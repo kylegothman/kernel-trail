@@ -18,7 +18,7 @@ import {
 } from '@kernel/rng';
 import type { RngState } from '@kernel/types';
 import { KernelConfigError, KernelInvariantError } from '@kernel/errors';
-import { createStreams, STREAM_LABELS } from '@kernel/rng/streams';
+import { createStreams, STREAM_LABELS } from '@kernel/rngStreams';
 
 /** Ten decimal places, matching how the spec publishes its vectors. */
 const draws = (rng: { next(): number }, n: number): string[] =>
