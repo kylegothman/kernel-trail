@@ -1,9 +1,8 @@
 /**
- * Fixtures RNG-1, RNG-2, RNG-2b, RNG-2c and RNG-3 from sim spec 16.2.
+ * Fixtures RNG-1, RNG-2, RNG-2b, RNG-2c, RNG-3 and RNG-4 from sim spec 16.2.
  *
- * Every expected value in this file was produced by running the algorithm, not
- * by reading it off the specification. They agree with sim spec 1.2.2, 1.2.4
- * and 1.2.6 to all ten published decimal places.
+ * Published decimal values are asserted to all ten places without widening
+ * the tolerance. The uint32 sequence was recorded by the scaffold.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -18,6 +17,8 @@ import {
   WARMUP_DRAWS,
 } from '@kernel/rng';
 import type { RngState } from '@kernel/types';
+import { KernelConfigError, KernelInvariantError } from '@kernel/errors';
+import { createStreams, STREAM_LABELS } from '@kernel/rng/streams';
 
 /** Ten decimal places, matching how the spec publishes its vectors. */
 const draws = (rng: { next(): number }, n: number): string[] =>
@@ -75,19 +76,21 @@ describe('RNG-1: seeding and the generator core', () => {
 describe('derived methods, sim spec 1.2.3', () => {
   it('int stays in range and rejects a bad range', () => {
     const rng = createRng(5, 'int');
-    for (let i = 0; i < 5000; i++) {
-      const v = rng.int(3, 11);
+    for (let i = 0; i < 10000; i++) {
+      const v = rng.int(-5, 5);
       expect(Number.isInteger(v)).toBe(true);
-      expect(v).toBeGreaterThanOrEqual(3);
-      expect(v).toBeLessThan(11);
+      expect(v).toBeGreaterThanOrEqual(-5);
+      expect(v).toBeLessThan(5);
     }
     expect(() => rng.int(4, 4)).toThrow(RangeError);
     expect(() => rng.int(0, 1.5)).toThrow(RangeError);
+    expect(() => rng.int(3, 3)).toThrow('int: empty range');
+    expect(() => rng.int(1.5, 4)).toThrow('int: non-integer bound');
   });
 
   it('chance(0) is never true and chance(1) is always true', () => {
     const rng = createRng(9, 'chance');
-    for (let i = 0; i < 2000; i++) {
+    for (let i = 0; i < 10000; i++) {
       expect(rng.chance(0)).toBe(false);
       expect(rng.chance(1)).toBe(true);
     }
@@ -118,6 +121,46 @@ describe('derived methods, sim spec 1.2.3', () => {
     const a = createRng(777, 's').shuffle([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     const b = createRng(777, 's').shuffle([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     expect(b).toEqual(a);
+  });
+
+  it('shuffle direction is descending and seed 42 advances exactly seven draws', () => {
+    const rng = createRng(42, 's');
+    const bounds: number[] = [];
+    const original = rng.int.bind(rng);
+    rng.int = (lo, hi): number => {
+      expect(lo).toBe(0);
+      bounds.push(hi);
+      return original(lo, hi);
+    };
+    const items = [0, 1, 2, 3, 4, 5, 6, 7];
+    expect(rng.shuffle(items)).toBe(items);
+    expect(bounds).toEqual([8, 7, 6, 5, 4, 3, 2]);
+    const reference = createRng(42, 's');
+    for (let i = 0; i < 7; i++) reference.next();
+    expect(rng.save()).toEqual(reference.save());
+  });
+
+  it('pick guards undefined selections with KernelInvariantError', () => {
+    expect(() => createRng(11).pick([undefined])).toThrow(KernelInvariantError);
+  });
+
+  it('shuffle preserves undefined elements permitted by its generic contract', () => {
+    const rng = createRng(42, 's');
+    const before = createRng(42, 's');
+    before.next();
+    const items = [undefined, 1];
+    expect(rng.shuffle(items)).toBe(items);
+    expect(items).toContain(undefined);
+    expect(items).toContain(1);
+    expect(rng.save()).toEqual(before.save());
+  });
+
+  it('empty and singleton shuffles do not draw', () => {
+    const rng = createRng(42, 's');
+    const before = rng.save();
+    expect(rng.shuffle([])).toEqual([]);
+    expect(rng.shuffle([7])).toEqual([7]);
+    expect(rng.save()).toEqual(before);
   });
 });
 
@@ -188,9 +231,19 @@ describe('RNG-2: fork derivation, sim spec 1.2.4', () => {
 
   it('child labels are the slash-joined path', () => {
     const root = createRng(1234, ROOT_STREAM_LABEL);
-    const vm = root.fork('vm') as Sfc32Rng;
+    const vm = root.fork('vm');
     expect(vm.save().label).toBe('root/vm');
-    expect((vm.fork('clock') as Sfc32Rng).save().label).toBe('root/vm/clock');
+    expect(vm.fork('clock').save().label).toBe('root/vm/clock');
+  });
+
+  it('fork label validation rejects non-ASCII labels without advancing the parent', () => {
+    const root = createRng(1234);
+    const before = root.save();
+    for (const label of ['', 'Scheduler', 'sched-1', 'a/b', 'a b', 'a\n', '\u00e9', '\ud83c\udf32']) {
+      expect(() => root.fork(label)).toThrow('fork: label must match /^[a-z0-9_]+$/');
+    }
+    expect(() => root.fork('sched_1')).not.toThrow();
+    expect(root.save()).toEqual(before);
   });
 
   it('fnv1a32 matches the reference offset basis and prime', () => {
@@ -239,8 +292,116 @@ describe('RNG-3: save and restore, sim spec 1.2.6', () => {
 
   it('rejects an unsupported algorithm', () => {
     const rng = createRng(1, 'y');
-    const bad = { algorithm: 'xoshiro', words: [1, 2, 3, 4], label: 'y' } as unknown as RngState;
-    expect(() => rng.restore(bad)).toThrow(/unsupported rng algorithm/);
+    const bad = rng.save();
+    Reflect.set(bad, 'algorithm', 'xoshiro');
+    expect(() => rng.restore(bad)).toThrow('unsupported rng algorithm xoshiro');
+  });
+});
+
+describe('RNG-4: uniformity, sim spec 16.2', () => {
+  it('one million draws produce chi-square 8.230 with nine degrees of freedom', () => {
+    const rng = createRng(99, 't');
+    const bins = Array<number>(10).fill(0);
+    for (let i = 0; i < 1_000_000; i++) {
+      const index = Math.floor(rng.next() * 10);
+      const count = bins[index];
+      if (count === undefined) throw new Error(`draw outside the ten bins: ${index}`);
+      bins[index] = count + 1;
+    }
+    const chiSquare = bins.reduce((sum, count) => sum + (count - 100_000) ** 2 / 100_000, 0);
+    console.info(`RNG-4 chi-square: ${chiSquare.toFixed(4)}`);
+    expect(chiSquare).toBeCloseTo(8.230, 3);
+  });
+});
+
+describe('WP-01 stream registry surface', () => {
+  it('saveAll has twelve states in the exact root-first order', () => {
+    const registry = createStreams(1234);
+    expect(registry.saveAll().map((state) => state.label)).toEqual([
+      'root', ...STREAM_LABELS.map((label) => `root/${label}`),
+    ]);
+    expect(registry.saveAll()).toHaveLength(12);
+    expect(registry.saveAll()[1]?.label).toBe('root/process');
+    expect(registry.saveAll()[11]?.label).toBe('root/events');
+  });
+
+  it('streams isolation matches RNG-2 and leaves root unadvanced', () => {
+    const registry = createStreams(1234);
+    registry.stream('memory').next();
+    registry.stream('io').next();
+    expect(draws(registry.stream('scheduler'), 5)).toEqual([
+      '0.7590017407', '0.1837793530', '0.0627553733', '0.4116676911', '0.8262647619',
+    ]);
+    expect(registry.root.save()).toEqual(createRng(1234).save());
+  });
+
+  it('restoreAll keeps all twelve object references and reproduces their next draws', () => {
+    const registry = createStreams(1234);
+    const refs = [registry.root, ...STREAM_LABELS.map((label) => registry.stream(label))];
+    for (const rng of refs) rng.next();
+    const saved = registry.saveAll();
+    const expected = refs.map((rng) => rng.next());
+    registry.restoreAll(saved);
+    expect(registry.root).toBe(refs[0]);
+    STREAM_LABELS.forEach((label, i) => expect(registry.stream(label)).toBe(refs[i + 1]));
+    expect(refs.map((rng) => rng.next())).toEqual(expected);
+  });
+
+  it('restoreAll rejects wrong count and ordering before mutating any stream', () => {
+    const registry = createStreams(1);
+    const initial = registry.saveAll();
+    const other = createStreams(2).saveAll();
+    expect(() => registry.restoreAll(other.slice(1))).toThrow(KernelConfigError);
+    const reordered = [...other];
+    const last = reordered.pop();
+    if (last === undefined) throw new Error('missing final stream fixture');
+    reordered.unshift(last);
+    expect(() => registry.restoreAll(reordered)).toThrow(KernelConfigError);
+    const badTail = other.map((state, i) => i === 11 ? { ...state, label: 'root/wrong' } : state);
+    expect(() => registry.restoreAll(badTail)).toThrow('expects root/events at index 11');
+    expect(registry.saveAll()).toEqual(initial);
+  });
+
+  it('restoreAll validates the entire algorithm and word payload before mutation', () => {
+    const registry = createStreams(1);
+    const before = registry.saveAll();
+    const bad = createStreams(2).saveAll();
+    const last = bad[11];
+    if (last === undefined) throw new Error('missing final stream fixture');
+    Reflect.set(last, 'algorithm', 'other');
+    expect(() => registry.restoreAll(bad)).toThrow(KernelConfigError);
+    expect(registry.saveAll()).toEqual(before);
+    Reflect.set(last, 'algorithm', 'sfc32');
+    Reflect.set(last, 'words', [0, 1, 2, NaN]);
+    expect(() => registry.restoreAll(bad)).toThrow(KernelConfigError);
+    expect(registry.saveAll()).toEqual(before);
+  });
+
+  it('unknown stream labels throw without lazy forking', () => {
+    const registry = createStreams(1234);
+    const before = registry.saveAll();
+    expect(() => Reflect.apply(registry.stream, registry, ['unknown'])).toThrow(KernelConfigError);
+    expect(registry.saveAll()).toEqual(before);
+  });
+});
+
+describe('kernel error classes', () => {
+  it('preserves Error inheritance, exact names and primitive diagnostics', () => {
+    const detail = { index: 4, valid: false, expected: 'dense', value: null };
+    const invariant = new KernelInvariantError(0, 'RNG guard', detail);
+    expect(invariant).toBeInstanceOf(Error);
+    expect(invariant).toBeInstanceOf(KernelInvariantError);
+    expect(invariant.name).toBe('KernelInvariantError');
+    expect(invariant.invariant).toBe(0);
+    expect(invariant.detail).toEqual(detail);
+    detail.index = 7;
+    expect(invariant.detail?.['index']).toBe(4);
+    expect(Object.isFrozen(invariant.detail)).toBe(true);
+    const config = new KernelConfigError('invalid registry');
+    expect(config).toBeInstanceOf(Error);
+    expect(config).toBeInstanceOf(KernelConfigError);
+    expect(config.name).toBe('KernelConfigError');
+    expect(config.message).toBe('invalid registry');
   });
 });
 

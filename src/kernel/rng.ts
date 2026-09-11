@@ -7,18 +7,15 @@
  * or a `>>> 0` produces a generator that agrees with this one for a while and
  * then silently diverges.
  *
- * This module has no imports beyond types, touches no globals, and calls
- * nothing from Math except `imul` and `floor`.
+ * This module depends only on kernel types and errors.
  */
 
 import type { Rng, RngState } from './types';
+import { KernelConfigError, KernelInvariantError } from './errors';
 
 /* ------------------------------------------------------------------ */
 /* Constants                                                           */
 /* ------------------------------------------------------------------ */
-
-/** 2^32, written as a literal so no Math.pow rounding enters. Spec 1.2.1. */
-const TWO_POW_32 = 4294967296;
 
 /**
  * Outputs discarded after seeding and after forking. Spec 1.2.2: sfc32 seeded
@@ -90,11 +87,28 @@ export function fnv1a32(s: string): number {
 /* The generator                                                       */
 /* ------------------------------------------------------------------ */
 
+interface Sfc32State {
+  a: number;
+  b: number;
+  c: number;
+  d: number;
+}
+
+function sfc32Next(s: Sfc32State): number {
+  let { a, b, c, d } = s;
+  a |= 0; b |= 0; c |= 0; d |= 0;
+  const t = (((a + b) | 0) + d) | 0;
+  d = (d + 1) | 0;
+  a = b ^ (b >>> 9);
+  b = (c + (c << 3)) | 0;
+  c = (c << 21) | (c >>> 11);
+  c = (c + t) | 0;
+  s.a = a; s.b = b; s.c = c; s.d = d;
+  return t >>> 0;
+}
+
 export class Sfc32Rng implements Rng {
-  private a: number;
-  private b: number;
-  private c: number;
-  private d: number;
+  private readonly state: Sfc32State;
   private streamLabel: string;
 
   /**
@@ -103,10 +117,12 @@ export class Sfc32Rng implements Rng {
    * neither, because `restore` and `fork` need the raw form.
    */
   constructor(words: readonly [number, number, number, number], label: string) {
-    this.a = words[0] | 0;
-    this.b = words[1] | 0;
-    this.c = words[2] | 0;
-    this.d = words[3] | 0;
+    this.state = {
+      a: words[0] | 0,
+      b: words[1] | 0,
+      c: words[2] | 0,
+      d: words[3] | 0,
+    };
     this.streamLabel = label;
   }
 
@@ -120,28 +136,12 @@ export class Sfc32Rng implements Rng {
    * `>>> 0` here is load bearing.
    */
   nextUint32(): number {
-    let a = this.a | 0;
-    let b = this.b | 0;
-    let c = this.c | 0;
-    let d = this.d | 0;
-
-    const t = (((a + b) | 0) + d) | 0;
-    d = (d + 1) | 0;
-    a = b ^ (b >>> 9);
-    b = (c + (c << 3)) | 0;
-    c = (c << 21) | (c >>> 11);
-    c = (c + t) | 0;
-
-    this.a = a;
-    this.b = b;
-    this.c = c;
-    this.d = d;
-    return t >>> 0;
+    return sfc32Next(this.state);
   }
 
   /** Uniform in [0, 1). Spec 1.2.1. */
   next(): number {
-    return this.nextUint32() / TWO_POW_32;
+    return this.nextUint32() / 4294967296;
   }
 
   /** Uniform integer in [minInclusive, maxExclusive). Spec 1.2.3. */
@@ -169,10 +169,12 @@ export class Sfc32Rng implements Rng {
       throw new RangeError('pick: empty array');
     }
     const chosen = items[this.int(0, items.length)];
-    if (chosen === undefined && !(0 in items)) {
-      throw new RangeError('pick: sparse array');
+    if (chosen === undefined) {
+      // Unreachable for a dense array of defined values: int keeps the index in range.
+      // Zero denotes a local RNG guard with no numbered sim invariant assigned.
+      throw new KernelInvariantError(0, 'pick: selected element is undefined');
     }
-    return chosen as T;
+    return chosen;
   }
 
   /**
@@ -183,6 +185,7 @@ export class Sfc32Rng implements Rng {
   shuffle<T>(items: T[]): T[] {
     for (let i = items.length - 1; i > 0; i--) {
       const j = this.int(0, i + 1);
+      // Both indices are in range; T itself may legitimately include undefined.
       const tmp = items[i] as T;
       items[i] = items[j] as T;
       items[j] = tmp;
@@ -199,14 +202,18 @@ export class Sfc32Rng implements Rng {
    * F2: the child is a pure function of the parent's words and the label, so
    *     fork order is irrelevant and two labels give unrelated streams.
    */
-  fork(label: string): Rng {
+  fork(label: string): Sfc32Rng {
+    if (!/^[a-z0-9_]+$/.test(label)) {
+      throw new RangeError('fork: label must match /^[a-z0-9_]+$/');
+    }
+    const { a, b, c, d } = this.state;
     const h = fnv1a32(label);
-    const m = splitmix32((this.a ^ h) | 0);
+    const m = splitmix32((a ^ h) | 0);
     const words: [number, number, number, number] = [
-      (this.a ^ Math.imul(h, 0x85ebca6b)) | 0,
-      (this.b ^ Math.imul(h ^ 0x9e3779b9, 0xc2b2ae35)) | 0,
-      (this.c ^ m()) | 0,
-      (this.d ^ m()) | 0,
+      (a ^ Math.imul(h, 0x85ebca6b)) | 0,
+      (b ^ Math.imul(h ^ 0x9e3779b9, 0xc2b2ae35)) | 0,
+      (c ^ m()) | 0,
+      (d ^ m()) | 0,
     ];
     const child = new Sfc32Rng(
       words,
@@ -225,7 +232,7 @@ export class Sfc32Rng implements Rng {
   save(): RngState {
     return {
       algorithm: 'sfc32',
-      words: [this.a >>> 0, this.b >>> 0, this.c >>> 0, this.d >>> 0],
+      words: [this.state.a >>> 0, this.state.b >>> 0, this.state.c >>> 0, this.state.d >>> 0],
       label: this.streamLabel,
     };
   }
@@ -242,10 +249,10 @@ export class Sfc32Rng implements Rng {
     if (state.words.length !== 4) {
       throw new Error(`rng state must hold 4 words, received ${state.words.length}`);
     }
-    this.a = state.words[0] | 0;
-    this.b = state.words[1] | 0;
-    this.c = state.words[2] | 0;
-    this.d = state.words[3] | 0;
+    this.state.a = state.words[0] | 0;
+    this.state.b = state.words[1] | 0;
+    this.state.c = state.words[2] | 0;
+    this.state.d = state.words[3] | 0;
     this.streamLabel = state.label;
   }
 }
@@ -285,40 +292,67 @@ export interface StreamRegistry {
   ordered(): readonly Sfc32Rng[];
   save(): readonly RngState[];
   restore(states: readonly RngState[]): void;
+  stream(label: SubsystemStreamLabel): Rng;
+  saveAll(): readonly RngState[];
+  restoreAll(states: readonly RngState[]): void;
 }
 
 export function createStreamRegistry(seed: number): StreamRegistry {
   const root = createRng(seed, ROOT_STREAM_LABEL);
   const streams = new Map<string, Sfc32Rng>();
   for (const label of SUBSYSTEM_STREAM_LABELS) {
-    // fork returns the Rng interface; the concrete class is what we store so
-    // that snapshot and restore can address the raw words.
-    streams.set(label, root.fork(label) as Sfc32Rng);
+    streams.set(label, root.fork(label));
   }
   const order: Sfc32Rng[] = [root];
   for (const label of SUBSYSTEM_STREAM_LABELS) {
-    order.push(streams.get(label) as Sfc32Rng);
+    const stream = streams.get(label);
+    if (stream === undefined) throw new KernelConfigError(`missing rng stream ${label}`);
+    order.push(stream);
   }
+
+  const saveAll = (): readonly RngState[] => order.map((rng) => rng.save());
+  const restoreAll = (states: readonly RngState[]): void => {
+    if (states.length !== order.length) {
+      throw new KernelConfigError(
+        `rng registry expects ${order.length} states, received ${states.length}`,
+      );
+    }
+    // Validate the whole input first so a bad later entry cannot partly restore the run.
+    for (let i = 0; i < order.length; i++) {
+      const state = states[i];
+      const expectedLabel = i === 0 ? ROOT_STREAM_LABEL : `${ROOT_STREAM_LABEL}/${SUBSYSTEM_STREAM_LABELS[i - 1]}`;
+      if (state === undefined || state.label !== expectedLabel) {
+        throw new KernelConfigError(`rng registry expects ${expectedLabel} at index ${i}`);
+      }
+      if (state.algorithm !== 'sfc32') {
+        throw new KernelConfigError(`unsupported rng algorithm ${state.algorithm}`);
+      }
+      if (state.words.length !== 4 || state.words.some((word) => !Number.isInteger(word) || word < 0 || word > 0xffffffff)) {
+        throw new KernelConfigError(`rng registry expects four uint32 words at index ${i}`);
+      }
+    }
+    for (let i = 0; i < order.length; i++) {
+      const target = order[i];
+      const state = states[i];
+      if (target === undefined || state === undefined) {
+        throw new KernelConfigError(`rng registry restore: missing entry at index ${i}`);
+      }
+      target.restore(state);
+    }
+  };
 
   return {
     root,
     streams,
     ordered: () => order,
-    save: () => order.map((r) => r.save()),
-    restore: (states) => {
-      if (states.length !== order.length) {
-        throw new Error(
-          `rng registry expects ${order.length} states, received ${states.length}`,
-        );
-      }
-      for (let i = 0; i < order.length; i++) {
-        const target = order[i];
-        const state = states[i];
-        if (target === undefined || state === undefined) {
-          throw new Error(`rng registry restore: missing entry at index ${i}`);
-        }
-        target.restore(state);
-      }
+    save: saveAll,
+    restore: restoreAll,
+    stream: (label) => {
+      const stream = streams.get(label);
+      if (stream === undefined) throw new KernelConfigError(`unknown rng stream ${label}`);
+      return stream;
     },
+    saveAll,
+    restoreAll,
   };
 }

@@ -52,56 +52,8 @@ const FILES = collect(KERNEL_ROOT);
  * division; that is harmless here, because no rule below looks for a character
  * a regex body could contain in a way that changes the verdict.
  */
-export function stripComments(source: string, alsoStrings: boolean): string {
-  const out: string[] = [];
-  let i = 0;
-  const n = source.length;
-  const blank = (from: number, to: number): void => {
-    for (let k = from; k < to; k++) out.push(source[k] === '\n' ? '\n' : ' ');
-  };
-
-  while (i < n) {
-    const c = source[i];
-    const next = source[i + 1];
-
-    if (c === '/' && next === '/') {
-      const end = source.indexOf('\n', i);
-      const stop = end === -1 ? n : end;
-      blank(i, stop);
-      i = stop;
-      continue;
-    }
-    if (c === '/' && next === '*') {
-      const end = source.indexOf('*/', i + 2);
-      const stop = end === -1 ? n : end + 2;
-      blank(i, stop);
-      i = stop;
-      continue;
-    }
-    if (alsoStrings && (c === '"' || c === "'" || c === '`')) {
-      const quote = c;
-      let j = i + 1;
-      while (j < n) {
-        const d = source[j];
-        if (d === '\\') {
-          j += 2;
-          continue;
-        }
-        if (d === quote) {
-          j += 1;
-          break;
-        }
-        j += 1;
-      }
-      blank(i, j);
-      i = j;
-      continue;
-    }
-    out.push(c ?? '');
-    i += 1;
-  }
-  return out.join('');
-}
+export { stripComments } from './sourceScan';
+import { stripComments } from './sourceScan';
 
 interface Offence {
   readonly file: string;

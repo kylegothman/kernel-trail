@@ -134,9 +134,10 @@ kernels built from the same config and stepped the same number of ticks produce 
 byte-identical event log and snapshot. This is enforced by test, not by
 convention.
 
-### Forbidden identifiers anywhere under `src/kernel`
+### Forbidden identifiers anywhere in CODE under `src/kernel`
 
-Including in comments, template strings, and dynamic property access:
+Including dynamic property access such as `Math['random']`, and access split
+across lines. The list:
 
 ```
 Math.random        Date.now           Date (as a constructor)
@@ -146,6 +147,17 @@ requestAnimationFrame                 fetch
 window             document           navigator            globalThis
 localStorage       indexedDB          Worker               console
 ```
+
+**Comments are exempt, and this is not a loophole.** The frozen `types.ts` header
+and the `Kernel.ts` header both state this prohibition in English, which means
+they name `Math.random`, `Date.now` and `performance.now` in order to forbid
+them. A scanner that reads raw source flags those two comments, and the only way
+to make it pass is to edit a frozen file and delete the sentence documenting the
+contract. So every source scan blanks comments before matching. It does NOT blank
+string literals, because computed access is written `Math['random']` and blanking
+the literal turns it into `Math[      ]`, defeating the check that matters most.
+`tests/kernel/sourceScan.ts` is the shared implementation. Use it. Do not write a
+second scanner with a different policy.
 
 `console` is on the list deliberately. A kernel that wants to say something emits
 a `KernelEvent`; `kernel.panic` exists for exactly this. Debug from a vitest run,

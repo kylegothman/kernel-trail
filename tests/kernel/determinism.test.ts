@@ -10,25 +10,26 @@
  * constructor, the real RNG stream registry, the real tick counter, the real
  * snapshot and restore, and the real invariant harness, and they fail loudly the
  * moment a phase body introduces nondeterminism. Every assertion here is
- * written against the finished behaviour, so nothing needs rewriting as the
- * phases land.
+ * retained below as FCFS scaffold regressions. The four exact reference cases
+ * use RR and stay skipped until the required kernel and scheduler work lands.
  */
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, test } from 'vitest';
+import { readdirSync, readFileSync } from 'node:fs';
+import { join, relative, resolve } from 'node:path';
 import { createKernel, InvariantViolation } from '@kernel/Kernel';
 import { createRng, createStreamRegistry } from '@kernel/rng';
 import { KernelEventBus } from '@kernel/EventBus';
-import { canonicalise, checksumSafeSnapshot, fnv1a64 } from '@game/save';
+import { checksumSafeSnapshot } from '@game/save';
 import { asPid, asTick } from '@kernel/types';
 import type { KernelConfig, KernelEvent, KernelSnapshot, SubsystemId } from '@kernel/types';
+import { canonical, hash, strip } from './canonical';
+import { stripComments } from './sourceScan';
 
-/** The reference configuration of sim spec 16.1, on the FCFS policy. */
-const REFERENCE_CONFIG: KernelConfig = {
+/** The exact reference configuration from sim spec 16.1. */
+const CONFIG: KernelConfig = {
   seed: 0x4b54524c,
-  // Sim spec 16.1 names 'rr'; FCFS is the only policy implemented at this
-  // commit, so the determinism fixtures run on it. Swap to 'rr' once
-  // src/kernel/scheduler/RR.ts exists; nothing else in this file changes.
-  scheduler: 'fcfs',
+  scheduler: 'rr',
   schedulerParams: {
     quantum: 4,
     levelQuanta: [4, 8, 16],
@@ -63,12 +64,61 @@ const REFERENCE_CONFIG: KernelConfig = {
   ],
 };
 
+/** Keep the existing executable coverage while RR is owned by WP-04. */
+const REFERENCE_CONFIG: KernelConfig = { ...CONFIG, scheduler: 'fcfs' };
 const TICKS = 5000;
 
-/** Deterministic serialisation: keys sorted, Maps flattened, -0 normalised. */
-const canonicalLog = (events: readonly KernelEvent[]): string => canonicalise(events);
-const canonicalSnapshot = (s: KernelSnapshot): string => canonicalise(checksumSafeSnapshot(s));
-const hash = (s: string): string => fnv1a64(s);
+// The scaffold uses Infinity for an unlimited budget. Preserve its existing
+// save-layer projection for active snapshot tests; canonical itself rejects it.
+const canonicalLog = (events: readonly KernelEvent[]): string => canonical(events);
+const canonicalSnapshot = (s: KernelSnapshot): string => canonical(checksumSafeSnapshot(s));
+
+// TODO(astra): enable when WP-02 lands createKernel
+test.skip('D1: identical construction produces identical event logs', () => {
+  const a = createKernel(CONFIG);
+  const b = createKernel(CONFIG);
+  const ea = a.run(TICKS);
+  const eb = b.run(TICKS);
+  expect(canonical(eb)).toBe(canonical(ea));
+  expect(canonical(b.snapshot())).toBe(canonical(a.snapshot()));
+});
+
+// TODO(astra): enable when WP-02 lands createKernel
+test.skip('D2: snapshot/restore mid-run is transparent', () => {
+  const a = createKernel(CONFIG);
+  a.run(2000);
+  const snap = structuredClone(a.snapshot());
+  const tailA = a.run(3000);
+
+  const b = createKernel(CONFIG);
+  b.restore(structuredClone(snap));
+  const tailB = b.run(3000);
+
+  expect(canonical(tailB)).toBe(canonical(tailA));
+  expect(canonical(b.snapshot())).toBe(canonical(a.snapshot()));
+});
+
+// TODO(astra): enable when WP-02 lands createKernel
+test.skip('D3: adding a subsystem stream does not shift existing streams', () => {
+  const withoutIo = { ...CONFIG, enabledSubsystems: CONFIG.enabledSubsystems.filter(s => s !== 'io') };
+  const a = createKernel(withoutIo);
+  const b = createKernel(CONFIG);
+  const sa = a.run(TICKS).filter(e => e.type === 'context.switch');
+  const sb = b.run(TICKS).filter(e => e.type === 'context.switch');
+  // Scheduling decisions are unaffected by whether the io subsystem exists,
+  // for a workload that issues no I/O.
+  expect(canonical(sb.map(strip('seq')))).toBe(canonical(sa.map(strip('seq'))));
+});
+
+// TODO(astra): enable when WP-02 lands createKernel
+test.skip('D4: seed sweep is stable across runs', () => {
+  for (let seed = 0; seed < 64; seed++) {
+    const c = { ...CONFIG, seed };
+    const h1 = hash(canonical(createKernel(c).run(1000)));
+    const h2 = hash(canonical(createKernel(c).run(1000)));
+    expect(h2).toBe(h1);
+  }
+});
 
 describe('D1: identical construction produces identical event logs', () => {
   it('agrees byte for byte over 5000 ticks', () => {
@@ -377,5 +427,210 @@ describe('policy swap mid-run, a core player verb', () => {
   it('throws a useful error for a policy that is not built yet', () => {
     const k = createKernel(REFERENCE_CONFIG);
     expect(() => k.setScheduler('mlfq')).toThrow(/not implemented yet.*sim spec 5\.8/s);
+  });
+});
+
+describe('canonical state encoding', () => {
+  it('is stable for nested Maps, Sets, arrays and negative zero', () => {
+    const fixture = {
+      map: new Map<unknown, unknown>([['z', new Set([3, 1, 2])], ['a', [-0, { ok: true }]]]),
+      set: new Set<unknown>([{ b: 2, a: 1 }, 'value']),
+      array: [null, false, 2.5],
+    };
+    expect(canonical(fixture)).toBe(canonical(fixture));
+    expect(canonical(fixture)).toBe(
+      '{"array":[null,false,2.5],"map":[["a",[0,{"ok":true}]],["z",[1,2,3]]],"set":["value",{"a":1,"b":2}]}',
+    );
+  });
+
+  it('sorts object keys by code unit regardless of insertion order', () => {
+    const a = { z: 1, a: 2, Z: 3, '\u{1f600}': 4, '\ue000': 5 };
+    const b = { '\ue000': 5, '\u{1f600}': 4, Z: 3, a: 2, z: 1 };
+    expect(canonical(a)).toBe(canonical(b));
+    expect(canonical(a)).toBe('{"Z":3,"a":2,"z":1,"\u{1f600}":4,"\ue000":5}');
+    expect(canonical({ 2: 'two', 10: 'ten' })).toBe('{"10":"ten","2":"two"}');
+  });
+
+  it('drops undefined object properties and supports objects without prototypes', () => {
+    const record: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+    record['present'] = null;
+    record['missing'] = undefined;
+    expect(canonical(record)).toBe('{"present":null}');
+    expect(canonical({ a: undefined, b: { c: undefined } })).toBe('{"b":{}}');
+  });
+
+  it('normalises negative zero and preserves finite number precision', () => {
+    expect(canonical([-0, 0, Number.MIN_VALUE, Number.MAX_VALUE, 1e-7, 1e21])).toBe(
+      '[0,0,5e-324,1.7976931348623157e+308,1e-7,1e+21]',
+    );
+  });
+
+  it('JSON-escapes string values and object keys', () => {
+    expect(canonical({ 'a"b': '\n\t"\\\u0000' })).toBe('{"a\\"b":"\\n\\t\\"\\\\\\u0000"}');
+  });
+
+  it('keeps array order', () => {
+    expect(canonical([3, 1, 2])).toBe('[3,1,2]');
+    expect(canonical([1, 2])).not.toBe(canonical([2, 1]));
+  });
+
+  it('sorts Map entries independently of insertion order, breaking equal-key ties by value', () => {
+    const entries: [unknown, unknown][] = [[{ key: 1 }, 'z'], [{ key: 1 }, 'a'], ['b', 2], ['a', 1]];
+    const a = new Map(entries);
+    const b = new Map(entries.toReversed());
+    expect(canonical(a)).toBe(canonical(b));
+    expect(canonical(a)).toBe('[["a",1],["b",2],[{"key":1},"a"],[{"key":1},"z"]]');
+    expect(Array.from(a.keys())).toEqual(entries.map(([key]) => key));
+  });
+
+  it('sorts Set values independently of insertion order, including equal encodings', () => {
+    const values: unknown[] = [{ b: 2, a: 1 }, 'z', 'a', { a: 1, b: 2 }];
+    expect(canonical(new Set(values))).toBe(canonical(new Set(values.toReversed())));
+    expect(canonical(new Set(values))).toBe('["a","z",{"a":1,"b":2},{"a":1,"b":2}]');
+  });
+
+  it('rejects functions with their property path', () => {
+    expect(() => canonical({ a: { b: () => 1 } })).toThrow(/a\.b/);
+  });
+
+  it.each([NaN, Infinity, -Infinity])('rejects non-finite number %s with its array path', (value) => {
+    expect(() => canonical({ a: [1, value] })).toThrow(/a\.1/);
+  });
+
+  it('rejects symbol values and symbol keys with their containing path', () => {
+    expect(() => canonical({ a: Symbol('hidden') })).toThrow(/a/);
+    expect(() => canonical({ a: { [Symbol('hidden')]: 1 } })).toThrow(/symbol key at \$\.a/);
+  });
+
+  it('rejects class instances even when their own data is serialisable', () => {
+    class Policy {
+      readonly quantum = 4;
+    }
+    expect(() => canonical({ a: new Policy() })).toThrow(/class instance at \$\.a/);
+    expect(() => canonical({ a: new Date(0) })).toThrow(/class instance at \$\.a/);
+  });
+
+  it('rejects undefined outside object properties and sparse array slots', () => {
+    expect(() => canonical(undefined)).toThrow(/undefined at \$/);
+    expect(() => canonical({ a: [undefined] })).toThrow(/a\.0/);
+    expect(() => canonical({ a: new Array<unknown>(1) })).toThrow(/a\.0/);
+    expect(() => canonical(new Map([[undefined, 1]]))).toThrow(/0\.key/);
+    expect(() => canonical(new Map([['key', undefined]]))).toThrow(/0\.value/);
+    expect(() => canonical(new Set([undefined]))).toThrow(/0/);
+  });
+
+  it('rejects BigInt with its path', () => {
+    expect(() => canonical({ a: 1n })).toThrow(/bigint at \$\.a/);
+  });
+
+  it('rejects object, Map and Set cycles with their paths', () => {
+    const record: Record<string, unknown> = {};
+    record['self'] = record;
+    expect(() => canonical({ a: record })).toThrow(/cycle at \$\.a\.self/);
+    const map = new Map<string, unknown>();
+    map.set('self', map);
+    expect(() => canonical({ a: map })).toThrow(/cycle at \$\.a\.0\.value/);
+    const set = new Set<unknown>();
+    set.add(set);
+    expect(() => canonical({ a: set })).toThrow(/cycle at \$\.a\.0/);
+  });
+
+  it('allows shared references that do not form cycles', () => {
+    const shared = { a: 1 };
+    expect(canonical([shared, shared])).toBe('[{"a":1},{"a":1}]');
+    expect(canonical(new Map([[shared, shared]]))).toBe('[[{"a":1},{"a":1}]]');
+  });
+
+  it('hashes to eight lowercase FNV-1a hex digits', () => {
+    expect(hash('')).toBe('811c9dc5');
+    expect(hash('')).toMatch(/^[0-9a-f]{8}$/);
+    expect(hash('abc')).toMatch(/^[0-9a-f]{8}$/);
+    expect(hash('')).not.toBe(hash('abc'));
+  });
+
+  it('strips named keys with a shallow copy while keeping the original intact', () => {
+    const nested = { seq: 2 };
+    const source = { seq: 3, tick: 4, nested };
+    const result = strip('seq', 'tick')(source);
+    expect(result).toEqual({ nested });
+    expect(result).not.toBe(source);
+    expect(Reflect.get(result, 'nested')).toBe(nested);
+    expect(source).toEqual({ seq: 3, tick: 4, nested: { seq: 2 } });
+    expect(strip()(source)).toEqual(source);
+  });
+});
+
+const KERNEL_ROOT = resolve(__dirname, '..', '..', 'src', 'kernel');
+const FORBIDDEN_IDENTIFIERS = /\bMath\s*(?:\.\s*random\b|\[\s*['"`]random['"`]\s*\])|\bDate\s*(?:\.\s*now\b|\[\s*['"`]now['"`]\s*\])|\bnew\s+Date\b|\bcrypto\s*(?:\.\s*getRandomValues\b|\[\s*['"`]getRandomValues['"`]\s*\])|\b(?:performance|setTimeout|setInterval|queueMicrotask|requestAnimationFrame|fetch|window|document|navigator|globalThis|localStorage|indexedDB|Worker|console)\b/g;
+const THREE_IMPORT = /\b(?:from|import)\s*['"`]three[^'"`]*['"`]|\b(?:import|require)\s*\(\s*['"`]three[^'"`]*['"`]/g;
+
+function kernelSources(dir: string): string[] {
+  const files: string[] = [];
+  for (const entry of readdirSync(dir, { withFileTypes: true })) {
+    const path = join(dir, entry.name);
+    if (entry.isDirectory()) files.push(...kernelSources(path));
+    else if (entry.isFile() && /\.(?:ts|tsx|mts|cts)$/.test(entry.name)) files.push(path);
+  }
+  return files.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+}
+
+function scanRawSource(source: string, pattern: RegExp): { line: number; match: string }[] {
+  // Matches across the whole string, so multiline property access like
+  // `Math\n.random` is caught. Callers scanning real files pass source that
+  // has already had its comments blanked; see tests/kernel/sourceScan.ts for
+  // why comments are exempt and string literals are not.
+  return Array.from(source.matchAll(pattern), (match) => ({
+    line: source.slice(0, match.index).split('\n').length,
+    match: match[0],
+  }));
+}
+
+describe('kernel source guards, comments exempt', () => {
+  it('contains no forbidden identifiers in code, including computed access', () => {
+    const files = kernelSources(KERNEL_ROOT);
+    expect(files.length).toBeGreaterThan(0);
+    const violations = files.flatMap((file) =>
+      scanRawSource(stripComments(readFileSync(file, 'utf8'), false), FORBIDDEN_IDENTIFIERS).map((hit) => ({
+        file: relative(KERNEL_ROOT, file),
+        ...hit,
+      })),
+    );
+    expect(violations).toEqual([]);
+  });
+
+  it('contains no import specifier starting with three', () => {
+    const violations = kernelSources(KERNEL_ROOT).flatMap((file) =>
+      scanRawSource(stripComments(readFileSync(file, 'utf8'), false), THREE_IMPORT).map((hit) => ({
+        file: relative(KERNEL_ROOT, file),
+        ...hit,
+      })),
+    );
+    expect(violations).toEqual([]);
+  });
+
+  it('detects every forbidden API in raw comments, literals and computed access', () => {
+    const identifiers = [
+      'Math.random', 'Date.now', 'new Date()', 'performance.now', 'performance',
+      'crypto.getRandomValues', 'setTimeout', 'setInterval', 'queueMicrotask',
+      'requestAnimationFrame', 'fetch', 'window', 'document', 'navigator',
+      'globalThis', 'localStorage', 'indexedDB', 'Worker', 'console',
+      'Math["random"]', "Date['now']", 'crypto[`getRandomValues`]', 'Math\n.random',
+    ];
+    for (const identifier of identifiers) {
+      expect(scanRawSource(`// ${identifier}`, FORBIDDEN_IDENTIFIERS)).not.toEqual([]);
+      expect(scanRawSource('const text = `' + identifier + '`;', FORBIDDEN_IDENTIFIERS)).not.toEqual([]);
+    }
+    expect(scanRawSource('const windowSize = Math.floor(2);', FORBIDDEN_IDENTIFIERS)).toEqual([]);
+  });
+
+  it('detects static, side-effect, dynamic, type and CommonJS three imports', () => {
+    const imports = [
+      "import { Mesh } from 'three';", "import 'three/addons';",
+      "const module = import('three/webgpu');", "type T = import('three').Mesh;",
+      "const module = require('three');", "export * from 'three/tsl';",
+      "import 'three-extension';",
+    ];
+    for (const source of imports) expect(scanRawSource(source, THREE_IMPORT)).not.toEqual([]);
+    expect(scanRawSource("import { createRng } from './rng';", THREE_IMPORT)).toEqual([]);
   });
 });

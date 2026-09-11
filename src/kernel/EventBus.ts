@@ -1,18 +1,12 @@
 /**
- * KERNEL TRAIL - the kernel event stream.
+ * KERNEL TRAIL - the synchronous kernel event stream.
  *
- * Implements the frozen `KernelEventStream` contract from @kernel/types. This
- * is the only channel between the simulation and everything visual, so it has
- * two hard requirements beyond the interface:
- *
- *  1. `seq` is a single monotonic counter across the whole run. It is never
- *     reset by `restore`, because `KernelSnapshot.seq` carries it. Spec 2.2.
- *  2. Emitting must not allocate beyond the event object itself. Handler lists
- *     are arrays walked by index, `lastFrame` is one array whose length is
- *     reset to 0 at the start of each step, and nothing here builds a closure,
- *     an iterator or a spread per event.
+ * Frame storage and subscriber lists are reused. Dispatch captures both list
+ * lengths before calling a subscriber so new subscriptions wait for the next
+ * event, including when a typed subscriber adds an onAny subscriber.
  */
 
+import { asTick } from './types';
 import type {
   KernelEvent,
   KernelEventOf,
@@ -22,49 +16,77 @@ import type {
   Unsubscribe,
 } from './types';
 
-/**
- * An event's own fields, without the envelope the bus stamps on. Callers pass
- * this to `emit` and the bus supplies `type`, `tick` and `seq`.
- */
+export type EmittableEvent = {
+  [T in KernelEventType]: Omit<KernelEventOf<T>, 'tick' | 'seq'>
+}[KernelEventType];
+
+/** The scaffold's three-argument emit API remains available to its consumers. */
 export type KernelEventPayload<T extends KernelEventType> = Omit<
   KernelEventOf<T>,
   'type' | 'tick' | 'seq'
 >;
 
-/** Writable view of an event, used only where the bus stamps the envelope. */
-type MutableEvent = { -readonly [K in keyof KernelEvent]: KernelEvent[K] };
+export interface EventEmitter {
+  /** Assigns tick and seq, appends to the frame, dispatches synchronously. */
+  emit(event: EmittableEvent): void;
+  /** Clears the frame buffer in place. Called at the top of step(). */
+  beginFrame(): void;
+  readonly stream: KernelEventStream;
+  readonly seq: number;
+  /** Restore path only. Sets the sequence counter. */
+  setSeq(seq: number): void;
+  setTick(tick: Tick): void;
+}
 
-/** A slot is null once its subscriber has unsubscribed. */
-type Slot<H> = H | null;
+interface Subscription {
+  readonly handler: (event: KernelEvent) => void;
+  readonly name: string;
+  active: boolean;
+}
 
-export class KernelEventBus implements KernelEventStream {
-  /** Reused across steps. Never reallocated; `beginFrame` truncates it. */
+interface HandlerList {
+  readonly entries: Subscription[];
+  dirty: boolean;
+}
+
+function hasType<T extends KernelEventType>(
+  event: KernelEvent,
+  type: T,
+): event is KernelEventOf<T> {
+  return event.type === type;
+}
+
+export class KernelEventBus implements KernelEventStream, EventEmitter {
   private readonly frame: KernelEvent[] = [];
-
-  private readonly typed = new Map<KernelEventType, Slot<(e: never) => void>[]>();
-  private readonly anyHandlers: Slot<(e: KernelEvent) => void>[] = [];
-
-  /** Count of null slots awaiting compaction, per list. */
-  private readonly typedDead = new Map<KernelEventType, number>();
-  private anyDead = 0;
-
+  private readonly typed = new Map<KernelEventType, HandlerList>();
+  private readonly anyHandlers: HandlerList = { entries: [], dirty: false };
+  private readonly dirtyLists: HandlerList[] = [];
+  private readonly failures: { name: string; error: unknown }[] = [];
+  private dispatchDepth = 0;
   private seqCounter = 0;
+  private currentTick = asTick(0);
 
-  /** Events emitted during the most recent step, in order. */
+  /** Readers receive the frozen stream contract without emitter methods. */
+  readonly stream: KernelEventStream = {
+    on: (type, handler) => this.on(type, handler),
+    onAny: handler => this.onAny(handler),
+    lastFrame: this.frame,
+  };
+
   get lastFrame(): readonly KernelEvent[] {
     return this.frame;
   }
 
-  /** The next value `emit` will stamp. Carried in `KernelSnapshot.seq`. */
+  get handlerFailures(): readonly { name: string; error: unknown }[] {
+    return this.failures;
+  }
+
+  /** The next value emit will stamp, carried in KernelSnapshot.seq. */
   get seq(): number {
     return this.seqCounter;
   }
 
-  /**
-   * Restore the counter from a snapshot. Invariant I-38 requires `seq` to
-   * strictly increase across the whole run including across a restore, so this
-   * refuses to move the counter backwards past a value already handed out.
-   */
+  /** Restore exactly the next sequence number recorded in a snapshot. */
   setSeq(next: number): void {
     if (!Number.isInteger(next) || next < 0) {
       throw new RangeError(`seq must be a non-negative integer, received ${next}`);
@@ -72,138 +94,148 @@ export class KernelEventBus implements KernelEventStream {
     this.seqCounter = next;
   }
 
+  setTick(tick: Tick): void {
+    this.currentTick = tick;
+  }
+
   on<T extends KernelEventType>(type: T, handler: (e: KernelEventOf<T>) => void): Unsubscribe {
     let list = this.typed.get(type);
     if (list === undefined) {
-      list = [];
+      list = { entries: [], dirty: false };
       this.typed.set(type, list);
-      this.typedDead.set(type, 0);
     }
-    const stored = handler as (e: never) => void;
-    list.push(stored);
-    let live = true;
-    return (): void => {
-      if (!live) return;
-      live = false;
-      const current = this.typed.get(type);
-      if (current === undefined) return;
-      // Identity scan rather than a captured index: compaction renumbers the
-      // list, so an index captured at subscribe time goes stale.
-      for (let i = 0; i < current.length; i++) {
-        if (current[i] === stored) {
-          current[i] = null;
-          this.typedDead.set(type, (this.typedDead.get(type) ?? 0) + 1);
-          return;
-        }
-      }
-    };
+    // Narrow the frozen union at delivery instead of widening the callback.
+    return this.subscribe(list, event => {
+      if (hasType(event, type)) handler(event);
+    }, handler.name);
   }
 
   onAny(handler: (e: KernelEvent) => void): Unsubscribe {
-    this.anyHandlers.push(handler);
-    let live = true;
-    return (): void => {
-      if (!live) return;
-      live = false;
-      for (let i = 0; i < this.anyHandlers.length; i++) {
-        if (this.anyHandlers[i] === handler) {
-          this.anyHandlers[i] = null;
-          this.anyDead += 1;
-          return;
-        }
-      }
-    };
+    return this.subscribe(this.anyHandlers, handler, handler.name);
   }
 
-  /**
-   * Truncate `lastFrame`. Called once at the top of `Kernel.step()`, before
-   * phase 1. The array object is reused so that a renderer holding a reference
-   * to `lastFrame` keeps seeing the live buffer.
-   */
   beginFrame(): void {
     this.frame.length = 0;
   }
 
-  /**
-   * Build, stamp and dispatch an event. The only allocation is the event
-   * object itself.
-   */
+  emit(event: EmittableEvent): void;
   emit<T extends KernelEventType>(
     tick: Tick,
     type: T,
     payload: KernelEventPayload<T>,
-  ): KernelEventOf<T> {
-    const event = { ...payload, type, tick, seq: this.seqCounter } as KernelEventOf<T>;
+  ): KernelEventOf<T>;
+  emit<T extends KernelEventType>(
+    eventOrTick: EmittableEvent | Tick,
+    type?: T,
+    payload?: KernelEventPayload<T>,
+  ): KernelEvent | void {
+    if (typeof eventOrTick === 'number') {
+      if (type === undefined || payload === undefined) {
+        throw new TypeError('emit: tick requires an event type and payload');
+      }
+      // The overload pairs T with its exact payload. TypeScript cannot retain
+      // that correlation when spreading a generic Omit into the frozen union.
+      const event = {
+        ...payload, type, tick: eventOrTick, seq: this.seqCounter,
+      } as KernelEventOf<T>;
+      this.seqCounter += 1;
+      this.dispatch(event);
+      return event;
+    }
+    const event = { ...eventOrTick, tick: this.currentTick, seq: this.seqCounter };
     this.seqCounter += 1;
     this.dispatch(event);
-    return event;
   }
 
-  /**
-   * Dispatch an event a caller already built. `tick` and `seq` are overwritten
-   * so that a policy handed a `SchedulerContext.emit` cannot invent an
-   * out-of-order sequence number.
-   */
+  /** Restamp a policy event without mutating its readonly envelope. */
   publish(event: KernelEvent, tick: Tick): KernelEvent {
-    const writable = event as MutableEvent;
-    writable.tick = tick;
-    writable.seq = this.seqCounter;
+    const stamped = { ...event, tick, seq: this.seqCounter };
     this.seqCounter += 1;
-    this.dispatch(event);
-    return event;
+    this.dispatch(stamped);
+    return stamped;
   }
 
-  /** Drop every subscriber. Used when a kernel is torn down at a leg boundary. */
+  /** Drop subscribers and frame contents when a kernel is torn down. */
   clear(): void {
-    this.typed.clear();
-    this.typedDead.clear();
-    this.anyHandlers.length = 0;
-    this.anyDead = 0;
+    for (const list of this.typed.values()) this.deactivate(list);
+    this.deactivate(this.anyHandlers);
     this.frame.length = 0;
+    if (this.dispatchDepth === 0) {
+      this.compactDirtyLists();
+      this.typed.clear();
+    }
+  }
+
+  private subscribe(
+    list: HandlerList,
+    handler: (event: KernelEvent) => void,
+    name: string,
+  ): Unsubscribe {
+    const subscription: Subscription = { handler, name, active: true };
+    list.entries.push(subscription);
+    return (): void => {
+      if (!subscription.active) return;
+      subscription.active = false;
+      this.markDirty(list);
+      if (this.dispatchDepth === 0) this.compactDirtyLists();
+    };
   }
 
   private dispatch(event: KernelEvent): void {
     this.frame.push(event);
-
     const list = this.typed.get(event.type);
-    if (list !== undefined) {
-      if ((this.typedDead.get(event.type) ?? 0) > 0) {
-        this.compact(list);
-        this.typedDead.set(event.type, 0);
-      }
-      for (let i = 0; i < list.length; i++) {
-        const handler = list[i];
-        if (handler !== null && handler !== undefined) {
-          (handler as (e: KernelEvent) => void)(event);
-        }
-      }
+    const typedLength = list?.entries.length ?? 0;
+    const anyLength = this.anyHandlers.entries.length;
+    this.dispatchDepth += 1;
+    try {
+      if (list !== undefined) this.deliver(list, typedLength, event);
+      this.deliver(this.anyHandlers, anyLength, event);
+    } finally {
+      this.dispatchDepth -= 1;
+      // Nested emissions must not shift an outer emission's captured indexes.
+      if (this.dispatchDepth === 0) this.compactDirtyLists();
     }
+  }
 
-    if (this.anyDead > 0) {
-      this.compact(this.anyHandlers);
-      this.anyDead = 0;
-    }
-    for (let i = 0; i < this.anyHandlers.length; i++) {
-      const handler = this.anyHandlers[i];
-      if (handler !== null && handler !== undefined) {
-        handler(event);
+  private deliver(list: HandlerList, length: number, event: KernelEvent): void {
+    for (let i = 0; i < length; i++) {
+      const subscription = list.entries[i];
+      if (subscription === undefined || !subscription.active) continue;
+      try {
+        subscription.handler(event);
+      } catch (error: unknown) {
+        this.failures.push({ name: subscription.name, error });
       }
     }
   }
 
-  /**
-   * Remove null slots. Runs only after an unsubscribe, never per event, so the
-   * allocation-free emit path is preserved.
-   */
-  private compact<H>(list: Slot<H>[]): void {
-    let write = 0;
-    for (let read = 0; read < list.length; read++) {
-      const value = list[read];
-      if (value !== null && value !== undefined) {
-        list[write] = value;
+  private deactivate(list: HandlerList): void {
+    for (let i = 0; i < list.entries.length; i++) {
+      const subscription = list.entries[i];
+      if (subscription !== undefined) subscription.active = false;
+    }
+    this.markDirty(list);
+  }
+
+  private markDirty(list: HandlerList): void {
+    if (list.dirty) return;
+    list.dirty = true;
+    this.dirtyLists.push(list);
+  }
+
+  private compactDirtyLists(): void {
+    while (this.dirtyLists.length > 0) {
+      const list = this.dirtyLists.pop();
+      if (list === undefined) continue;
+      let write = 0;
+      for (let read = 0; read < list.entries.length; read++) {
+        const subscription = list.entries[read];
+        if (subscription === undefined || !subscription.active) continue;
+        list.entries[write] = subscription;
         write += 1;
       }
+      list.entries.length = write;
+      list.dirty = false;
     }
-    list.length = write;
   }
 }

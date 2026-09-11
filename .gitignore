@@ -4,3 +4,5 @@ dist/
 *.local
 coverage/
 .vite/
+.stale/
+_to_delete/

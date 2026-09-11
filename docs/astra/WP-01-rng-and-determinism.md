@@ -61,6 +61,21 @@ src/kernel/index.ts       (create it if absent; export only what section 1.6 lis
 
 Nothing else. `src/kernel/types.ts` is frozen and read-only.
 
+**Path reconciliation, decided after the first implementation attempt.** The
+scaffold shipped `src/kernel/rng.ts` while this list names `src/kernel/rng/`.
+Folding the generator into the existing `rng.ts` was correct, but leaving
+`src/kernel/rng/streams.ts` beside it creates a file and a directory with the
+same name. `@kernel/rng` currently resolves to `rng.ts` in tsc, vite and vitest,
+so it works, and it stops working the day anyone adds `src/kernel/rng/index.ts`.
+Resolve it one of two ways and say which you chose:
+
+- consolidate into the folder: `src/kernel/rng/index.ts` holds the generator,
+  `src/kernel/rng/streams.ts` stays, and the bare `rng.ts` goes away; or
+- consolidate into the file: `streams.ts` moves to `src/kernel/rngStreams.ts`
+  and the `rng/` directory goes away.
+
+Either is acceptable. A file shadowing a directory is not.
+
 ## Frozen contracts
 
 From `src/kernel/types.ts`. These may not be edited. If this package cannot be
@@ -474,7 +489,7 @@ write, unskipped:
 
 | Case | Assertion |
 |---|---|
-| `forbidden identifiers` | reading every `.ts` file under `src/kernel/` and matching against the forbidden list from architecture 1.4 produces zero hits. Read files with `node:fs`; strip nothing, since the rule covers comments and template strings too |
+| `forbidden identifiers` | reading every `.ts` file under `src/kernel/` and matching against the forbidden list from architecture 1.4 produces zero hits. Read files with `node:fs` and blank comments before matching, via `stripComments(source, false)` from `tests/kernel/sourceScan.ts`. Keep string literals, so computed access like `Math['random']` is still caught. The rule governs code: the frozen `types.ts` and `Kernel.ts` headers state the prohibition in prose and must not be flagged |
 | `no three import` | no file under `src/kernel/` contains an import specifier starting with `three` |
 | `canonical stability` | `canonical(x) === canonical(x)` for a nested fixture containing a `Map`, a `Set`, an array and a `-0` |
 | `canonical key order` | two objects with the same entries inserted in different orders serialise identically |
