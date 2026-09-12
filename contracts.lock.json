@@ -5,8 +5,8 @@
     "src/game/types.ts": "ef746b6f9be1ea9222d92825ad32cad2ba1a7f41ae5e7300a6a8167415a5e47a"
   },
   "scanner": "tests/kernel/sourceScan.ts",
-  "skipBudget": 4,
-  "skipBudgetNote": "Matches the committed tree, where WP-01 left four determinism tests skipped pending createKernel from WP-02. WP-02 unskips all four, and lowering this to 0 is part of closing it. The budget only ever moves down, and only in a commit that says why.",
+  "skipBudget": 0,
+  "skipBudgetNote": "Zero since WP-02. The four determinism tests that WP-01 deferred pending createKernel are live and passing. The budget only ever moves down, and only in a commit that says why.",
   "forbiddenTerms": [
     "tron",
     "encom",

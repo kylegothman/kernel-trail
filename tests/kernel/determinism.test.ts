@@ -4,14 +4,10 @@
  * and stepped the same number of ticks produces a byte-identical event log and
  * snapshot every time.
  *
- * NOTE ON SCOPE. Phases 1 to 10 of `step()` are stubs at this commit, so the
- * event log these kernels produce is empty and the snapshot changes only in
- * `tick`. That does not make these tests vacuous: they exercise the real
- * constructor, the real RNG stream registry, the real tick counter, the real
- * snapshot and restore, and the real invariant harness, and they fail loudly the
- * moment a phase body introduces nondeterminism. Every assertion here is
- * retained below as FCFS scaffold regressions. The four exact reference cases
- * use RR and stay skipped until the required kernel and scheduler work lands.
+ * The four reference tests now run through the WP-02 bootstrap FCFS. Their
+ * init-only snapshots exercise the retained scaffold restore path. Populated
+ * workload replay is tested in stepOrder.test.ts; saving those workloads needs
+ * the frozen KernelSnapshot extension reported for WP-11.
  */
 
 import { describe, expect, it, test } from 'vitest';
@@ -73,8 +69,7 @@ const TICKS = 5000;
 const canonicalLog = (events: readonly KernelEvent[]): string => canonical(events);
 const canonicalSnapshot = (s: KernelSnapshot): string => canonical(checksumSafeSnapshot(s));
 
-// TODO(astra): enable when WP-02 lands createKernel
-test.skip('D1: identical construction produces identical event logs', () => {
+test('D1: identical construction produces identical event logs', () => {
   const a = createKernel(CONFIG);
   const b = createKernel(CONFIG);
   const ea = a.run(TICKS);
@@ -83,8 +78,7 @@ test.skip('D1: identical construction produces identical event logs', () => {
   expect(canonical(b.snapshot())).toBe(canonical(a.snapshot()));
 });
 
-// TODO(astra): enable when WP-02 lands createKernel
-test.skip('D2: snapshot/restore mid-run is transparent', () => {
+test('D2: snapshot/restore mid-run is transparent', () => {
   const a = createKernel(CONFIG);
   a.run(2000);
   const snap = structuredClone(a.snapshot());
@@ -98,8 +92,7 @@ test.skip('D2: snapshot/restore mid-run is transparent', () => {
   expect(canonical(b.snapshot())).toBe(canonical(a.snapshot()));
 });
 
-// TODO(astra): enable when WP-02 lands createKernel
-test.skip('D3: adding a subsystem stream does not shift existing streams', () => {
+test('D3: adding a subsystem stream does not shift existing streams', () => {
   const withoutIo = { ...CONFIG, enabledSubsystems: CONFIG.enabledSubsystems.filter(s => s !== 'io') };
   const a = createKernel(withoutIo);
   const b = createKernel(CONFIG);
@@ -110,8 +103,7 @@ test.skip('D3: adding a subsystem stream does not shift existing streams', () =>
   expect(canonical(sb.map(strip('seq')))).toBe(canonical(sa.map(strip('seq'))));
 });
 
-// TODO(astra): enable when WP-02 lands createKernel
-test.skip('D4: seed sweep is stable across runs', () => {
+test('D4: seed sweep is stable across runs', () => {
   for (let seed = 0; seed < 64; seed++) {
     const c = { ...CONFIG, seed };
     const h1 = hash(canonical(createKernel(c).run(1000)));

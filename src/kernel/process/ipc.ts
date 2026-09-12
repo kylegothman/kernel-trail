@@ -1,0 +1,368 @@
+import { KernelInvariantError } from '../errors';
+import { asPageId, asResourceId } from '../types';
+import type {
+  AccessRight,
+  AddressSpaceId,
+  BlockReason,
+  Frame,
+  FrameId,
+  PageId,
+  PageTableEntry,
+  Pid,
+  ProcessControlBlock,
+  ResourceId,
+  SyscallResult,
+  Tick,
+} from '../types';
+
+export interface SharedRegion {
+  readonly id: ResourceId;
+  readonly pages: readonly PageId[];
+  readonly space: AddressSpaceId;
+  attached: Pid[];
+  /** The single integer the region holds, for the race detector in section 8.6. */
+  value: number;
+}
+
+export interface Mailbox {
+  readonly id: ResourceId;
+  readonly capacity: number;
+  queue: Message[];
+  sendWaiters: Pid[];
+  recvWaiters: Pid[];
+}
+
+export interface Message {
+  readonly from: Pid;
+  readonly tick: Tick;
+  readonly payload: number;
+}
+
+export interface IpcHooks {
+  readonly process: (pid: Pid) => ProcessControlBlock | undefined;
+  readonly pageTable: (space: AddressSpaceId) => PageTableEntry[];
+  readonly frame: (id: FrameId) => Frame | undefined;
+  readonly rights: (pid: Pid, region: ResourceId) => readonly AccessRight[];
+  readonly block: (pid: Pid, reason: BlockReason) => void;
+}
+
+interface RegionMapping {
+  readonly space: AddressSpaceId;
+  readonly pages: readonly PageId[];
+}
+
+type PendingOperation =
+  | { readonly kind: 'send'; readonly mailbox: ResourceId; readonly message: Message }
+  | { readonly kind: 'recv'; readonly mailbox: ResourceId };
+
+const completed: SyscallResult = Object.freeze({ ok: true, value: null });
+
+/** Owns IPC state; process transitions and protection decisions stay with their owners. */
+export class IpcManager {
+  private readonly regions = new Map<ResourceId, SharedRegion>();
+  private readonly regionOrder: ResourceId[] = [];
+  private readonly mappings = new Map<ResourceId, Map<Pid, RegionMapping>>();
+  private readonly mailboxes = new Map<ResourceId, Mailbox>();
+  private readonly mailboxOrder: ResourceId[] = [];
+  private readonly pending = new Map<Pid, PendingOperation>();
+  private readonly completions = new Map<Pid, SyscallResult>();
+  private readonly completedWaits = new Map<Pid, ResourceId>();
+  private readonly originalPins = new Map<FrameId, boolean>();
+
+  constructor(private readonly hooks: IpcHooks) {}
+
+  get hasState(): boolean { return this.regions.size > 0 || this.mailboxes.size > 0; }
+
+  createSharedRegion(region: SharedRegion): SharedRegion {
+    if (this.regions.has(region.id)) throw new Error(`shared region already exists: ${region.id}`);
+    if (region.pages.length === 0 || !Number.isSafeInteger(region.value)) {
+      throw new Error('shared region requires pages and an integer value');
+    }
+    if (region.attached.length !== 0) throw new Error('shared region must start unattached');
+    const pages = [...region.pages];
+    if (pages.some((page, index) => !Number.isSafeInteger(page) || page < 0 || pages.indexOf(page) !== index)) {
+      throw new Error('shared region pages must be distinct nonnegative integers');
+    }
+    const stored: SharedRegion = { ...region, pages, attached: [] };
+    this.regions.set(region.id, stored);
+    this.mappings.set(region.id, new Map());
+    insertResource(this.regionOrder, region.id);
+    return stored;
+  }
+
+  sharedRegion(id: ResourceId): SharedRegion | undefined {
+    return this.regions.get(id);
+  }
+
+  createMailbox(id: ResourceId, capacity: number): Mailbox {
+    if (!Number.isSafeInteger(capacity) || capacity < 0) {
+      throw new Error('mailbox capacity must be a nonnegative integer');
+    }
+    if (this.mailboxes.has(id)) throw new Error(`mailbox already exists: ${id}`);
+    const mailbox: Mailbox = { id, capacity, queue: [], sendWaiters: [], recvWaiters: [] };
+    this.mailboxes.set(id, mailbox);
+    insertResource(this.mailboxOrder, id);
+    return mailbox;
+  }
+
+  mailbox(id: ResourceId): Mailbox | undefined {
+    return this.mailboxes.get(id);
+  }
+
+  mmap(pid: Pid, id: ResourceId, writable?: boolean): SyscallResult {
+    const pcb = this.hooks.process(pid);
+    if (!isLive(pcb)) return noProcess();
+    const region = this.regions.get(id);
+    const mappings = this.mappings.get(id);
+    if (region === undefined || mappings === undefined) return noRegion();
+    const rights = this.hooks.rights(pid, id);
+    if (!rights.includes('read') || (writable === true && !rights.includes('write'))) {
+      return { ok: false, errno: 'EACCES', message: 'shared region access denied' };
+    }
+    const existing = mappings.get(pid);
+    if (existing !== undefined) {
+      return { ok: false, errno: 'EBUSY', message: 'shared region already attached' };
+    }
+    const sourceTable = this.hooks.pageTable(region.space);
+    const sources = region.pages.map(page => sourceTable.find(entry => entry.page === page));
+    if (sources.some(entry => entry === undefined)) {
+      return { ok: false, errno: 'ENOMEM', message: 'shared region page table is unavailable' };
+    }
+    const targetTable = this.hooks.pageTable(pcb.addressSpaceId);
+    const firstPage = targetTable.reduce((next, entry) => Math.max(next, entry.page + 1), 0);
+    if (!Number.isSafeInteger(firstPage + region.pages.length - 1)) {
+      return { ok: false, errno: 'ENOMEM', message: 'address space exhausted' };
+    }
+    const mappedPages: PageId[] = [];
+    for (const source of sources) {
+      if (source === undefined) throw new KernelInvariantError(11, 'shared region source disappeared');
+      const page = asPageId(firstPage + mappedPages.length);
+      targetTable.push({
+        ...source,
+        page,
+        readable: true,
+        writable: writable ?? rights.includes('write'),
+        executable: rights.includes('execute'),
+      });
+      mappedPages.push(page);
+    }
+    mappings.set(pid, { space: pcb.addressSpaceId, pages: mappedPages });
+    insertPid(region.attached, pid);
+    this.refreshSharedMappings();
+    return { ok: true, value: firstPage };
+  }
+
+  munmap(pid: Pid, id: ResourceId): SyscallResult {
+    const region = this.regions.get(id);
+    const mappings = this.mappings.get(id);
+    if (region === undefined || mappings === undefined) return noRegion();
+    const mapping = mappings.get(pid);
+    if (mapping === undefined) return { ok: false, errno: 'EINVAL', message: 'shared region is not attached' };
+    const table = this.hooks.pageTable(mapping.space);
+    for (let index = table.length - 1; index >= 0; index -= 1) {
+      const entry = table[index];
+      if (entry !== undefined && mapping.pages.includes(entry.page)) table.splice(index, 1);
+    }
+    mappings.delete(pid);
+    removePid(region.attached, pid);
+    this.refreshSharedMappings();
+    return completed;
+  }
+
+  munmapRange(pid: Pid, firstPage: PageId, count: number): SyscallResult {
+    for (const id of this.regionOrder) {
+      const mapping = this.mappings.get(id)?.get(pid);
+      if (mapping !== undefined && mapping.pages[0] === firstPage && mapping.pages.length === count) {
+        return this.munmap(pid, id);
+      }
+    }
+    return { ok: false, errno: 'EINVAL', message: 'range does not match an attached shared region' };
+  }
+
+  /** WP-05 calls this after loading a previously invalid shared page. */
+  refreshSharedMappings(): void {
+    const activeFrames: FrameId[] = [];
+    for (const id of this.regionOrder) {
+      const region = this.regions.get(id);
+      const mappings = this.mappings.get(id);
+      if (region === undefined || mappings === undefined || region.attached.length === 0) continue;
+      const sourceTable = this.hooks.pageTable(region.space);
+      for (let offset = 0; offset < region.pages.length; offset += 1) {
+        const page = region.pages[offset];
+        const source = sourceTable.find(entry => entry.page === page);
+        if (source === undefined) throw new KernelInvariantError(11, 'attached shared region lost a page');
+        if (source.frame !== null && !activeFrames.includes(source.frame)) activeFrames.push(source.frame);
+        for (const pid of region.attached) {
+          const mapping = mappings.get(pid);
+          if (mapping === undefined) throw new KernelInvariantError(11, 'shared region mapping is missing');
+          const mappedPage = mapping.pages[offset];
+          const target = this.hooks.pageTable(mapping.space).find(entry => entry.page === mappedPage);
+          if (target === undefined) throw new KernelInvariantError(11, 'attached shared page is missing');
+          target.frame = source.frame;
+          target.valid = source.valid;
+          target.swapped = source.swapped;
+        }
+      }
+    }
+    activeFrames.sort((a, b) => a - b);
+    const previousFrames = [...this.originalPins.keys()].sort((a, b) => a - b);
+    for (const id of previousFrames) {
+      if (activeFrames.includes(id)) continue;
+      const frame = this.hooks.frame(id);
+      const original = this.originalPins.get(id);
+      if (frame !== undefined && original !== undefined) frame.pinned = original;
+      this.originalPins.delete(id);
+    }
+    for (const id of activeFrames) {
+      const frame = this.hooks.frame(id);
+      if (frame === undefined) throw new KernelInvariantError(11, 'shared region frame is missing');
+      if (!this.originalPins.has(id)) this.originalPins.set(id, frame.pinned);
+      frame.pinned = true;
+    }
+  }
+
+  send(pid: Pid, id: ResourceId, payload: number, tick: Tick): SyscallResult {
+    const failure = this.operationFailure(pid, id);
+    if (failure !== undefined) return failure;
+    if (!Number.isFinite(payload)) {
+      return { ok: false, errno: 'EINVAL', message: 'message payload must be finite' };
+    }
+    const mailbox = this.requireMailbox(id);
+    const message: Message = { from: pid, tick, payload };
+    const receiver = mailbox.recvWaiters.shift();
+    if (receiver !== undefined) {
+      this.finish(receiver, { ok: true, value: payload });
+      return completed;
+    }
+    if (mailbox.queue.length < mailbox.capacity) {
+      mailbox.queue.push(message);
+      return completed;
+    }
+    mailbox.sendWaiters.push(pid);
+    this.pending.set(pid, { kind: 'send', mailbox: id, message });
+    this.hooks.block(pid, { kind: 'semaphore', resource: asResourceId(`mbox:${id}:send`) });
+    return completed;
+  }
+
+  receive(pid: Pid, id: ResourceId): SyscallResult {
+    const failure = this.operationFailure(pid, id);
+    if (failure !== undefined) return failure;
+    const mailbox = this.requireMailbox(id);
+    const queued = mailbox.queue.shift();
+    if (queued !== undefined) {
+      this.fillVacancy(mailbox);
+      return { ok: true, value: queued.payload };
+    }
+    const sender = mailbox.sendWaiters.shift();
+    if (sender !== undefined) {
+      const pending = this.pending.get(sender);
+      if (pending?.kind !== 'send' || pending.mailbox !== id) {
+        throw new KernelInvariantError(11, 'mailbox sender has no pending message');
+      }
+      this.finish(sender, completed);
+      return { ok: true, value: pending.message.payload };
+    }
+    mailbox.recvWaiters.push(pid);
+    this.pending.set(pid, { kind: 'recv', mailbox: id });
+    this.hooks.block(pid, { kind: 'semaphore', resource: asResourceId(`mbox:${id}:recv`) });
+    return completed;
+  }
+
+  matchesWait(pid: Pid, reason: BlockReason): boolean {
+    if (reason.kind !== 'semaphore') return false;
+    const operation = this.pending.get(pid);
+    const resource = operation === undefined ? this.completedWaits.get(pid)
+      : asResourceId(`mbox:${operation.mailbox}:${operation.kind === 'send' ? 'send' : 'recv'}`);
+    return resource === reason.resource;
+  }
+
+  hasCompletion(pid: Pid): boolean {
+    return this.completions.has(pid);
+  }
+
+  hasMailboxWait(pid: Pid): boolean {
+    return this.pending.has(pid) || this.completions.has(pid);
+  }
+
+  /** Consumed by phase 4, so phase 8 never inserts a woken peer in the ready queue. */
+  takeCompletion(pid: Pid): SyscallResult | undefined {
+    const result = this.completions.get(pid);
+    this.completions.delete(pid);
+    this.completedWaits.delete(pid);
+    return result;
+  }
+
+  removeProcess(pid: Pid): void {
+    for (const id of this.regionOrder) {
+      if (this.mappings.get(id)?.has(pid) === true) this.munmap(pid, id);
+    }
+    for (const id of this.mailboxOrder) {
+      const mailbox = this.requireMailbox(id);
+      removePid(mailbox.sendWaiters, pid);
+      removePid(mailbox.recvWaiters, pid);
+    }
+    this.pending.delete(pid);
+    this.completions.delete(pid);
+    this.completedWaits.delete(pid);
+  }
+
+  private operationFailure(pid: Pid, id: ResourceId): SyscallResult | undefined {
+    if (!isLive(this.hooks.process(pid))) return noProcess();
+    if (!this.mailboxes.has(id)) return { ok: false, errno: 'ENOENT', message: 'no such mailbox' };
+    if (this.hasMailboxWait(pid)) {
+      return { ok: false, errno: 'EBUSY', message: 'process already has a pending mailbox operation' };
+    }
+    return undefined;
+  }
+
+  private fillVacancy(mailbox: Mailbox): void {
+    const sender = mailbox.sendWaiters.shift();
+    if (sender === undefined) return;
+    const pending = this.pending.get(sender);
+    if (pending?.kind !== 'send' || pending.mailbox !== mailbox.id) {
+      throw new KernelInvariantError(11, 'mailbox sender has no pending message');
+    }
+    mailbox.queue.push(pending.message);
+    this.finish(sender, completed);
+  }
+
+  private finish(pid: Pid, result: SyscallResult): void {
+    const operation = this.pending.get(pid);
+    if (operation !== undefined) this.completedWaits.set(pid, asResourceId(`mbox:${operation.mailbox}:${operation.kind === 'send' ? 'send' : 'recv'}`));
+    this.pending.delete(pid);
+    this.completions.set(pid, result);
+  }
+
+  private requireMailbox(id: ResourceId): Mailbox {
+    const mailbox = this.mailboxes.get(id);
+    if (mailbox === undefined) throw new KernelInvariantError(11, 'mailbox disappeared');
+    return mailbox;
+  }
+}
+
+function isLive(pcb: ProcessControlBlock | undefined): pcb is ProcessControlBlock {
+  return pcb !== undefined && pcb.state !== 'zombie' && pcb.state !== 'terminated';
+}
+
+function noProcess(): SyscallResult {
+  return { ok: false, errno: 'ESRCH', message: 'no such process' };
+}
+
+function noRegion(): SyscallResult {
+  return { ok: false, errno: 'ENOENT', message: 'no such shared region' };
+}
+
+function insertResource(order: ResourceId[], id: ResourceId): void {
+  const index = order.findIndex(existing => existing > id);
+  order.splice(index === -1 ? order.length : index, 0, id);
+}
+
+function insertPid(order: Pid[], pid: Pid): void {
+  const index = order.findIndex(existing => existing > pid);
+  order.splice(index === -1 ? order.length : index, 0, pid);
+}
+
+function removePid(order: Pid[], pid: Pid): void {
+  const index = order.indexOf(pid);
+  if (index !== -1) order.splice(index, 1);
+}

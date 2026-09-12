@@ -1,26 +1,15 @@
-/**
- * KERNEL TRAIL - the simulator.
- *
- * Pure, deterministic, headless. Nothing here imports three, touches the DOM,
- * or calls `Math.random`, `Date.now` or `performance.now`; the guard rail is
- * tests/kernel/boundaries.test.ts.
- *
- * WHAT IS REAL IN THIS FILE:
- *   - the constructor, including the RNG stream registry of sim spec 1.2.5
- *   - the tick counter and the fixed eleven-phase `step()` order of sim spec 2.1
- *   - `run`, `snapshot`, `restore`
- *   - the invariant harness of sim spec 15 (phase 11), behind the DEV flag
- *
- * WHAT IS NOT: the bodies of phases 1 to 10, and the subsystem state they
- * mutate. Each is stubbed with a TODO naming its sim spec section. The state
- * containers those phases will fill are declared and initialised here so that
- * `snapshot`, `restore` and the invariants are real, executing code from the
- * first commit rather than something switched on later.
- */
-
-import { KernelEventBus } from './EventBus';
-import { createStreamRegistry, type StreamRegistry } from './rng';
+/** KERNEL TRAIL: deterministic process engine and eleven-phase orchestrator. */
+import { KernelEventBus, type EmittableEvent } from './EventBus';
+import { createStreams, type StreamRegistry } from './rngStreams';
 import { createScheduler, isMetricsAware, isRunningAware } from './scheduler/SchedulerRegistry';
+import { KernelInvariantError } from './errors';
+import { DEFAULT_TUNING, resolveTuning, validateConfig, type KernelTuning } from './config';
+import { ProcessTable } from './process/ProcessTable';
+import { transition, type TransitionOptions } from './process/transitions';
+import { ProcessLifecycle } from './process/lifecycle';
+import { ThreadManager, type ThreadControlBlock } from './process/threads';
+import { generatedProgram, scriptedProgram, instructionProgram, type Program, type ProgramSpec } from './process/Program';
+import { IpcManager } from './process/ipc';
 import type {
   AddressSpaceId,
   AllocationStrategy,
@@ -58,60 +47,9 @@ import type {
   SyscallRequest,
   SyscallResult,
   Tick,
+  Tid, BlockReason, DomainId, FileDescriptor, DeviceId, AccessRight, Unsubscribe, SchedulerSnapshot,
 } from './types';
-import { asFrameId, asTick } from './types';
-
-/* ------------------------------------------------------------------ */
-/* Dev flag and the invariant error                                    */
-/* ------------------------------------------------------------------ */
-
-/**
- * Phase 11 runs only when this is true. It is a constructor option rather than
- * a global, because reading `import.meta.env` or `process.env` from inside
- * src/kernel would make the simulator depend on its host, and the whole point
- * of a headless kernel is that it does not.
- */
-export interface KernelOptions {
-  /** Defaults to true. Production bundles pass false; phase 11 then no-ops. */
-  readonly devBuild?: boolean;
-  /** Sim spec 9: how often deadlock detection runs. Default 20. */
-  readonly deadlockDetectionInterval?: number;
-  /** Sim spec 15 I-29: how often the expensive block-exclusivity check runs. */
-  readonly invariantSlowInterval?: number;
-}
-
-export class InvariantViolation extends Error {
-  constructor(
-    readonly invariant: number,
-    message: string,
-    readonly tick: number,
-  ) {
-    super(`I-${invariant} violated at tick ${tick}: ${message}`);
-    this.name = 'InvariantViolation';
-  }
-}
-
-/* ------------------------------------------------------------------ */
-/* Legal state transitions, sim spec 3.3                               */
-/* ------------------------------------------------------------------ */
-
-/** The edge table of sim spec 3.3. Invariant I-11 admits nothing else. */
-const LEGAL_TRANSITIONS: ReadonlySet<string> = new Set([
-  'new>ready', // T2
-  'ready>running', // T3
-  'running>ready', // T4
-  'running>waiting', // T5
-  'waiting>ready', // T6
-  'running>zombie', // T7
-  'ready>zombie', // T8
-  'waiting>zombie', // T9
-  'zombie>terminated', // T10
-  'new>terminated', // T11
-]);
-
-/* ------------------------------------------------------------------ */
-/* Internal state                                                      */
-/* ------------------------------------------------------------------ */
+import { asFrameId, asTick, asPid, asPageId } from './types';
 
 const EMPTY_SCHEDULING_METRICS: SchedulingMetrics = {
   averageWaitingTime: 0,
@@ -137,7 +75,23 @@ const EMPTY_MEMORY_METRICS: MemoryMetrics = {
   tlbHitRate: 0,
 };
 
-/** One TLB entry. Sim spec 6.5. Declared here so invariant I-9 is executable. */
+export const MAX_PRIORITY = 39;
+export interface KernelOptions extends Partial<KernelTuning> {
+  readonly devBuild?: boolean;
+  readonly invariantSlowInterval?: number;
+}
+export interface SpawnOptions {
+  readonly program?: Program;
+  readonly parent?: Pid;
+  readonly serialFraction?: number;
+  readonly threadCount?: number;
+}
+export class InvariantViolation extends KernelInvariantError {
+  constructor(invariant: number, message: string, readonly tick: number) {
+    super(invariant, `I-${invariant} violated at tick ${tick}: ${message}`);
+    this.name = 'InvariantViolation';
+  }
+}
 export interface TlbEntry {
   readonly space: AddressSpaceId;
   readonly page: PageId;
@@ -146,158 +100,278 @@ export interface TlbEntry {
   lastUsedTick: Tick;
 }
 
-/** The highest priority number a process may hold. Sim spec 15 I-15. */
-export const MAX_PRIORITY = 39;
+export interface MemoryHooks {
+  expireTimers(tick: Tick): void;
+  admit(pcb: ProcessControlBlock): void;
+  access(pid: Pid, page: PageId, write: boolean): { readonly hit: boolean };
+  isSatisfied(pid: Pid, reason: BlockReason): boolean;
+  allocateFrame(space: AddressSpaceId, page: PageId): FrameId | null;
+  freeFrame(frame: FrameId): void;
+  copyFrame(from: FrameId, to: FrameId): void;
+}
+export interface SyncHooks {
+  expireTimers(tick: Tick): void;
+  isSatisfied(pid: Pid, reason: BlockReason): boolean;
+  acquire(pid: Pid, resource: ResourceId): void;
+  release(pid: Pid, resource: ResourceId): void;
+  releaseAll(pcb: ProcessControlBlock): void;
+  removeWaiter(pid: Pid): void;
+}
+export interface IoHooks {
+  serviceCompletions(tick: Tick): void;
+  deliverInterrupts(tick: Tick): void;
+  isSatisfied(pid: Pid, reason: BlockReason): boolean;
+  request(pid: Pid, device: DeviceId): void;
+  removeWaiter(pid: Pid): void;
+}
+export interface StorageHooks { expireTimers(tick: Tick): void }
+export interface FsHooks {
+  expireTimers(tick: Tick): void;
+  retainDescriptor(fd: FileDescriptor): void;
+  closeDescriptor(pcb: ProcessControlBlock, fd: FileDescriptor): void;
+  closeOnExec(pcb: ProcessControlBlock, fd: FileDescriptor): boolean;
+}
+export interface SecurityHooks { rights(pid: Pid, resource: ResourceId): readonly AccessRight[] }
+export interface DeadlockHooks { maybeDetect(tick: Tick): void }
+// SchedulerPolicy has no aging member. Keep this hook separate from the contract.
+export interface SchedulerHooks { ageAndDetectStarvation(ctx: SchedulerContext): void }
+export interface InvariantHooks { check(kernel: KernelImpl): void }
+export interface KernelHooks {
+  memory: Partial<MemoryHooks>; sync: Partial<SyncHooks>; io: Partial<IoHooks>;
+  storage: Partial<StorageHooks>; fs: Partial<FsHooks>; security: Partial<SecurityHooks>;
+  deadlock: Partial<DeadlockHooks>; scheduler: Partial<SchedulerHooks>; invariants: InvariantHooks;
+}
+const noop = (): void => {};
+
+// TODO(astra): replaced by the scheduler registry in WP-03
+class BootstrapFcfs implements SchedulerPolicy {
+  readonly id = 'fcfs';
+  readonly displayName = 'Bootstrap FCFS';
+  readonly isPreemptive = false;
+  private readonly queue: Pid[] = [];
+  private running: Pid | null = null;
+  private metrics: SchedulingMetrics = EMPTY_SCHEDULING_METRICS;
+  private readonly view: SchedulerSnapshot;
+  constructor() {
+    const self = this;
+    this.view = { policy: 'fcfs', queues: [this.queue], quantumRemaining: 0,
+      get running() { return self.running; }, get metrics() { return self.metrics; } };
+  }
+  configure(_params: SchedulerParams): void {}
+  onAdmit(pcb: ProcessControlBlock, _ctx: SchedulerContext): void { this.enqueue(pcb.pid); }
+  onUnblock(pcb: ProcessControlBlock, _ctx: SchedulerContext): void { this.enqueue(pcb.pid); }
+  onBlock(pcb: ProcessControlBlock, _ctx: SchedulerContext): void { this.remove(pcb.pid); }
+  onExit(pcb: ProcessControlBlock, _ctx: SchedulerContext): void { this.remove(pcb.pid); }
+  onTick(ctx: SchedulerContext) {
+    const current = ctx.running === null ? undefined : ctx.process(ctx.running);
+    const next = current?.state === 'running' ? current.pid : this.queue.shift() ?? null;
+    return { next, isContextSwitch: next !== ctx.running, rationale: 'FCFS: earliest ready process' };
+  }
+  snapshot(): SchedulerSnapshot { return this.view; }
+  setRunning(pid: Pid | null): void { this.running = pid; }
+  acceptMetrics(metrics: SchedulingMetrics): void { this.metrics = metrics; }
+  private enqueue(pid: Pid): void { if (!this.queue.includes(pid)) this.queue.push(pid); }
+  private remove(pid: Pid): void {
+    const index = this.queue.indexOf(pid);
+    if (index >= 0) this.queue.splice(index, 1);
+  }
+}
 
 export class KernelImpl implements Kernel {
-  readonly config: Readonly<KernelConfig>;
-  readonly events: KernelEventBus;
-
-  private currentTick: Tick = asTick(0);
-
-  /* ---- determinism ---- */
+  private currentConfig: Readonly<KernelConfig>;
+  get config(): Readonly<KernelConfig> { return this.currentConfig; }
+  readonly tuning: KernelTuning;
+  readonly events = new KernelEventBus();
+  readonly table = new ProcessTable();
+  readonly threads: ThreadManager;
+  readonly lifecycle: ProcessLifecycle;
+  readonly ipc: IpcManager;
+  readonly pageTables = new Map<AddressSpaceId, PageTableEntry[]>();
+  private currentTick = asTick(0);
   private readonly rng: StreamRegistry;
-
-  /* ---- processes ---- */
-  private readonly pcbs = new Map<Pid, ProcessControlBlock>();
-  /** Strictly ascending. Invariant I-1. */
-  private orderedPids: Pid[] = [];
-  private running: Pid | null = null;
-  private sliceElapsed = 0;
-  /** Set at admission, adjusted only by the Amdahl recomputation. I-4. */
-  private readonly totalServiceAtAdmission = new Map<Pid, number>();
-  /** Per-process program counter into its `Program`. Sim spec 2.3. I-8. */
-  private readonly programCounters = new Map<Pid, number>();
-
-  /* ---- per-tick bookkeeping, for cross-tick invariants ---- */
-  private readonly stateAtTickStart = new Map<Pid, ProcessState>();
-  private readonly pcAtTickStart = new Map<Pid, number>();
-  private readonly faultedThisTick = new Set<Pid>();
+  private enabled: ReadonlySet<SubsystemId>;
+  private hooksInstalled = false;
+  private requestedScheduler: SchedulerId;
+  private readonly programs = new Map<Pid, Program>();
+  private readonly namedPrograms = new Map<string, Program>();
+  private readonly burstSizes = new Map<Pid, number>();
+  private readonly syscallResults = new Map<Pid, SyscallResult>();
+  private readonly wakeable = new Set<Pid>();
+  private readonly probes = new Set<(phase: number, tick: Tick) => void>();
   private readonly admittedThisTick = new Set<Pid>();
-
-  /* ---- scheduling ---- */
+  private nextSpace = 2;
+  private running: Pid | null = null;
+  private lastCpuOwner: Pid | null = null;
+  private executingThread: Tid | undefined;
+  private sliceElapsed = 0;
+  private switchDebt = 0;
+  private readonly copyDebt = new Map<Pid, number>();
   private scheduler: SchedulerPolicy;
   private schedulerParams: SchedulerParams;
   private contextSwitches = 0;
-  private busyTicks = 0;
-
-  /* ---- memory ---- */
   private frames: Frame[] = [];
-  /** Strictly ascending. Invariant I-20. */
   private freeList: FrameId[] = [];
-  private readonly pageTables = new Map<AddressSpaceId, Map<PageId, PageTableEntry>>();
   private tlb: TlbEntry[] = [];
-  private replacementPolicyId: PageReplacementId;
-  private allocationStrategy: AllocationStrategy;
-
-  /* ---- sync, deadlock ---- */
   private syncPrimitives: SyncPrimitive[] = [];
   private resources: ResourceType[] = [];
-
-  /* ---- storage, io, fs, security ---- */
   private diskQueue: DiskRequest[] = [];
   private diskHead: DiskHead;
-  private diskPolicyId: DiskSchedulingId;
   private devices: Device[] = [];
   private inodes: Inode[] = [];
   private journal: JournalEntry[] = [];
   private domains: ProtectionDomain[] = [];
-
-  /* ---- metrics ---- */
   private schedulingMetrics: SchedulingMetrics = EMPTY_SCHEDULING_METRICS;
   private memoryMetrics: MemoryMetrics = EMPTY_MEMORY_METRICS;
-
-  /* ---- options ---- */
-  private readonly devBuild: boolean;
-  private readonly deadlockDetectionInterval: number;
   private readonly invariantSlowInterval: number;
-  private readonly enabled: ReadonlySet<SubsystemId>;
 
-  /* ---- live policy accessors ----
-   * These read the mutable policy fields rather than config, because the player
-   * swaps policies mid-run and config records only what the leg started with.
-   * The HUD, the world and the debrief all need the live value.
-   */
-  get activeReplacementPolicy(): PageReplacementId {
-    return this.replacementPolicyId;
-  }
+  // TODO(astra): WP-05 and WP-06 supply allocation, access and TLB timers.
+  private memory: MemoryHooks = { expireTimers: noop, admit: noop, access: () => ({ hit: true }),
+    isSatisfied: () => false,
+    // TODO(astra): WP-05 provides the frame table.
+    allocateFrame: () => null, freeFrame: noop, copyFrame: noop };
+  // TODO(astra): WP-07 supplies ordered synchronization waits and condition timers.
+  private sync: SyncHooks = { expireTimers: noop, isSatisfied: () => false,
+    acquire: noop, release: noop, releaseAll: noop, removeWaiter: noop };
+  // TODO(astra): WP-09 supplies completion, interrupt and device wait handling.
+  private io: IoHooks = { serviceCompletions: noop, deliverInterrupts: noop,
+    isSatisfied: () => false, request: noop, removeWaiter: noop };
+  // TODO(astra): WP-09 supplies RAID rebuild timers.
+  private storage: StorageHooks = { expireTimers: noop };
+  // TODO(astra): WP-10 supplies journal timers and descriptor reference counts.
+  private fs: FsHooks = { expireTimers: noop, retainDescriptor: noop, closeDescriptor: noop, closeOnExec: () => false };
+  // TODO(astra): WP-10 supplies shared-region access rights from protection domains.
+  private security: SecurityHooks = { rights: () => [] };
+  // TODO(astra): WP-08 supplies periodic wait-for graph detection.
+  private deadlock: DeadlockHooks = { maybeDetect: noop };
+  // TODO(astra): WP-03 supplies aging and starvation detection.
+  private schedulerHooks: SchedulerHooks = { ageAndDetectStarvation: noop };
+  // TODO(astra): WP-11 extends the existing invariant harness to the full set.
+  private invariants: InvariantHooks = { check: kernel => kernel.checkInvariants() };
 
-  get activeAllocationStrategy(): AllocationStrategy {
-    return this.allocationStrategy;
-  }
-
-  get activeDiskPolicy(): DiskSchedulingId {
-    return this.diskPolicyId;
-  }
-
-  /** Ticks between full invariant sweeps. Read by the dev overlay. */
-  get invariantInterval(): number {
-    return this.invariantSlowInterval;
-  }
-
-  constructor(config: KernelConfig, options?: KernelOptions) {
-    this.config = Object.freeze({ ...config });
-    this.devBuild = options?.devBuild ?? true;
-    this.deadlockDetectionInterval = options?.deadlockDetectionInterval ?? 20;
-    this.invariantSlowInterval = options?.invariantSlowInterval ?? 50;
+  constructor(config: KernelConfig, options: KernelOptions = {}) {
+    validateConfig(config);
+    this.currentConfig = cloneConfig(config);
+    this.requestedScheduler = config.scheduler;
+    this.tuning = resolveTuning({ ...options, checkInvariants: options.checkInvariants ?? options.devBuild ?? true });
+    this.invariantSlowInterval = options.invariantSlowInterval ?? 50;
     this.enabled = new Set(config.enabledSubsystems);
-
-    // Sim spec 1.2.5: one root stream seeded from config.seed, then exactly
-    // eleven forks in a fixed order, taken whether or not the subsystem is
-    // enabled, so that enabling one for a leg cannot shift another's stream.
-    this.rng = createStreamRegistry(config.seed);
-
-    this.events = new KernelEventBus();
-
+    this.rng = createStreams(config.seed);
     this.schedulerParams = { ...config.schedulerParams };
-    this.scheduler = createScheduler(config.scheduler, this.schedulerParams);
-
-    this.replacementPolicyId = config.replacementPolicy;
-    this.allocationStrategy = config.allocationStrategy;
-    this.diskPolicyId = config.diskPolicy;
-
+    this.scheduler = this.makeScheduler(config.scheduler);
     this.diskHead = { cylinder: 0, direction: 'up', totalCylinders: config.totalCylinders };
-
+    this.threads = new ThreadManager({ model: this.tuning.threadModel,
+      coreCount: this.tuning.coreCount, lwpPoolSize: this.tuning.lwpPoolSize,
+      maxThreadsPerProcess: this.tuning.maxThreadsPerProcess, threadCreateTicks: this.tuning.threadCreateTicks },
+    this.table.raw, event => this.publish(event), pcb => { this.lifecycle.exit(pcb, 0); });
+    this.lifecycle = new ProcessLifecycle({
+      table: this.table, maxProcesses: this.tuning.maxProcesses, cowCopyTicks: this.tuning.cowCopyTicks,
+      tick: () => this.tick, emit: event => this.publish(event),
+      onTransition: (pcb, to, opts) => {
+        if (to === 'waiting' && opts?.blockReason !== undefined) this.blockProcess(pcb.pid, opts.blockReason);
+        else this.move(pcb, to, opts);
+      },
+      nextAddressSpace: () => this.nextSpace++ as AddressSpaceId,
+      createInitialThread: (pcb, parent) => {
+        const pc = parent === undefined ? 0 : this.threadPc(parent) + (this.executingThread === undefined ? 0 : 1);
+        this.threads.attach(pcb, { programCounter: pc });
+      },
+      clearThreads: pcb => this.threads.clear(pcb),
+      programNamed: name => this.namedPrograms.get(name),
+      detachIpc: pcb => this.ipc.removeProcess(pcb.pid),
+      replaceProgram: (pcb, program) => {
+        this.programs.set(pcb.pid, program);
+        this.burstSizes.set(pcb.pid, program.length);
+        this.threads.clear(pcb);
+        pcb.serviceRemaining = program.length;
+        this.threads.attach(pcb);
+      },
+      copyProgram: (parent, child) => {
+        const program = this.programs.get(parent.pid);
+        if (program !== undefined) this.programs.set(child.pid, program);
+        this.burstSizes.set(child.pid, this.burstSizes.get(parent.pid) ?? parent.cpuBurstRemaining);
+      },
+      retainDescriptor: fd => this.fs.retainDescriptor(fd),
+      closeDescriptor: (pcb, fd) => this.fs.closeDescriptor(pcb, fd),
+      closeOnExec: (pcb, fd) => this.fs.closeOnExec(pcb, fd),
+      releaseResources: pcb => this.sync.releaseAll(pcb),
+      removeFromWaitQueues: pcb => { this.sync.removeWaiter(pcb.pid); this.io.removeWaiter(pcb.pid); this.ipc.removeProcess(pcb.pid); },
+      wakeParent: pid => { this.wakeable.add(pid); },
+      chargeCowCopy: (pcb, ticks) => { this.copyDebt.set(pcb.pid, (this.copyDebt.get(pcb.pid) ?? 0) + ticks); },
+      memory: { pageTables: this.pageTables,
+        allocateFrame: (space, page) => this.memory.allocateFrame(space, page),
+        freeFrame: frame => this.memory.freeFrame(frame), copyFrame: (from, to) => this.memory.copyFrame(from, to) },
+    });
+    this.ipc = new IpcManager({ process: pid => this.table.get(pid),
+      pageTable: space => { let table = this.pageTables.get(space); if (table === undefined) { table = []; this.pageTables.set(space, table); } return table; },
+      frame: id => this.frames[id], rights: (pid, id) => this.security.rights(pid, id),
+      block: (pid, reason) => this.blockProcess(pid, reason),
+    });
     this.initialiseFrameTable();
+    this.initialiseSystemProcesses();
   }
 
-  /* ---------------------------------------------------------------- */
-  /* Public surface                                                    */
-  /* ---------------------------------------------------------------- */
-
-  get tick(): Tick {
-    return this.currentTick;
+  get tick(): Tick { return this.currentTick; }
+  get processes(): readonly Readonly<ProcessControlBlock>[] { return this.table.processes; }
+  process(pid: Pid): Readonly<ProcessControlBlock> | undefined { return this.table.get(pid); }
+  get activeReplacementPolicy(): PageReplacementId { return this.config.replacementPolicy; }
+  get activeAllocationStrategy(): AllocationStrategy { return this.config.allocationStrategy; }
+  get activeDiskPolicy(): DiskSchedulingId { return this.config.diskPolicy; }
+  get invariantInterval(): number { return this.invariantSlowInterval; }
+  frame(id: FrameId): Frame | undefined { return this.frames[id]; }
+  program(pid: Pid): Program | undefined { return this.programs.get(pid); }
+  allProgramsScripted(): boolean {
+    return this.table.filterAscending(pcb => pcb.pid > 1 && (pcb.state === 'ready' || pcb.state === 'running'))
+      .every(pcb => { const refs = this.programs.get(pcb.pid)?.referenceString; return refs !== null && refs !== undefined; });
+  }
+  lastSyscallResult(pid: Pid): SyscallResult | undefined { return this.syscallResults.get(pid); }
+  registerProgram(name: string, program: Program): void { this.namedPrograms.set(name, program); }
+  onPhase(probe: (phase: number, tick: Tick) => void): Unsubscribe {
+    this.probes.add(probe); return () => { this.probes.delete(probe); };
+  }
+  installHooks(hooks: Partial<KernelHooks>): void {
+    this.hooksInstalled = true;
+    this.memory = { ...this.memory, ...hooks.memory }; this.sync = { ...this.sync, ...hooks.sync };
+    this.io = { ...this.io, ...hooks.io }; this.storage = { ...this.storage, ...hooks.storage };
+    this.fs = { ...this.fs, ...hooks.fs }; this.security = { ...this.security, ...hooks.security };
+    this.deadlock = { ...this.deadlock, ...hooks.deadlock };
+    this.schedulerHooks = { ...this.schedulerHooks, ...hooks.scheduler };
+    if (hooks.invariants !== undefined) this.invariants = hooks.invariants;
   }
 
-  get processes(): readonly Readonly<ProcessControlBlock>[] {
-    const out: ProcessControlBlock[] = [];
-    for (const pid of this.orderedPids) {
-      const pcb = this.pcbs.get(pid);
-      if (pcb !== undefined) out.push(pcb);
+  spawn(spec: ProgramSpec, options: SpawnOptions = {}): Pid {
+    if (this.table.activeCount >= this.tuning.maxProcesses) throw new RangeError('process table is full');
+    for (const [name, value] of Object.entries({ burst: spec.burst, service: spec.service, arrival: spec.arrival, pages: spec.pages, priority: spec.priority })) {
+      if (!Number.isSafeInteger(value) || value < 0) throw new RangeError(`invalid process ${name}`);
     }
-    return out;
+    if (spec.burst < 1 || spec.service < 1 || spec.priority > 39) throw new RangeError('invalid process work or priority');
+    const count = options.threadCount ?? 1;
+    if (!Number.isSafeInteger(count) || count < 1 || count > this.tuning.maxThreadsPerProcess) throw new RangeError('invalid thread count');
+    const serial = options.serialFraction ?? this.tuning.defaultSerialFraction;
+    if (!(serial >= 0 && serial <= 1)) throw new RangeError('invalid serial fraction');
+    const parent = options.parent ?? asPid(1);
+    if (this.table.get(parent) === undefined) throw new RangeError('unknown parent');
+    const pid = this.table.allocatePid();
+    const pcb = this.table.insert({ ...this.basePcb(pid, parent, spec.name), state: 'new', readySince: null,
+      priority: spec.priority, basePriority: spec.priority, arrivalTick: asTick(spec.arrival),
+      cpuBurstRemaining: spec.burst, serviceRemaining: spec.service, addressSpaceId: this.nextSpace++ as AddressSpaceId },
+    { rawBurst: spec.burst, rawService: spec.service, serialFraction: serial });
+    for (let i = 0; i < count; i++) pcb.threads.push(this.threads.newTid());
+    this.threads.attach(pcb);
+    const stream = this.rng.streams.get('process');
+    if (stream === undefined) throw new Error('process RNG stream missing');
+    const program = options.program ?? (spec.referenceString === undefined
+      ? generatedProgram(stream.fork(String(pid)), spec) : scriptedProgram(spec.referenceString, spec.service));
+    this.programs.set(pid, program); this.namedPrograms.set(spec.name, program); this.burstSizes.set(pid, spec.burst);
+    this.pageTables.set(pcb.addressSpaceId, Array.from({ length: spec.pages }, (_, i) => ({ page: asPageId(i),
+      frame: null, valid: false, dirty: false, referenced: false, readable: true, writable: true,
+      executable: false, swapped: false, lastAccessTick: null, accessCount: 0 })));
+    return pid;
   }
 
-  process(pid: Pid): Readonly<ProcessControlBlock> | undefined {
-    return this.pcbs.get(pid);
-  }
-
-  /**
-   * Advance exactly one tick. Sim spec 2.1: eleven phases, in this order, every
-   * tick, with no early return. A phase with nothing to do is a no-op; a
-   * disabled subsystem's phase is skipped whole.
-   *
-   * The order is not negotiable. Sim spec 2.2 gives the reason for every
-   * adjacency, and several of them (interrupts before unblocking, aging before
-   * the scheduler decision, execution before deadlock detection) change
-   * published fixture numbers if swapped.
-   */
   step(): readonly KernelEvent[] {
     this.events.beginFrame();
     this.currentTick = asTick(this.currentTick + 1);
-
-    this.captureTickStartState();
-
+    this.admittedThisTick.clear();
     this.phase01_expireTimers();
     this.phase02_serviceDeviceCompletions();
     this.phase03_deliverInterrupts();
@@ -309,861 +383,439 @@ export class KernelImpl implements Kernel {
     this.phase09_detectDeadlock();
     this.phase10_updateMetrics();
     this.phase11_checkInvariants();
-
     return this.events.lastFrame;
   }
-
-  /** Advance n ticks, returning the concatenated event log. */
   run(ticks: number): readonly KernelEvent[] {
-    if (!Number.isInteger(ticks) || ticks < 0) {
-      throw new RangeError(`run: ticks must be a non-negative integer, received ${ticks}`);
-    }
+    if (!Number.isSafeInteger(ticks) || ticks < 0) throw new RangeError('run: ticks must be a non-negative integer');
     const log: KernelEvent[] = [];
-    for (let i = 0; i < ticks; i++) {
-      const frame = this.step();
-      for (let j = 0; j < frame.length; j++) {
-        const event = frame[j];
-        if (event !== undefined) log.push(event);
-      }
-    }
+    for (let i = 0; i < ticks; i++) log.push(...this.step());
     return log;
   }
-
   syscall(request: SyscallRequest): SyscallResult {
-    // TODO(astra): implement the syscall table per sim spec 14. Dispatch on
-    // request.name through a total record, charge the trap cost, emit
-    // syscall.invoked with the result, and return the Errno cases of sim spec
-    // 14.3 rather than throwing.
-    void request;
-    return { ok: false, errno: 'EINVAL', message: 'syscall table not implemented' };
+    const pcb = this.table.get(request.pid);
+    const result = pcb === undefined || pcb.state === 'zombie' || pcb.state === 'terminated'
+      ? failure('ESRCH', 'process not found') : this.dispatchSyscall(pcb, request);
+    this.syscallResults.set(request.pid, result);
+    this.publish({ type: 'syscall.invoked', request, result });
+    return result;
   }
-
+  private dispatchSyscall(pcb: ProcessControlBlock, request: SyscallRequest): SyscallResult {
+    const arg = request.args[0];
+    switch (request.name) {
+      case 'getpid': return { ok: true, value: pcb.pid };
+      case 'fork': return this.lifecycle.fork(pcb);
+      case 'exec':
+        if (pcb.state === 'waiting') return failure('EBUSY', 'cannot exec a blocked process');
+        return typeof arg === 'string' ? this.lifecycle.exec(pcb, arg) : failure('EINVAL', 'exec requires a program name');
+      case 'exit': return typeof arg === 'number' && Number.isSafeInteger(arg)
+        ? this.exitProcess(pcb, arg) : failure('EINVAL', 'exit requires an integer code');
+      case 'wait': {
+        if (arg !== undefined && (typeof arg !== 'number' || !Number.isSafeInteger(arg) || arg < 0)) return failure('EINVAL', 'invalid child pid');
+        const child = typeof arg === 'number' ? asPid(arg) : null;
+        if (child !== null && (this.table.parentOf(child) !== pcb.pid || this.table.get(child)?.state === 'terminated')) return failure('ESRCH', 'not a child');
+        if (pcb.state !== 'running' && !this.lifecycle.hasExitedChild(pcb.pid, child)) {
+          const hasChildren = this.table.filterAscending(p => this.table.parentOf(p.pid) === pcb.pid && p.state !== 'terminated').length > 0;
+          if (hasChildren) return failure('EBUSY', 'blocking wait requires a running caller');
+        }
+        return this.lifecycle.wait(pcb, child);
+      }
+      case 'kill': {
+        if (typeof arg !== 'number' || !Number.isSafeInteger(arg)) return failure('EINVAL', 'invalid target pid');
+        const target = this.table.get(asPid(arg));
+        if (target === undefined || target.pid === asPid(0)) return failure('ESRCH', 'process not found');
+        return this.exitProcess(target, 137, target.parent === pcb.pid ? 'killed_by_parent' : 'killed_by_user');
+      }
+      case 'nice':
+        if (typeof arg !== 'number' || !Number.isSafeInteger(arg) || arg < 0 || arg > 39) return failure('EINVAL', 'priority must be in [0, 39]');
+        pcb.priority = arg; return { ok: true, value: arg };
+      default:
+        // TODO(astra): WP-11 completes the syscall table.
+        return failure('EINVAL', 'not implemented in WP-02');
+    }
+  }
+  private exitProcess(pcb: ProcessControlBlock, code: number, reason: import('./types').TerminationReason = 'normal_exit'): SyscallResult {
+    if (pcb.pid === asPid(0)) return failure('EPERM', 'idle cannot exit');
+    if (pcb.state === 'new') {
+      pcb.exitCode = code; pcb.terminationReason = reason; this.move(pcb, 'terminated');
+      return { ok: true, value: null };
+    }
+    return this.lifecycle.exit(pcb, code, reason);
+  }
+  blockProcess(pid: Pid, reason: BlockReason, tid?: Tid): void {
+    const pcb = this.table.get(pid);
+    if (pcb === undefined || pcb.state !== 'running') throw new KernelInvariantError(11, 'only a running process can block');
+    const selected = tid ?? this.executingThread ?? pcb.threads[0];
+    if (selected === undefined) throw new KernelInvariantError(7, 'blocking process has no thread');
+    const wholeProcess = this.threads.block(pcb, selected, reason);
+    if (wholeProcess) this.move(pcb, 'waiting', { blockReason: reason });
+    else { this.threads.recompute(pcb); this.move(pcb, 'ready'); }
+  }
   setScheduler(id: SchedulerId, params?: Partial<SchedulerParams>): void {
-    this.schedulerParams = { ...this.schedulerParams, ...params };
-    this.scheduler = createScheduler(id, this.schedulerParams);
-    // Every ready process must be re-offered to the new policy, or the new
-    // policy's queues would be empty and invariant I-13 would fail on the very
-    // next tick.
-    const ctx = this.schedulerContext();
-    for (const pid of this.orderedPids) {
-      const pcb = this.pcbs.get(pid);
-      if (pcb !== undefined && pcb.state === 'ready') {
-        this.scheduler.onAdmit(pcb, ctx);
-      }
-    }
+    const nextParams = { ...this.schedulerParams, ...params };
+    const next = this.makeScheduler(id, nextParams);
+    this.schedulerParams = nextParams; this.scheduler = next; this.requestedScheduler = id;
+    for (const pcb of this.table.filterAscending(p => p.pid > 1 && p.state === 'ready')) this.scheduler.onAdmit(pcb, this.schedulerContext());
     this.syncSchedulerView();
   }
-
-  setReplacementPolicy(id: PageReplacementId): void {
-    // TODO(astra): construct the policy from REPLACEMENT_POLICIES per sim spec
-    // 7.4, call reset(this.frames), and refuse 'optimal' with a kernel.panic in
-    // dev builds unless every runnable process has a scripted referenceString
-    // (sim spec 2.3).
-    this.replacementPolicyId = id;
+  setReplacementPolicy(_id: PageReplacementId): void {
+    // TODO(astra): WP-06 implements this.
+    throw new Error('not implemented: setReplacementPolicy');
   }
-
-  setDiskPolicy(id: DiskSchedulingId): void {
-    // TODO(astra): construct the policy from DISK_POLICIES per sim spec 10.3
-    // and recompute the projected head path for the world layer.
-    this.diskPolicyId = id;
+  setAllocationStrategy(_strategy: AllocationStrategy): void {
+    // TODO(astra): WP-05 implements this.
+    throw new Error('not implemented: setAllocationStrategy');
   }
-
-  setAllocationStrategy(s: AllocationStrategy): void {
-    // TODO(astra): switch the contiguous allocator per sim spec 6.2. Existing
-    // allocations are not moved; only future placements change.
-    this.allocationStrategy = s;
+  setDiskPolicy(_id: DiskSchedulingId): void {
+    // TODO(astra): WP-09 implements this.
+    throw new Error('not implemented: setDiskPolicy');
   }
-
-  evaluateBankers(pid: Pid, resource: ResourceId, instances: number): SafetyCheckResult {
-    // TODO(astra): implement the safety algorithm of sim spec 9.4. Return the
-    // full trace whether or not the request is granted, because the codex shows
-    // the player the actual algorithm step by step.
-    void pid;
-    void resource;
-    void instances;
-    return { safe: true, sequence: null, trace: [] };
+  evaluateBankers(_pid: Pid, _resource: ResourceId, _instances: number): SafetyCheckResult {
+    // TODO(astra): WP-08 implements this.
+    throw new Error('not implemented: evaluateBankers');
   }
-
   detectDeadlock(): DeadlockReport | null {
-    // TODO(astra): build the wait-for graph and run the cycle detection of sim
-    // spec 9.3. The returned cycle must begin at its lowest pid, per invariant
-    // I-26.
-    return null;
+    // TODO(astra): WP-08 implements this.
+    throw new Error('not implemented: detectDeadlock');
   }
 
-  /* ---------------------------------------------------------------- */
-  /* Snapshot and restore                                              */
-  /* ---------------------------------------------------------------- */
-
-  /**
-   * Serialisable, structurally cloneable, and sufficient to resume a run
-   * exactly. Sim spec 1.2.6: the eleven RNG streams plus the root, in the fixed
-   * registry order. Everything returned is a deep copy, so a later `step()`
-   * cannot mutate a snapshot the caller is still holding.
-   */
+  /** The scaffold's init-only replay remains supported. Workload saves need WP-11's contract channel. */
   snapshot(): KernelSnapshot {
+    this.requireSnapshotChannel('snapshot');
     return {
-      version: 1,
-      tick: this.currentTick,
-      seq: this.events.seq,
-      config: { ...this.config },
-      rng: this.rng.save(),
-      processes: this.orderedPids.map((pid) => clonePcb(this.pcbs.get(pid) as ProcessControlBlock)),
-      frames: this.frames.map((f) => ({ ...f })),
-      pageTables: [...this.pageTables.entries()]
-        .sort((a, b) => a[0] - b[0])
-        .map(([space, table]) => [
-          space,
-          [...table.values()].sort((a, b) => a.page - b.page).map((e) => ({ ...e })),
-        ] as const),
-      syncPrimitives: this.syncPrimitives.map((s) => ({
-        ...s,
-        holders: [...s.holders],
-        waitQueue: [...s.waitQueue],
-      })),
-      resources: this.resources.map((r) => ({ ...r })),
-      diskQueue: this.diskQueue.map((r) => ({ ...r })),
-      diskHead: { ...this.diskHead },
-      devices: this.devices.map((d) => ({ ...d, queue: [...d.queue] })),
-      inodes: this.inodes.map((i) => ({ ...i, blocks: [...i.blocks] })),
-      journal: this.journal.map((j) => ({ ...j, blocks: [...j.blocks] })),
-      domains: this.domains.map((d) => ({ ...d })),
-      metrics: {
-        scheduling: { ...this.schedulingMetrics },
-        memory: { ...this.memoryMetrics, workingSets: new Map(this.memoryMetrics.workingSets) },
-      },
+      version: 1, tick: this.tick, seq: this.events.seq, config: cloneConfig({ ...this.config, scheduler: this.requestedScheduler, schedulerParams: this.schedulerParams }), rng: this.rng.save(),
+      processes: this.processes.map(clonePcb), frames: this.frames.map(frame => ({ ...frame })),
+      pageTables: [...this.pageTables].sort(([a], [b]) => a - b).map(([space, entries]) => [space, entries.map(entry => ({ ...entry }))] as const),
+      syncPrimitives: this.syncPrimitives.map(s => ({ ...s, holders: [...s.holders], waitQueue: [...s.waitQueue] })),
+      resources: this.resources.map(r => ({ ...r })), diskQueue: this.diskQueue.map(r => ({ ...r })),
+      diskHead: { ...this.diskHead }, devices: this.devices.map(d => ({ ...d, queue: [...d.queue] })),
+      inodes: this.inodes.map(i => ({ ...i, blocks: [...i.blocks] })), journal: this.journal.map(j => ({ ...j, blocks: [...j.blocks] })),
+      domains: this.domains.map(d => ({ ...d, rights: new Map([...d.rights].map(([key, rights]) => [key, [...rights]])) })),
+      metrics: { scheduling: { ...this.schedulingMetrics }, memory: { ...this.memoryMetrics, workingSets: new Map(this.memoryMetrics.workingSets) } },
     };
   }
-
-  /**
-   * Resume from a snapshot. Sim spec 1.2.6: RNG state is replaced in place, not
-   * rebuilt, because subsystems hold references to their `Rng`. `seq` is
-   * carried, never reset, because invariant I-38 requires it to strictly
-   * increase across a restore.
-   */
   restore(snapshot: KernelSnapshot): void {
-    if (snapshot.version !== 1) {
-      throw new Error(`unsupported snapshot version ${String(snapshot.version)}`);
+    if (snapshot.version !== 1) throw new Error(`unsupported snapshot version ${String(snapshot.version)}`);
+    this.requireSnapshotChannel('restore');
+    if (snapshot.processes.some(pcb => pcb.pid !== asPid(1) || pcb.state !== 'ready') || snapshot.processes.length !== 1) this.snapshotBlocked('restore');
+    this.currentConfig = cloneConfig(snapshot.config); this.enabled = new Set(this.config.enabledSubsystems);
+    this.schedulerParams = { ...snapshot.config.schedulerParams }; this.requestedScheduler = this.config.scheduler;
+    this.currentTick = snapshot.tick; this.events.beginFrame(); this.events.setSeq(snapshot.seq); this.rng.restore(snapshot.rng);
+    this.table.forEachAscending(pcb => this.threads.clear(pcb)); this.table.clear(); this.threads.reset(); this.initialiseSystemProcesses(snapshot.processes[0]);
+    const init = snapshot.processes[0];
+    const live = this.table.get(asPid(1));
+    if (init !== undefined && live !== undefined) {
+      // Init has no instruction stream; its finite service fields stay unchanged.
+      live.state = init.state; live.readySince = init.readySince;
     }
-
-    this.currentTick = snapshot.tick;
-    this.events.beginFrame();
-    this.events.setSeq(snapshot.seq);
-    this.rng.restore(snapshot.rng);
-
-    this.pcbs.clear();
-    this.orderedPids = [];
-    this.totalServiceAtAdmission.clear();
-    this.programCounters.clear();
-    for (const pcb of snapshot.processes) {
-      const copy = clonePcb(pcb);
-      this.pcbs.set(copy.pid, copy);
-      this.orderedPids.push(copy.pid);
-    }
-    this.orderedPids.sort((a, b) => a - b);
-
-    this.running = null;
-    for (const pid of this.orderedPids) {
-      if (this.pcbs.get(pid)?.state === 'running') {
-        this.running = pid;
-        break;
-      }
-    }
-
-    this.frames = snapshot.frames.map((f) => ({ ...f }));
-    this.rebuildFreeList();
-
+    this.frames = snapshot.frames.map(frame => ({ ...frame })); this.rebuildFreeList();
     this.pageTables.clear();
-    for (const [space, entries] of snapshot.pageTables) {
-      const table = new Map<PageId, PageTableEntry>();
-      for (const entry of entries) table.set(entry.page, { ...entry });
-      this.pageTables.set(space, table);
-    }
+    for (const [space, entries] of snapshot.pageTables) this.pageTables.set(space, entries.map(entry => ({ ...entry })));
     this.tlb = [];
-
-    this.syncPrimitives = snapshot.syncPrimitives.map((s) => ({
-      ...s,
-      holders: [...s.holders],
-      waitQueue: [...s.waitQueue],
-    }));
-    this.resources = snapshot.resources.map((r) => ({ ...r }));
-    this.diskQueue = snapshot.diskQueue.map((r) => ({ ...r }));
-    this.diskHead = { ...snapshot.diskHead };
-    this.devices = snapshot.devices.map((d) => ({ ...d, queue: [...d.queue] }));
-    this.inodes = snapshot.inodes.map((i) => ({ ...i, blocks: [...i.blocks] }));
-    this.journal = snapshot.journal.map((j) => ({ ...j, blocks: [...j.blocks] }));
-    this.domains = snapshot.domains.map((d) => ({ ...d }));
-
+    this.syncPrimitives = snapshot.syncPrimitives.map(s => ({ ...s, holders: [...s.holders], waitQueue: [...s.waitQueue] }));
+    this.resources = snapshot.resources.map(r => ({ ...r })); this.diskQueue = snapshot.diskQueue.map(r => ({ ...r }));
+    this.diskHead = { ...snapshot.diskHead }; this.devices = snapshot.devices.map(d => ({ ...d, queue: [...d.queue] }));
+    this.inodes = snapshot.inodes.map(i => ({ ...i, blocks: [...i.blocks] })); this.journal = snapshot.journal.map(j => ({ ...j, blocks: [...j.blocks] }));
+    this.domains = snapshot.domains.map(d => ({ ...d, rights: new Map([...d.rights].map(([key, rights]) => [key, [...rights]])) }));
     this.schedulingMetrics = { ...snapshot.metrics.scheduling };
-    this.memoryMetrics = {
-      ...snapshot.metrics.memory,
-      workingSets: new Map(snapshot.metrics.memory.workingSets),
-    };
+    this.memoryMetrics = { ...snapshot.metrics.memory, workingSets: new Map(snapshot.metrics.memory.workingSets) };
     this.contextSwitches = snapshot.metrics.scheduling.contextSwitches;
-
-    // The policy holds its own ordering structure, which is not in the
-    // snapshot, so it is rebuilt from the restored PCBs. Sim spec 1.3 calls
-    // out policy objects with hidden internal state as exactly the thing
-    // determinism test D2 exists to catch: everything a policy needs must be
-    // derivable from the snapshot, which for an insertion-ordered queue means
-    // ascending pid over the ready set.
-    this.scheduler = createScheduler(this.config.scheduler, this.schedulerParams);
-    const ctx = this.schedulerContext();
-    for (const pid of this.orderedPids) {
-      const pcb = this.pcbs.get(pid);
-      if (pcb !== undefined && pcb.state === 'ready') {
-        this.scheduler.onAdmit(pcb, ctx);
-      }
-    }
+    this.running = null; this.lastCpuOwner = null; this.sliceElapsed = 0; this.switchDebt = 0;
+    this.wakeable.clear(); this.admittedThisTick.clear(); this.scheduler = this.makeScheduler(this.config.scheduler);
     this.syncSchedulerView();
-
-    this.stateAtTickStart.clear();
-    this.pcAtTickStart.clear();
-    this.faultedThisTick.clear();
-    this.admittedThisTick.clear();
-    this.sliceElapsed = 0;
   }
-
-  /* ---------------------------------------------------------------- */
-  /* The eleven phases, sim spec 2.1                                   */
-  /* ---------------------------------------------------------------- */
+  private requireSnapshotChannel(name: string): void {
+    const tuningNeedsState = Object.keys(DEFAULT_TUNING).some(key => key !== 'checkInvariants'
+      && Reflect.get(this.tuning, key) !== Reflect.get(DEFAULT_TUNING, key));
+    if (this.table.nextPid > 2 || this.namedPrograms.size > 0 || this.hooksInstalled || this.ipc.hasState
+      || tuningNeedsState || this.table.get(asPid(1))?.state !== 'ready') this.snapshotBlocked(name);
+  }
+  private snapshotBlocked(name: string): never {
+    // TODO(astra): blocked on contract change, see report
+    throw new Error(`not implemented: ${name} for process workloads or custom subsystem state; WP-11 needs a KernelSnapshot channel for programs, threads and side tables`);
+  }
 
   private phase01_expireTimers(): void {
-    // TODO(astra): implement phase 1 per sim spec 2.1. Advance every countdown
-    // keyed on absolute tick: sleep blocks whose untilTick <= tick, monitor
-    // condition timeouts, starvation clocks, RAID rebuild progress, journal
-    // checkpoint interval, TLB shootdown counter. Mark expired sleepers
-    // wakeable but do NOT move them; phase 4 owns every ready-queue insertion.
+    this.probe(1); this.wakeable.clear();
+    if (this.enabled.has('process')) this.table.forEachAscending(pcb => {
+      if (pcb.blockedOn?.kind === 'sleep' && pcb.blockedOn.untilTick <= this.tick) this.wakeable.add(pcb.pid);
+    });
+    if (this.enabled.has('sync')) this.sync.expireTimers(this.tick);
+    if (this.enabled.has('memory') || this.enabled.has('vm')) this.memory.expireTimers(this.tick);
+    if (this.enabled.has('storage')) this.storage.expireTimers(this.tick);
+    if (this.enabled.has('fs')) this.fs.expireTimers(this.tick);
   }
-
   private phase02_serviceDeviceCompletions(): void {
-    if (!this.enabled.has('io') && !this.enabled.has('storage')) return;
-    // TODO(astra): implement phase 2 per sim spec 2.1 and 11.1. Decrement each
-    // busy Device's remaining service; on zero raise an interrupt line for
-    // interrupt/dma modes or set a status flag for polling and charge the
-    // poller for wasted ticks. Drain disk requests through
-    // DiskSchedulingPolicy.select (sim spec 10.3). Emits disk.served,
-    // io.dma_transfer.
+    this.probe(2);
+    if (this.enabled.has('io') || this.enabled.has('storage')) this.io.serviceCompletions(this.tick);
   }
-
   private phase03_deliverInterrupts(): void {
-    if (!this.enabled.has('io')) return;
-    // TODO(astra): implement phase 3 per sim spec 11.2. Sort pending lines by
-    // (priority, deviceId), deliver up to maxInterruptsPerTick, charge
-    // interruptServiceTicks against the kernel rather than the interrupted
-    // process, and fire the storm condition of sim spec 11.3 when the pending
-    // queue exceeds interruptStormThreshold for interruptStormWindow ticks.
-    // Emits io.interrupt.
+    this.probe(3); if (this.enabled.has('io')) this.io.deliverInterrupts(this.tick);
   }
-
   private phase04_resolveBlockedProcesses(): void {
-    // TODO(astra): implement phase 4 per sim spec 2.1 and 3.3 T6. Re-test every
-    // waiting process against blockedOn in ascending pid order; on satisfaction
-    // move waiting -> ready, clear blockedOn, set readySince = tick, and call
-    // SchedulerPolicy.onUnblock. Wakes from a SyncPrimitive with ordered: true
-    // come from the head of waitQueue only, preserving bounded waiting.
-    // Emits process.state_changed, sync.acquired.
+    this.probe(4); if (!this.enabled.has('process')) return;
+    this.table.forEachAscending(pcb => {
+      if (pcb.pid <= 1 || pcb.state === 'new' || pcb.state === 'terminated' || pcb.state === 'zombie') return;
+      let woke = false;
+      for (const tid of pcb.threads) {
+        const thread = this.threads.table.get(tid);
+        if (thread?.state !== 'waiting' || thread.blockedOn === null) continue;
+        const reason = thread.blockedOn;
+        if (!this.isSatisfied(pcb, reason)) continue;
+        if (reason.kind === 'child_wait') this.syscallResults.set(pcb.pid, this.lifecycle.wait(pcb, reason.child));
+        if (this.ipc.matchesWait(pcb.pid, reason)) {
+          const result = this.ipc.takeCompletion(pcb.pid);
+          if (result !== undefined) this.syscallResults.set(pcb.pid, result);
+        }
+        this.threads.wake(pcb, tid); woke = true;
+      }
+      // Any newly runnable LWP can wake the PCB, even if a different LWP blocked last.
+      if (pcb.state === 'waiting' && woke && (this.threads.runnable(pcb).length > 0 || pcb.serviceRemaining === 0)) {
+        this.threads.recompute(pcb); this.move(pcb, 'ready');
+      }
+    });
+    // Init has no user program and reaps its zombie children in deterministic pid order.
+    const init = this.table.get(asPid(1));
+    if (init !== undefined && init.state === 'ready') {
+      for (const child of this.table.filterAscending(pcb => pcb.state === 'zombie' && this.table.parentOf(pcb.pid) === init.pid)) this.lifecycle.wait(init, child.pid);
+    }
   }
-
+  private isSatisfied(pcb: ProcessControlBlock, reason: BlockReason): boolean {
+    switch (reason.kind) {
+      case 'sleep': return reason.untilTick <= this.tick;
+      case 'child_wait': return this.lifecycle.hasExitedChild(pcb.pid, reason.child);
+      case 'io': return this.enabled.has('io') && this.io.isSatisfied(pcb.pid, reason);
+      case 'page_fault': return (this.enabled.has('memory') || this.enabled.has('vm')) && this.memory.isSatisfied(pcb.pid, reason);
+      case 'semaphore': case 'mutex': case 'condition':
+        if (this.ipc.matchesWait(pcb.pid, reason)) return this.ipc.hasCompletion(pcb.pid);
+        return this.enabled.has('sync') && this.sync.isSatisfied(pcb.pid, reason);
+    }
+  }
   private phase05_admitNewProcesses(): void {
-    // TODO(astra): implement phase 5 per sim spec 2.1 and 3.3 T2. Admit
-    // processes in state 'new' with arrivalTick <= tick, subject to
-    // TravelPolicy.degreeOfMultiprogramming passed down from the game layer.
-    // Allocate the address space, set readySince = tick, call
-    // SchedulerPolicy.onAdmit, record totalServiceAtAdmission for invariant
-    // I-4, and add the pid to admittedThisTick for invariant I-14.
-    // Emits process.created, process.state_changed.
+    this.probe(5); if (!this.enabled.has('process')) return;
+    let resident = this.table.filterAscending(pcb => pcb.pid > 1 && ['ready', 'running', 'waiting'].includes(pcb.state)).length;
+    this.table.forEachAscending(pcb => {
+      if (pcb.state !== 'new' || pcb.arrivalTick > this.tick || resident >= this.tuning.degreeOfMultiprogramming) return;
+      if (this.enabled.has('memory')) this.memory.admit(pcb);
+      this.threads.recompute(pcb); this.move(pcb, 'ready'); resident += 1; this.admittedThisTick.add(pcb.pid);
+    });
   }
-
   private phase06_ageAndDetectStarvation(): void {
-    if (!this.enabled.has('scheduler')) return;
-    // TODO(astra): implement phase 6 per sim spec 5.9. For each ready process
-    // in ascending pid order compute waited = tick - readySince. Age when
-    // agingInterval > 0 and waited % agingInterval === 0 and waited > 0,
-    // decrementing priority with a floor of 0. Warn on strict equality with
-    // starvationThreshold so it fires once per residence; terminate at
-    // starvationFatalThreshold with reason 'starvation' via T8. SABLE's passive
-    // multiplies both thresholds by 3 for its own PCB only.
+    this.probe(6); if (this.enabled.has('scheduler')) this.schedulerHooks.ageAndDetectStarvation(this.schedulerContext());
   }
-
   private phase07_scheduleDecision(): void {
-    if (!this.enabled.has('scheduler')) return;
-    // TODO(astra): implement phase 7 per sim spec 2.1 and 5.1. Build the
-    // SchedulerContext, call SchedulerPolicy.onTick exactly once, and apply the
-    // returned SchedulingDecision verbatim: move the outgoing process
-    // running -> ready (unless it left the CPU for another reason), move the
-    // incoming ready -> running, set lastScheduledTick, reset sliceElapsed,
-    // increment contextSwitches, and emit context.switch with the policy's
-    // rationale. A context switch costs contextSwitchTicks, charged as idle
-    // ticks before phase 8 when nonzero.
-  }
-
-  private phase08_executeOneTick(): void {
-    // TODO(astra): implement phase 8 per sim spec 2.1 and 2.3. Deliver exactly
-    // one unit of CPU service to the running process, dispatching on the head
-    // of its instruction stream (compute, access, syscall, io, acquire,
-    // release). Increment totalCpuUsed and busyTicks, decrement
-    // cpuBurstRemaining and serviceRemaining. A syscall or page fault may move
-    // the process out of 'running' here, which is legal and is the only place
-    // other than phase 7 where that happens. A page fault must NOT advance the
-    // program counter; invariant I-8 checks that.
-  }
-
-  private phase09_detectDeadlock(): void {
-    if (this.config.deadlockStrategy !== 'detect') return;
-    if (this.currentTick % this.deadlockDetectionInterval !== 0) return;
-    // TODO(astra): implement phase 9 per sim spec 9.3 and 9.6. Build the
-    // wait-for graph, run cycle detection, emit deadlock.detected on a cycle
-    // and deadlock.resolved when recovery is enabled. Under 'avoid' no
-    // detection runs because Banker's already ran inside the request syscall;
-    // under 'prevent' none runs because the ordering rule makes a cycle
-    // impossible, and invariant I-24 checks that claim every tick.
-  }
-
-  private phase10_updateMetrics(): void {
-    // TODO(astra): implement phase 10 per sim spec 5.10 and 7.8. Recompute
-    // SchedulingMetrics and MemoryMetrics from scratch off PCB and frame state,
-    // never by accumulation, because an accumulated float drifts across a
-    // restore (sim spec 1.3). Smooth faultRate and cpuUtilisation with the
-    // integer-friendly EWMA of sim spec 7.8, test the thrashing thresholds, and
-    // emit memory.thrashing here, after this tick's faults are counted.
-    //
-    // The two lines below are real and must survive: the scheduler snapshot has
-    // to report the live metrics and the live running pid.
-    this.schedulingMetrics = {
-      ...this.schedulingMetrics,
-      contextSwitches: this.contextSwitches,
-      cpuUtilisation: this.currentTick === 0 ? 0 : this.busyTicks / this.currentTick,
-    };
-    this.memoryMetrics = {
-      ...this.memoryMetrics,
-      totalFrames: this.frames.length,
-      freeFrames: this.freeList.length,
-    };
+    this.probe(7); if (!this.enabled.has('scheduler') || !this.enabled.has('process')) return;
+    const decision = this.scheduler.onTick(this.schedulerContext());
+    if (decision.next !== this.running) {
+      const outgoing = this.running === null ? undefined : this.table.get(this.running);
+      if (outgoing?.state === 'running') this.move(outgoing, 'ready');
+      if (decision.next !== null) {
+        const incoming = this.table.get(decision.next);
+        if (incoming?.state !== 'ready' || incoming.pid <= 1) throw new KernelInvariantError(13, 'scheduler selected a non-ready user process');
+        this.move(incoming, 'running');
+        const forkReturn = this.lifecycle.takeForkReturn(incoming.pid);
+        if (forkReturn !== undefined) this.syscallResults.set(incoming.pid, { ok: true, value: forkReturn });
+      }
+      this.running = decision.next; this.sliceElapsed = 0;
+    }
+    if (this.lastCpuOwner !== this.running) {
+      this.contextSwitches += 1; this.switchDebt = this.tuning.contextSwitchTicks;
+      this.publish({ type: 'context.switch', from: this.lastCpuOwner, to: this.running, rationale: decision.rationale });
+      this.lastCpuOwner = this.running;
+    }
     this.syncSchedulerView();
   }
-
-  /* ---------------------------------------------------------------- */
-  /* Phase 11: the invariant harness, sim spec 15                      */
-  /* ---------------------------------------------------------------- */
-
-  /**
-   * Every invariant is checked here, in numbered order, in development and
-   * test builds. A failure throws `InvariantViolation` naming the number and
-   * the offending state. In a production build `devBuild` is false and this
-   * returns immediately.
-   */
-  private phase11_checkInvariants(): void {
-    if (!this.devBuild) return;
-
-    this.i1_pidUniquenessAndOrdering();
-    this.i2_exactlyOneRunning();
-    this.i3_cpuUtilisationIsAProbability();
-    this.i4_serviceAccountingConserved();
-    this.i5_resourceConservation();
-    this.i6_noSelfOnlyResourceWait();
-    this.i7_everyLiveProcessHasAThread();
-    this.i8_pageFaultDoesNotAdvanceThePc();
-    this.i9_tlbCoherence();
-    this.i10_waitQueueMembership();
-    this.i11_onlyLegalTransitions();
-    this.i12_readySincePairsWithReady();
-    this.i13_readyQueueMatchesReadySet();
-    this.i14_admittedThisTickHasNotWaited();
-    this.i15_prioritiesInRange();
-    this.i17_frameConservation();
-    this.i19_metricsAreFinite();
-    this.i20_freeListOrdering();
-    this.i38_eventSequenceIsMonotonic();
-
-    // TODO(astra): add I-16, I-18, I-21 to I-37 as their subsystems land. I-29
-    // and I-30 are expensive and run only every invariantSlowInterval ticks;
-    // the gate is already available as this.invariantSlowInterval.
-  }
-
-  private assert(condition: boolean, invariant: number, message: () => string): void {
-    if (!condition) throw new InvariantViolation(invariant, message(), this.currentTick);
-  }
-
-  /** I-1. PID uniqueness and ordering. */
-  private i1_pidUniquenessAndOrdering(): void {
-    const seen = new Set<Pid>();
-    for (let i = 0; i < this.orderedPids.length; i++) {
-      const pid = this.orderedPids[i];
-      if (pid === undefined) continue;
-      this.assert(!seen.has(pid), 1, () => `duplicate pid ${pid}`);
-      seen.add(pid);
-      const prev = i === 0 ? null : this.orderedPids[i - 1];
-      this.assert(
-        prev === undefined || prev === null || pid > prev,
-        1,
-        () => `pids not ascending at index ${i}: ${String(prev)} then ${pid}`,
-      );
+  private phase08_executeOneTick(): void {
+    this.probe(8); if (!this.enabled.has('process') || this.running === null) return;
+    if (this.switchDebt > 0) { this.switchDebt -= 1; return; }
+    const pcb = this.table.get(this.running);
+    if (pcb?.state !== 'running') return;
+    if (pcb.serviceRemaining === 0) { this.lifecycle.exit(pcb, 0); return; }
+    const debt = this.copyDebt.get(pcb.pid) ?? 0;
+    if (debt > 0) { this.copyDebt.set(pcb.pid, debt - 1); return; }
+    const delivered = this.threads.deliver(pcb, thread => this.execute(pcb, thread));
+    this.executingThread = undefined;
+    if (delivered === null) return;
+    this.sliceElapsed += 1;
+    if (pcb.state === 'running' && pcb.serviceRemaining === 0) this.lifecycle.exit(pcb, 0);
+    else if (pcb.cpuBurstRemaining === 0 && pcb.serviceRemaining > 0 && !['zombie', 'terminated'].includes(pcb.state)) {
+      const raw = this.table.raw.get(pcb.pid);
+      if (raw !== undefined) raw.rawBurst = Math.min(this.burstSizes.get(pcb.pid) ?? 1, raw.rawService);
+      this.threads.recompute(pcb);
     }
-    this.assert(
-      seen.size === this.pcbs.size,
-      1,
-      () => `orderedPids holds ${seen.size} pids but the table holds ${this.pcbs.size}`,
-    );
-  }
-
-  /** I-2. Exactly one running process, or none. */
-  private i2_exactlyOneRunning(): void {
-    const running: Pid[] = [];
-    for (const pcb of this.pcbs.values()) {
-      if (pcb.state === 'running') running.push(pcb.pid);
-    }
-    this.assert(
-      running.length <= 1,
-      2,
-      () => `${running.length} processes in state running`,
-    );
-    if (this.running !== null) {
-      const pcb = this.pcbs.get(this.running);
-      this.assert(
-        pcb !== undefined && pcb.state === 'running',
-        2,
-        () => `k.running=${String(this.running)} but its state is ${String(pcb?.state)}`,
-      );
-    }
-    this.assert(
-      running.length === 0 || running[0] === this.running,
-      2,
-      () => `running pid ${String(running[0])} disagrees with k.running ${String(this.running)}`,
-    );
-  }
-
-  /** I-3. `cpuUtilisation` is a probability, and busyTicks <= tick. */
-  private i3_cpuUtilisationIsAProbability(): void {
-    const u = this.schedulingMetrics.cpuUtilisation;
-    this.assert(u >= 0 && u <= 1, 3, () => `cpuUtilisation ${u} is not in [0, 1]`);
-    this.assert(
-      this.busyTicks <= this.currentTick,
-      3,
-      () => `busyTicks ${this.busyTicks} exceeds tick ${this.currentTick}`,
-    );
-  }
-
-  /** I-4. Service accounting is conserved. */
-  private i4_serviceAccountingConserved(): void {
-    for (const pcb of this.pcbs.values()) {
-      const total = this.totalServiceAtAdmission.get(pcb.pid);
-      if (total === undefined) continue; // not yet admitted
-      this.assert(
-        pcb.totalCpuUsed + pcb.serviceRemaining === total,
-        4,
-        () =>
-          `P${pcb.pid}: totalCpuUsed ${pcb.totalCpuUsed} + serviceRemaining ` +
-          `${pcb.serviceRemaining} != ${total} at admission`,
-      );
-      if (pcb.terminationReason === 'normal_exit') {
-        this.assert(
-          pcb.serviceRemaining === 0,
-          4,
-          () => `P${pcb.pid} exited normally with ${pcb.serviceRemaining} service left`,
-        );
-      }
+    if (pcb.state === 'running' && pcb.serviceRemaining > 0 && this.threads.runnable(pcb).length === 0) {
+      const waiting = pcb.threads.map(tid => this.threads.table.get(tid)).find(thread => thread?.state === 'waiting');
+      if (waiting?.blockedOn !== null && waiting?.blockedOn !== undefined) this.move(pcb, 'waiting', { blockReason: waiting.blockedOn });
     }
   }
-
-  /** I-5. Resource conservation. */
-  private i5_resourceConservation(): void {
-    for (const rt of this.resources) {
-      let held = 0;
-      for (const pcb of this.pcbs.values()) {
-        for (const r of pcb.heldResources) if (r === rt.id) held += 1;
-      }
-      this.assert(
-        rt.availableInstances + held === rt.totalInstances,
-        5,
-        () =>
-          `${rt.id}: ${rt.availableInstances} available + ${held} held != ` +
-          `${rt.totalInstances} total`,
-      );
-      this.assert(rt.availableInstances >= 0, 5, () => `${rt.id}: negative availability`);
-    }
-  }
-
-  /** I-6. No process blocks on a resource whose only holder is itself. */
-  private i6_noSelfOnlyResourceWait(): void {
-    for (const pcb of this.pcbs.values()) {
-      for (const r of pcb.requestedResources) {
-        if (!pcb.heldResources.includes(r)) continue;
-        let othersHold = false;
-        for (const other of this.pcbs.values()) {
-          if (other.pid === pcb.pid) continue;
-          if (other.heldResources.includes(r)) {
-            othersHold = true;
-            break;
-          }
+  private execute(pcb: ProcessControlBlock, thread: ThreadControlBlock): boolean {
+    this.executingThread = thread.tid;
+    const program = this.programs.get(pcb.pid);
+    if (program === undefined) throw new KernelInvariantError(8, 'running process has no program');
+    const instruction = program.at(thread.programCounter);
+    switch (instruction.kind) {
+      case 'compute': return true;
+      case 'access': {
+        if (!this.enabled.has('memory') && !this.enabled.has('vm')) return true;
+        const cow = instruction.write ? this.lifecycle.resolveCow(pcb, instruction.page) : null;
+        if (cow !== null) {
+          if (!cow.ok) this.lifecycle.exit(pcb, 1, 'out_of_memory');
+          return false;
         }
-        const rt = this.resources.find((x) => x.id === r);
-        const selfOnly = !othersHold && rt !== undefined && rt.availableInstances === 0;
-        this.assert(!selfOnly, 6, () => `P${pcb.pid} blocked on ${r} which only it holds`);
+        const result = this.memory.access(pcb.pid, instruction.page, instruction.write);
+        if (!result.hit) {
+          this.publish({ type: 'memory.page_fault', pid: pcb.pid, page: instruction.page, major: true });
+          this.blockProcess(pcb.pid, { kind: 'page_fault', page: instruction.page }, thread.tid);
+        }
+        return result.hit;
       }
-    }
-  }
-
-  /** I-7. Every live process has at least one thread. */
-  private i7_everyLiveProcessHasAThread(): void {
-    for (const pcb of this.pcbs.values()) {
-      if (pcb.state !== 'ready' && pcb.state !== 'running' && pcb.state !== 'waiting') continue;
-      this.assert(
-        pcb.threads.length >= 1,
-        7,
-        () => `P${pcb.pid} is ${pcb.state} with no threads`,
-      );
-    }
-  }
-
-  /** I-8. A page fault does not advance the program counter. */
-  private i8_pageFaultDoesNotAdvanceThePc(): void {
-    for (const pid of this.faultedThisTick) {
-      const before = this.pcAtTickStart.get(pid);
-      const after = this.programCounters.get(pid);
-      if (before === undefined || after === undefined) continue;
-      this.assert(
-        before === after,
-        8,
-        () => `P${pid} faulted but its pc moved ${before} -> ${after}`,
-      );
-    }
-  }
-
-  /** I-9. TLB coherence. */
-  private i9_tlbCoherence(): void {
-    for (const entry of this.tlb) {
-      if (!entry.valid) continue;
-      const frame = this.frames[entry.frame];
-      this.assert(
-        frame !== undefined,
-        9,
-        () => `tlb entry names frame ${entry.frame} which is out of range`,
-      );
-      if (frame === undefined) continue;
-      this.assert(
-        frame.owner === entry.space && frame.page === entry.page,
-        9,
-        () =>
-          `tlb entry (space ${entry.space}, page ${entry.page}) names frame ${entry.frame} ` +
-          `owned by ${String(frame.owner)} holding page ${String(frame.page)}`,
-      );
-    }
-  }
-
-  /** I-10. Wait queue membership is consistent with state. */
-  private i10_waitQueueMembership(): void {
-    for (const primitive of this.syncPrimitives) {
-      for (const pid of primitive.waitQueue) {
-        const pcb = this.pcbs.get(pid);
-        this.assert(
-          pcb !== undefined && pcb.state === 'waiting',
-          10,
-          () => `P${pid} is in ${primitive.id}'s wait queue with state ${String(pcb?.state)}`,
-        );
-        const reason = pcb?.blockedOn;
-        this.assert(
-          reason !== null &&
-            reason !== undefined &&
-            (reason.kind === 'semaphore' || reason.kind === 'mutex'
-              ? reason.resource === primitive.id
-              : reason.kind === 'condition'
-                ? reason.monitor === primitive.id
-                : false),
-          10,
-          () => `P${pid} waits in ${primitive.id} but blockedOn says ${JSON.stringify(reason)}`,
-        );
+      case 'syscall': {
+        const result = this.syscall({ ...instruction.call, pid: pcb.pid });
+        return !(instruction.call.name === 'exec' && result.ok);
       }
-    }
-    for (const device of this.devices) {
-      for (const pid of device.queue) {
-        const pcb = this.pcbs.get(pid);
-        this.assert(
-          pcb !== undefined && pcb.state === 'waiting',
-          10,
-          () => `P${pid} is in device ${device.id}'s queue with state ${String(pcb?.state)}`,
-        );
-        const reason = pcb?.blockedOn;
-        this.assert(
-          reason !== null && reason !== undefined && reason.kind === 'io' && reason.device === device.id,
-          10,
-          () => `P${pid} queues on ${device.id} but blockedOn says ${JSON.stringify(reason)}`,
-        );
-      }
-    }
-    for (const pcb of this.pcbs.values()) {
-      if (pcb.state !== 'waiting') continue;
-      this.assert(pcb.blockedOn !== null, 10, () => `P${pcb.pid} is waiting with blockedOn null`);
+      case 'io': if (this.enabled.has('io')) this.io.request(pcb.pid, instruction.device); return true;
+      case 'acquire': if (this.enabled.has('sync')) this.sync.acquire(pcb.pid, instruction.resource); return true;
+      case 'release': if (this.enabled.has('sync')) this.sync.release(pcb.pid, instruction.resource); return true;
+      case 'thread_create': this.threads.create(pcb, thread.tid); return true;
+      case 'thread_join': this.threads.join(pcb, instruction.tid, thread.tid); return true;
     }
   }
-
-  /** I-11. Only legal state transitions occurred. Sim spec 3.3. */
-  private i11_onlyLegalTransitions(): void {
-    for (const pcb of this.pcbs.values()) {
-      const before = this.stateAtTickStart.get(pcb.pid);
-      if (before === undefined || before === pcb.state) continue;
-      const edge = `${before}>${pcb.state}`;
-      this.assert(
-        LEGAL_TRANSITIONS.has(edge),
-        11,
-        () => `P${pcb.pid} took the illegal transition ${edge}`,
-      );
-    }
+  private phase09_detectDeadlock(): void {
+    this.probe(9);
+    if (this.enabled.has('deadlock') && this.config.deadlockStrategy === 'detect' && this.tick % this.tuning.deadlockDetectionInterval === 0) this.deadlock.maybeDetect(this.tick);
   }
-
-  /** I-12. `readySince` pairs with state `ready`. */
-  private i12_readySincePairsWithReady(): void {
-    for (const pcb of this.pcbs.values()) {
-      this.assert(
-        (pcb.state === 'ready') === (pcb.readySince !== null),
-        12,
-        () => `P${pcb.pid} state=${pcb.state} readySince=${String(pcb.readySince)}`,
-      );
-      if (pcb.readySince !== null) {
-        this.assert(
-          pcb.readySince <= this.currentTick,
-          12,
-          () => `P${pcb.pid} readySince ${pcb.readySince} is in the future`,
-        );
-      }
-    }
+  private phase10_updateMetrics(): void {
+    this.probe(10);
+    let cpu = 0; let finished = 0; let worstWait = 0;
+    this.table.forEachAscending(pcb => {
+      if (pcb.pid <= 1) return;
+      cpu += pcb.totalCpuUsed;
+      if (pcb.state === 'zombie' || pcb.state === 'terminated') finished += 1;
+      if (pcb.readySince !== null) worstWait = Math.max(worstWait, this.tick - pcb.readySince);
+    });
+    this.schedulingMetrics = { ...EMPTY_SCHEDULING_METRICS,
+      cpuUtilisation: this.tick === 0 ? 0 : cpu / this.tick,
+      contextSwitches: this.contextSwitches, throughput: this.tick === 0 ? 0 : finished / this.tick, worstWait };
+    this.rebuildFreeList();
+    // TODO(astra): WP-05 and WP-06 compute memory metrics beyond frame conservation.
+    this.memoryMetrics = { ...EMPTY_MEMORY_METRICS, totalFrames: this.frames.length, freeFrames: this.freeList.length, workingSets: new Map() };
+    this.syncSchedulerView();
   }
-
-  /** I-13. The ready queue equals the set of ready processes. */
-  private i13_readyQueueMatchesReadySet(): void {
-    const queued = new Set<Pid>();
-    for (const level of this.scheduler.snapshot().queues) {
-      for (const pid of level) {
-        this.assert(!queued.has(pid), 13, () => `P${pid} appears in two queue levels`);
-        queued.add(pid);
-      }
-    }
-    if (this.running !== null) {
-      this.assert(
-        !queued.has(this.running),
-        13,
-        () => `running P${String(this.running)} is also queued`,
-      );
-      queued.add(this.running);
-    }
-
-    const expected = new Set<Pid>();
-    for (const pcb of this.pcbs.values()) {
-      if (pcb.state === 'ready' || pcb.state === 'running') expected.add(pcb.pid);
-    }
-
-    this.assert(
-      queued.size === expected.size,
-      13,
-      () => `queues hold ${queued.size} pids, ${expected.size} are ready or running`,
-    );
-    for (const pid of expected) {
-      this.assert(queued.has(pid), 13, () => `P${pid} is ready or running but not queued`);
-    }
+  private phase11_checkInvariants(): void {
+    this.probe(11); if (this.tuning.checkInvariants) this.invariants.check(this);
   }
-
-  /** I-14. A process admitted this tick has `waited === 0`. */
-  private i14_admittedThisTickHasNotWaited(): void {
-    for (const pid of this.admittedThisTick) {
-      const pcb = this.pcbs.get(pid);
-      if (pcb === undefined || pcb.readySince === null) continue;
-      this.assert(
-        this.currentTick - pcb.readySince === 0,
-        14,
-        () => `P${pid} was admitted this tick but has already waited ${this.currentTick - (pcb.readySince ?? 0)}`,
-      );
-    }
+  private move(pcb: ProcessControlBlock, to: ProcessState, options: TransitionOptions = {}): void {
+    transition(pcb, to, { ...options, tick: this.tick, emit: event => this.publish(event),
+      parentOf: pid => this.table.parentOf(pid), markCreated: pid => this.table.markCreated(pid),
+      onAdmit: p => this.scheduler.onAdmit(p, this.schedulerContext()),
+      onDispatch: p => { this.running = p.pid; },
+      onReady: p => { if (this.running === p.pid) this.running = null; this.scheduler.onUnblock(p, this.schedulerContext()); },
+      onBlock: p => {
+        if (this.running === p.pid) this.running = null;
+        if (p.blockedOn !== null && !p.threads.some(tid => this.threads.table.get(tid)?.state === 'waiting')) {
+          const tid = this.executingThread ?? p.threads[0];
+          if (tid !== undefined) this.threads.block(p, tid, p.blockedOn);
+        }
+        this.scheduler.onBlock(p, this.schedulerContext());
+      },
+      onUnblock: p => this.scheduler.onUnblock(p, this.schedulerContext()),
+      onExit: p => {
+        if (this.running === p.pid) this.running = null;
+        this.scheduler.onExit(p, this.schedulerContext()); this.lifecycle.cleanupExit(p);
+      },
+      onDiscard: p => this.lifecycle.cleanupExit(p),
+    });
   }
-
-  /** I-15. Priorities are in range. */
-  private i15_prioritiesInRange(): void {
-    for (const pcb of this.pcbs.values()) {
-      this.assert(
-        pcb.priority >= 0 && pcb.priority <= MAX_PRIORITY,
-        15,
-        () => `P${pcb.pid} priority ${pcb.priority} out of [0, ${MAX_PRIORITY}]`,
-      );
-      this.assert(
-        pcb.basePriority >= 0 && pcb.basePriority <= MAX_PRIORITY,
-        15,
-        () => `P${pcb.pid} basePriority ${pcb.basePriority} out of [0, ${MAX_PRIORITY}]`,
-      );
-    }
+  private publish(event: EmittableEvent): void { this.events.setTick(this.tick); this.events.emit(event); }
+  private probe(phase: number): void { for (const callback of this.probes) callback(phase, this.tick); }
+  private threadPc(pcb: ProcessControlBlock): number {
+    const tid = this.executingThread ?? pcb.threads[0];
+    return tid === undefined ? 0 : this.threads.table.get(tid)?.programCounter ?? 0;
   }
-
-  /** I-17. Frame conservation. */
-  private i17_frameConservation(): void {
-    let used = 0;
-    for (const frame of this.frames) if (frame.owner !== null) used += 1;
-    const free = this.freeList.length;
-    this.assert(
-      used + free === this.config.totalFrames,
-      17,
-      () => `${used} used + ${free} free != ${this.config.totalFrames} total`,
-    );
-    const seen = new Set<FrameId>();
-    for (const id of this.freeList) {
-      this.assert(!seen.has(id), 17, () => `duplicate frame ${id} in the free list`);
-      seen.add(id);
-      const frame = this.frames[id];
-      this.assert(
-        frame !== undefined && frame.owner === null,
-        17,
-        () => `free list holds owned frame ${id}`,
-      );
-    }
+  private makeScheduler(id: SchedulerId, params: SchedulerParams = this.schedulerParams): SchedulerPolicy {
+    // TODO(astra): WP-04 provides RR. The reference configuration temporarily runs bootstrap FCFS.
+    return id === 'fcfs' || id === 'rr' ? new BootstrapFcfs() : createScheduler(id, params);
   }
-
-  /** I-19. Metrics are finite. */
-  private i19_metricsAreFinite(): void {
-    const scheduling = this.schedulingMetrics;
-    const schedulingNumbers: readonly (readonly [string, number])[] = [
-      ['averageWaitingTime', scheduling.averageWaitingTime],
-      ['averageTurnaroundTime', scheduling.averageTurnaroundTime],
-      ['averageResponseTime', scheduling.averageResponseTime],
-      ['throughput', scheduling.throughput],
-      ['cpuUtilisation', scheduling.cpuUtilisation],
-      ['contextSwitches', scheduling.contextSwitches],
-      ['worstWait', scheduling.worstWait],
-    ];
-    for (const [name, value] of schedulingNumbers) {
-      this.assert(Number.isFinite(value), 19, () => `scheduling.${name} is ${value}`);
-      this.assert(value >= 0, 19, () => `scheduling.${name} is negative: ${value}`);
-    }
-    this.assert(
-      scheduling.cpuUtilisation <= 1,
-      19,
-      () => `cpuUtilisation ${scheduling.cpuUtilisation} exceeds 1`,
-    );
-
-    const memory = this.memoryMetrics;
-    const memoryNumbers: readonly (readonly [string, number])[] = [
-      ['totalFrames', memory.totalFrames],
-      ['freeFrames', memory.freeFrames],
-      ['pageFaults', memory.pageFaults],
-      ['majorFaults', memory.majorFaults],
-      ['evictions', memory.evictions],
-      ['writeBacks', memory.writeBacks],
-      ['faultRate', memory.faultRate],
-      ['externalFragmentation', memory.externalFragmentation],
-      ['internalFragmentation', memory.internalFragmentation],
-      ['tlbHitRate', memory.tlbHitRate],
-    ];
-    for (const [name, value] of memoryNumbers) {
-      this.assert(Number.isFinite(value), 19, () => `memory.${name} is ${value}`);
-      this.assert(value >= 0, 19, () => `memory.${name} is negative: ${value}`);
-    }
-    this.assert(
-      memory.tlbHitRate <= 1,
-      19,
-      () => `tlbHitRate ${memory.tlbHitRate} exceeds 1`,
-    );
-  }
-
-  /** I-20. Free list ordering. Strictly ascending makes allocation reproducible. */
-  private i20_freeListOrdering(): void {
-    for (let i = 1; i < this.freeList.length; i++) {
-      const prev = this.freeList[i - 1];
-      const cur = this.freeList[i];
-      if (prev === undefined || cur === undefined) continue;
-      this.assert(
-        cur > prev,
-        20,
-        () => `free list not ascending at index ${i}: ${prev} then ${cur}`,
-      );
-    }
-  }
-
-  /** I-38. The event sequence is monotonic within the frame. */
-  private i38_eventSequenceIsMonotonic(): void {
-    const frame = this.events.lastFrame;
-    for (let i = 1; i < frame.length; i++) {
-      const prev = frame[i - 1];
-      const cur = frame[i];
-      if (prev === undefined || cur === undefined) continue;
-      this.assert(cur.seq > prev.seq, 38, () => `seq went ${prev.seq} then ${cur.seq}`);
-      this.assert(cur.tick >= prev.tick, 38, () => `tick went ${prev.tick} then ${cur.tick}`);
-    }
-  }
-
-  /* ---------------------------------------------------------------- */
-  /* Helpers                                                           */
-  /* ---------------------------------------------------------------- */
-
-  /** Frames start owned by nobody and the free list starts fully ascending. */
-  private initialiseFrameTable(): void {
-    this.frames = [];
-    this.freeList = [];
-    for (let i = 0; i < this.config.totalFrames; i++) {
-      const id = asFrameId(i);
-      this.frames.push({
-        id,
-        owner: null,
-        page: null,
-        pinned: false,
-        loadedAtTick: null,
-        lastAccessTick: null,
-        referenceBit: false,
-      });
-      this.freeList.push(id);
-    }
-  }
-
-  private rebuildFreeList(): void {
-    this.freeList = [];
-    for (const frame of this.frames) {
-      if (frame.owner === null) this.freeList.push(frame.id);
-    }
-    this.freeList.sort((a, b) => a - b);
-  }
-
-  /** Snapshot per-process state so the cross-tick invariants have a baseline. */
-  private captureTickStartState(): void {
-    this.stateAtTickStart.clear();
-    this.pcAtTickStart.clear();
-    this.faultedThisTick.clear();
-    this.admittedThisTick.clear();
-    for (const pcb of this.pcbs.values()) {
-      this.stateAtTickStart.set(pcb.pid, pcb.state);
-      this.pcAtTickStart.set(pcb.pid, this.programCounters.get(pcb.pid) ?? 0);
-    }
-  }
-
-  /** Push kernel-owned values into the policy's reusable snapshot. */
   private syncSchedulerView(): void {
     if (isRunningAware(this.scheduler)) this.scheduler.setRunning(this.running);
     if (isMetricsAware(this.scheduler)) this.scheduler.acceptMetrics(this.schedulingMetrics);
   }
-
-  /** The read-only view handed to the scheduling policy in phase 7. */
   private schedulerContext(): SchedulerContext {
-    return {
-      tick: this.currentTick,
-      rng: this.rng.streams.get('scheduler') ?? this.rng.root,
-      params: this.schedulerParams,
-      running: this.running,
-      sliceElapsed: this.sliceElapsed,
-      process: (pid: Pid) => this.pcbs.get(pid),
-      readyQueue: this.orderedPids.filter((pid) => this.pcbs.get(pid)?.state === 'ready'),
-      emit: (event: KernelEvent) => {
-        this.events.publish(event, this.currentTick);
-      },
-    };
+    return { tick: this.tick, rng: this.rng.streams.get('scheduler') ?? this.rng.root,
+      params: this.schedulerParams, running: this.running, sliceElapsed: this.sliceElapsed,
+      process: pid => this.table.get(pid), readyQueue: this.table.filterAscending(p => p.pid > 1 && p.state === 'ready').map(p => p.pid),
+      emit: event => this.publish(event) };
+  }
+  private basePcb(pid: Pid, parent: Pid | null, name: string): ProcessControlBlock {
+    return { pid, parent, name, state: 'ready', priority: 39, basePriority: 39,
+      arrivalTick: asTick(0), cpuBurstRemaining: 1, serviceRemaining: 1, totalCpuUsed: 0,
+      readySince: asTick(0), lastScheduledTick: null, queueLevel: 0, addressSpaceId: pid as number as AddressSpaceId,
+      threads: [], openFiles: [], heldResources: [], requestedResources: [], blockedOn: null,
+      domain: 'kernel' as DomainId, exitCode: null, terminationReason: null, convoyMemberId: null };
+  }
+  private initialiseSystemProcesses(savedInit?: ProcessControlBlock): void {
+    const idle = this.table.insert({ ...this.basePcb(asPid(0), null, 'idle'), priority: Number.MAX_SAFE_INTEGER, basePriority: Number.MAX_SAFE_INTEGER, cpuBurstRemaining: Infinity, serviceRemaining: Infinity });
+    idle.threads.push(0 as Tid);
+    const init = this.table.insert(savedInit === undefined ? this.basePcb(asPid(1), null, 'init') : clonePcb(savedInit), { rawBurst: 1, rawService: 1, serialFraction: 1 });
+    this.threads.attach(init);
+    this.programs.set(init.pid, instructionProgram([{ kind: 'compute' }]));
+  }
+  private initialiseFrameTable(): void {
+    this.frames = Array.from({ length: this.config.totalFrames }, (_, index) => ({ id: asFrameId(index),
+      owner: null, page: null, pinned: false, loadedAtTick: null, lastAccessTick: null, referenceBit: false }));
+    this.rebuildFreeList();
+  }
+  private rebuildFreeList(): void {
+    this.freeList = this.frames.filter(frame => frame.owner === null).map(frame => frame.id).sort((a, b) => a - b);
+  }
+  private checkInvariants(): void {
+    const processes = this.table.filterAscending(p => p.pid !== asPid(0));
+    this.assert(processes.filter(p => p.state === 'running').length <= 1, 2, 'more than one running process');
+    for (let index = 0; index < processes.length; index++) {
+      const pcb = processes[index]; if (pcb === undefined) continue;
+      this.assert(index === 0 || pcb.pid > (processes[index - 1]?.pid ?? -1), 1, 'process table not ascending');
+      this.assert((pcb.state === 'ready') === (pcb.readySince !== null), 12, 'readySince disagrees with state');
+      if (pcb.readySince !== null) this.assert(pcb.readySince <= this.tick, 12, 'readySince lies in the future');
+      if (['ready', 'running', 'waiting'].includes(pcb.state)) this.assert(pcb.threads.length > 0, 7, 'active process has no threads');
+      for (const value of [pcb.cpuBurstRemaining, pcb.serviceRemaining, pcb.totalCpuUsed]) this.assert(Number.isSafeInteger(value) && value >= 0, 4, 'invalid process service');
+      this.assert(pcb.priority >= 0 && pcb.priority <= 39 && pcb.basePriority >= 0 && pcb.basePriority <= 39, 15, 'priority out of range');
+      if (pcb.state === 'waiting') this.assert(pcb.blockedOn !== null, 10, 'waiting process has no block reason');
+      if (this.admittedThisTick.has(pcb.pid) && pcb.readySince !== null) this.assert(pcb.readySince === this.tick, 14, 'new admission has waited');
+      if (pcb.pid > 1 && ['ready', 'running', 'waiting'].includes(pcb.state)) {
+        const sum = pcb.threads.reduce((total, tid) => total + (this.threads.table.get(tid)?.serviceRemaining ?? 0), 0);
+        this.assert(sum === pcb.serviceRemaining, 7, 'thread service is not conserved');
+      }
+    }
+    // I-11 is enforced per edge by transition(), not by comparing endpoints of a multi-edge tick.
+    const queued = this.scheduler.snapshot().queues.flat();
+    this.assert(new Set(queued).size === queued.length, 13, 'duplicate ready queue entry');
+    const expected = processes.filter(p => p.pid > 1 && p.state === 'ready').map(p => p.pid);
+    this.assert(queued.length === expected.length && expected.every(pid => queued.includes(pid)), 13, 'ready queue differs from ready processes');
+    this.assert(this.frames.filter(frame => frame.owner !== null).length + this.freeList.length === this.config.totalFrames, 17, 'frame conservation');
+    for (let index = 1; index < this.freeList.length; index++) this.assert((this.freeList[index] ?? -1) > (this.freeList[index - 1] ?? -1), 20, 'free list not ascending');
+    for (const entry of this.tlb) {
+      const frame = this.frames[entry.frame];
+      if (entry.valid) this.assert(frame?.owner === entry.space && frame.page === entry.page, 9, 'TLB does not match frame owner');
+    }
+    for (const value of Object.values(this.schedulingMetrics)) this.assert(Number.isFinite(value) && value >= 0, 19, 'invalid scheduling metric');
+    this.assert(this.schedulingMetrics.cpuUtilisation <= 1, 19, 'CPU utilisation exceeds one');
+    let previous = -1;
+    for (const event of this.events.lastFrame) { this.assert(event.seq > previous, 38, 'event sequence decreased'); previous = event.seq; }
+  }
+  private assert(condition: boolean, invariant: number, message: string): void {
+    if (!condition) {
+      this.publish({ type: 'kernel.panic', message: `I-${invariant}: ${message}` });
+      throw new InvariantViolation(invariant, message, this.tick);
+    }
   }
 }
-
-function clonePcb(pcb: ProcessControlBlock): ProcessControlBlock {
-  return {
-    ...pcb,
-    threads: [...pcb.threads],
-    openFiles: [...pcb.openFiles],
-    heldResources: [...pcb.heldResources],
-    requestedResources: [...pcb.requestedResources],
-    blockedOn: pcb.blockedOn === null ? null : { ...pcb.blockedOn },
-  };
+function clonePcb(pcb: Readonly<ProcessControlBlock>): ProcessControlBlock {
+  return { ...pcb, threads: [...pcb.threads], openFiles: [...pcb.openFiles], heldResources: [...pcb.heldResources],
+    requestedResources: [...pcb.requestedResources], blockedOn: pcb.blockedOn === null ? null : { ...pcb.blockedOn } };
 }
-
-/** The factory the game layer and the tests use. */
-export function createKernel(config: KernelConfig, options?: KernelOptions): KernelImpl {
-  return new KernelImpl(config, options);
+function cloneConfig(config: KernelConfig): KernelConfig {
+  return Object.freeze({ ...config, enabledSubsystems: Object.freeze([...config.enabledSubsystems]),
+    schedulerParams: Object.freeze({ ...config.schedulerParams,
+      ...(config.schedulerParams.levelQuanta === undefined ? {} : { levelQuanta: Object.freeze([...config.schedulerParams.levelQuanta]) }) }) });
 }
+function failure(errno: import('./types').Errno, message: string): SyscallResult { return { ok: false, errno, message }; }
+export function createKernel(config: KernelConfig, options?: KernelOptions): KernelImpl { return new KernelImpl(config, options); }
