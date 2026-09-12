@@ -175,3 +175,49 @@ replaced:
   in its report.
 - **WP-L02, The Weave**, gains its hazard back. Over-threading is now a real
   failure mode with a felt cost.
+
+---
+
+# Package scope corrections
+
+Not contract changes, so no hash moves and no amendment number. Recorded here
+because they changed what a package is allowed to do, and a later agent reading
+only its package would not otherwise know why.
+
+## 2026-09-12: phase 10, WP-03 and WP-05
+
+**Raised by:** the WP-03 agent, asking before editing rather than after.
+
+WP-03 required scheduling metrics and granted no way to wire them into the kernel.
+It also required the reference fixtures to stop depending on an ambiguous scheduler
+id while excluding the two files that hold them. Both were defects in the package.
+This is the third time a package has demanded an outcome while withholding the
+means, after the WP-01 scanner policy and the WP-02 snapshot channel. The pattern
+is mine: I wrote the outcome and the file list at different moments and did not
+reconcile them.
+
+Phase 10 turned out to be contested. WP-03 needs it for scheduling metrics and
+WP-05 recomputes `MemoryMetrics.tlbHitRate` there, and both were in flight at the
+same time.
+
+**Decision.** WP-03 converts phase 10 into a metrics dispatch point that calls each
+enabled subsystem's hook, following the `installHooks` pattern WP-02 established
+for phases 2, 3, 4 and 6. WP-03 owns the scheduling side in
+`src/kernel/scheduler/metrics.ts`. WP-05 registers through the hook and does not
+edit phase 10 at all. If WP-05 arrives before the dispatch point exists, it stubs
+and reports rather than adding the dispatch itself.
+
+WP-03 also gained permission to name `fcfs` explicitly in
+`tests/kernel/fixtures/referenceConfig.ts` and `tests/kernel/determinism.test.ts`,
+changing the scheduler id and nothing else.
+
+**The general lesson, worth applying to every remaining package.** A contested
+region of a shared file should become an extension point rather than a scheduling
+problem between agents. When two packages need the same lines, the first one there
+turns those lines into a dispatch and the second registers into it. Serialising one
+seam costs less than merging two versions of it.
+
+**Also settled:** the four wave 2 agents get one git worktree each, on their own
+branch, because all four packages grant `Kernel.ts` and `index.ts` and a shared
+checkout loses work silently. WP-03 merges first. See
+`docs/astra/00-KICKOFF-PROMPT.md`.

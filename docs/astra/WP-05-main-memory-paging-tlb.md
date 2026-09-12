@@ -65,11 +65,30 @@ tests/kernel/memory/fragmentation.test.ts
 
 ```
 src/kernel/Kernel.ts   (wire MemoryHooks to MemorySubsystem; implement
-                        setAllocationStrategy. Nothing else in this file.)
+                        setAllocationStrategy. Nothing else in this file, and
+                        specifically not phase 10, see below.)
 src/kernel/index.ts    (add the ALLOCATORS export)
 ```
 
 Nothing else.
+
+### Scope correction, 2026-09-12
+
+This package recomputes `MemoryMetrics.tlbHitRate` in phase 10, and WP-03 is being
+built at the same time and also needs phase 10. Rather than have you both edit the
+same lines, WP-03 is converting phase 10 into a dispatch point that calls each
+subsystem's metrics hook.
+
+So: do not edit phase 10. Register your metrics recomputation through the hook,
+the same way you register `MemoryHooks`, and look for the marker
+`// TODO(astra): WP-05 registers its metrics hook here`.
+
+If that marker is not in `Kernel.ts` when you get there, WP-03 has not landed yet.
+Do not add the dispatch yourself and do not compute `tlbHitRate` inline. Implement
+everything else, leave your recomputation behind a
+`// TODO(astra): blocked on WP-03 phase 10 dispatch` stub, and say so in your
+report. Serialising this one seam is much cheaper than merging two versions of the
+same phase.
 
 ## Frozen contracts
 

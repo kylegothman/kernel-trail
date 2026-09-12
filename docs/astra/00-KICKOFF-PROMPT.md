@@ -387,6 +387,38 @@ sits in. Detection timing and context-switch and copy debt are already kept out 
 delivered useful CPU service, so do not charge them again.
 ```
 
+## Shared files in wave 2, and how not to lose work
+
+All four packages grant `src/kernel/Kernel.ts` and `src/kernel/index.ts`, each
+scoped to a different region. That works on paper and fails in practice if four
+agents write into one checkout, because the last writer wins and the other three
+edits vanish with no conflict and no warning.
+
+**Give each agent its own git worktree.** From the repository root:
+
+```
+git worktree add ../kt-wp03 -b wp-03 main
+git worktree add ../kt-wp05 -b wp-05 main
+git worktree add ../kt-wp07 -b wp-07 main
+git worktree add ../kt-wp09 -b wp-09 main
+```
+
+Each agent works in its own directory on its own branch, runs its own install, and
+its Kernel.ts edits merge as a normal three-way merge rather than overwriting.
+Separate worktrees also end the node_modules platform problem, since each has its
+own.
+
+Merge order is WP-03 first, because it converts phase 10 into a metrics dispatch
+point that WP-05 registers into. The other three can merge in any order after it.
+
+Two rules for every agent, regardless:
+
+- Keep `Kernel.ts` edits minimal, contiguous and inside your named region. Do not
+  reorder, rename or renumber the eleven phases, and do not reformat surrounding
+  code. A reflowed file conflicts with everything.
+- Report the exact line ranges you touched in `Kernel.ts` and `index.ts`, so the
+  other three can be told before they merge.
+
 ## Not in wave 2
 
 Two open items belong to nobody in this wave. Do not let an agent pick them up as

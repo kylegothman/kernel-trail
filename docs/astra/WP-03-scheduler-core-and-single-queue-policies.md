@@ -80,11 +80,49 @@ tests/kernel/scheduler/starvation.test.ts
 
 ```
 src/kernel/Kernel.ts     (delete BootstrapFcfs; wire phases 6 and 7 to the registry;
-                          complete setScheduler. Nothing else in this file.)
+                          complete setScheduler; make phase 10 a metrics dispatch
+                          point, see the scope correction below. Nothing else in
+                          this file.)
 src/kernel/index.ts      (add the SCHEDULERS export)
+tests/kernel/fixtures/referenceConfig.ts   (name FCFS explicitly, see below)
+tests/kernel/determinism.test.ts           (name FCFS explicitly, see below)
 ```
 
 Nothing else.
+
+### Scope correction, 2026-09-12
+
+This package required scheduling metrics while granting no way to wire them into
+the kernel, and it required the reference fixtures to stop depending on an
+ambiguous scheduler id while excluding those two files. Both were defects in the
+package, not limits to work around. Corrected as follows.
+
+**Phase 10 is now yours, but as a dispatch point rather than as your own code.**
+Do not compute scheduling metrics inline in `Kernel.ts`. Phase 10 must call each
+enabled subsystem's metrics recomputation through the hook mechanism WP-02 already
+established, exactly the way phases 2, 3, 4 and 6 call their hooks. Then implement
+the scheduling side of it in `src/kernel/scheduler/metrics.ts`.
+
+This matters because phase 10 is contested. WP-05 recomputes
+`MemoryMetrics.tlbHitRate` there, and it is being built at the same time as this
+package. If you hard-code scheduling metrics into phase 10, WP-05 has to edit the
+same lines and one of you loses work. If you make phase 10 a dispatch point, WP-05
+plugs in through its own hook and never touches the file again. Leave a
+`// TODO(astra): WP-05 registers its metrics hook here` marker at the registration
+site so the next agent can see where it belongs.
+
+**Completion and dispatch accounting** is in scope for the same reason: the
+metrics are not computable without it. Keep the edits at the existing call sites
+and do not reorder or rename the eleven phases.
+
+**The two test files:** change them to name `fcfs` explicitly rather than relying
+on the registry resolving `rr` to the bootstrap. That removes the RR ambiguity
+this package already discloses. Change the scheduler id and nothing else. Do not
+alter an assertion, a seed, a tick count or the scanner policy. Those tests are
+the determinism baseline for the whole project and 226 tests currently pass.
+
+**Report the exact line ranges you touched in `Kernel.ts`**, so the three agents
+working beside you can be told.
 
 ## Frozen contracts
 
