@@ -5,14 +5,16 @@
   "type": "module",
   "description": "A journey across the substrate. An Oregon-Trail-structured game that teaches college-level operating systems.",
   "scripts": {
-    "dev": "vite",
     "build": "tsc --noEmit && vite build",
+    "check:contracts": "node scripts/check-contracts.mjs",
+    "dev": "vite",
+    "lint": "eslint src tests",
     "preview": "vite preview",
-    "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "test:watch": "vitest",
     "test:determinism": "vitest run tests/kernel/determinism.test.ts",
-    "lint": "eslint src tests"
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "verify": "npm run check:contracts && npm run typecheck && npm run test && npm run build"
   },
   "dependencies": {
     "three": "^0.185.0"

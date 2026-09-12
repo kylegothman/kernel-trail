@@ -1,0 +1,40 @@
+{
+  "//": "Context compression policy for KERNEL TRAIL build agents. See docs/06-AGENT-TOOLCHAIN.md section 3 for the reasoning behind every rule here. IMPORTANT: these field names are this project's policy vocabulary, NOT Headroom's configuration schema. Map them to the real schema by reading Headroom's documentation. Do not guess field names.",
+
+  "mode": "shadow",
+  "modeNote": "Stays shadow until the fidelity canary in tests/toolchain/headroom.canary.test.ts passes. Shadow measures what would have been compressed without changing what the model receives.",
+
+  "neverCompress": {
+    "paths": [
+      "src/kernel/types.ts",
+      "src/game/types.ts",
+      "contracts.lock.json",
+      "docs/**",
+      "tests/**/*.test.ts",
+      "tests/**/fixtures/**"
+    ],
+    "contentPatterns": [
+      "Ch\\.\\s*\\d+(\\.\\d+)*",
+      "\\b\\d+\\.\\d{6,}\\b",
+      "\\btoBeCloseTo\\b",
+      "\\bsafe sequence\\b",
+      "\\b(avg|average)\\s+(wait|waiting|turnaround|response)\\b"
+    ],
+    "contentPatternsNote": "A chapter citation, a high precision decimal, or a named scheduling metric marks content whose exact value is the point. Paraphrasing any of it produces fabricated test vectors that the agent will then write passing tests against.",
+    "toolOutputs": ["typecheck", "test", "build", "check:contracts", "lint"],
+    "toolOutputsNote": "Small, and they are the signal the agent acts on. Compressing them saves nothing and can hide a failure."
+  },
+
+  "compressible": {
+    "paths": ["tests/golden/**"],
+    "toolOutputs": ["npm-install", "git-log", "git-status"],
+    "minLines": 200,
+    "minLinesNote": "Below this the overhead and the risk exceed the saving."
+  },
+
+  "reversibility": {
+    "required": true,
+    "cacheLocal": true,
+    "note": "Every compressed span must be retrievable in full. A golden log is additionally reproducible from its seed, so the cache is a convenience rather than the system of record."
+  }
+}

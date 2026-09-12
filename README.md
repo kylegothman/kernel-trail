@@ -72,12 +72,20 @@ difficulty curve you control by playing well.
 ```bash
 npm install
 npm run dev        # vite dev server
-npm run typecheck  # tsc --noEmit
-npm run test       # vitest
+npm run verify     # contract guard, typecheck, tests, build
 npm run build      # production bundle
 ```
 
-Requires Node 22 or newer. Targets 60 fps on Apple silicon integrated graphics,
+Requires Node 22 or newer. A devcontainer is provided and is the recommended way
+to work on this, because it pins the toolchain and keeps `node_modules` in a
+named volume. Native binaries are per platform, so two machines installing into
+one checkout will break each other's toolchain.
+
+`npm run verify` is the gate. It runs `check:contracts` first, which enforces the
+things a passing test suite cannot see: that the frozen interfaces have not been
+edited, that there is exactly one source scanner, that no test was made to pass
+by skipping it, and that no em dash or borrowed name reached a file that ships.
+CI runs the same gate. Targets 60 fps on Apple silicon integrated graphics,
 WebGPU where available and WebGL2 as the fallback.
 
 ## Architecture
@@ -131,6 +139,7 @@ labels to that plane. There are no flat 2D simulation overlays.
 | `docs/03-VISUAL-BIBLE.md` | Design tokens, materials, post chain, focus camera |
 | `docs/04-NARRATIVE-BIBLE.md` | World, Programs, economy, event tables, epitaphs |
 | `docs/05-CURRICULUM-MAP.md` | Chapter mapping, objectives, assessment, misconceptions |
+| `docs/06-AGENT-TOOLCHAIN.md` | Environment pinning, the contract guard, context compression policy |
 | `docs/astra/` | Sequenced build packages, 20 engine and 14 leg |
 
 Start with `docs/astra/00-ASTRA-BRIEFING.md` and `docs/astra/00-PACKAGE-INDEX.md`.

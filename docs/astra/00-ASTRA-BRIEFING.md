@@ -234,10 +234,25 @@ forbidden.
 Run all three, in this order, from the repository root:
 
 ```
-npm run typecheck     # tsc --noEmit, must exit 0
-npm run test          # vitest run, must exit 0
-npm run build         # vite build, must exit 0
+npm run check:contracts   # the contract guard, must exit 0, and runs first
+npm run typecheck         # tsc --noEmit, must exit 0
+npm run test              # vitest run, must exit 0
+npm run build             # vite build, must exit 0
 ```
+
+`npm run verify` runs all four in that order.
+
+The contract guard comes first and needs no dependencies installed. It catches
+five things a green test suite cannot: an edit to a frozen contract, a second
+source scanner with a contradicting policy, a test made to pass by skipping it,
+an em dash, and a borrowed name reaching a file that ships. If it fails, read the
+remedy it prints. Do not disable a rule to get past it. `docs/06-AGENT-TOOLCHAIN.md`
+section 2 explains each rule and how a human approves an exception.
+
+If `npm install` or `npx` fails with "Cannot find native binding" or "Unable to
+resolve @typescript/typescript-<platform>", that is a platform mismatch in
+`node_modules`, not a defect in your package. Delete `node_modules`, reinstall,
+and carry on. `docs/06-AGENT-TOOLCHAIN.md` section 1 explains why it happens.
 
 A package is not done until all three exit zero. "It works but the type checker
 complains" is not done. "The new tests pass but two old ones broke" is not done:

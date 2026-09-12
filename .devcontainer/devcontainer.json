@@ -1,0 +1,34 @@
+{
+  "name": "KERNEL TRAIL",
+  "image": "mcr.microsoft.com/devcontainers/typescript-node:22",
+
+  // WHY THIS EXISTS. Native binaries are per platform. When one agent installs
+  // on darwin-arm64 and another installs into the same checkout on linux-arm64,
+  // npm prunes the optional dependency the other one needs and the toolchain
+  // breaks in ways that look like code faults: "Cannot find native binding",
+  // "Unable to resolve @typescript/typescript-<platform>". This cost real time
+  // during WP-01. One container, one platform, one node_modules.
+
+  "features": {
+    "ghcr.io/devcontainers/features/github-cli:1": {}
+  },
+
+  // node_modules lives in a named volume rather than the bind mount, so a host
+  // install and a container install can never overwrite each other.
+  "mounts": [
+    "source=kernel-trail-node-modules,target=${containerWorkspaceFolder}/node_modules,type=volume"
+  ],
+  "postCreateCommand": "sudo chown node node_modules && npm install",
+
+  "customizations": {
+    "vscode": {
+      "extensions": ["dbaeumer.vscode-eslint", "vitest.explorer", "slevesque.shader"],
+      "settings": {
+        "typescript.tsdk": "node_modules/typescript/lib",
+        "editor.formatOnSave": false
+      }
+    }
+  },
+
+  "remoteUser": "node"
+}

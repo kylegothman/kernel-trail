@@ -1,0 +1,54 @@
+name: ci
+
+# Every gate an agent is told to run before reporting done, run again here where
+# it cannot be skipped. The contract check comes FIRST and on its own, because a
+# frozen-interface edit or a disabled guard makes the rest of the run
+# meaningless: the suite would be green and the project would still be broken.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contracts:
+    name: contract guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+      # No install step. The guard has zero dependencies precisely so it still
+      # runs when the dependency tree is broken, which is when it matters most.
+      - run: node scripts/check-contracts.mjs
+
+  gates:
+    name: typecheck, test, build
+    needs: contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run test
+      - run: npm run build
+      - name: bundle budget
+        run: |
+          # The whole point of a browser game is that it opens fast. A silent
+          # bundle regression is the easiest way to lose that, so name a ceiling.
+          size=$(du -sk dist | cut -f1)
+          echo "dist is ${size}KB"
+          if [ "$size" -gt 6144 ]; then
+            echo "dist exceeds the 6MB ceiling. Check what was added, or raise the ceiling deliberately."
+            exit 1
+          fi

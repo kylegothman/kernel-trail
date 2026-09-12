@@ -920,3 +920,53 @@ State:
 10. Confirmation that the five `package.json` scripts are the only ones added,
     that nothing under `tests/` or `tools/` is imported from `src/`, and that no
     frozen contract was edited, extended or shadowed.
+
+---
+
+## Amendment: how a golden run is stored and compared
+
+Added after WP-01, ahead of implementation. This supersedes any part of the
+specification above that implies a golden run is stored as a full event log.
+
+A fourteen-leg journey emits a very large event stream. Storing and diffing it
+raw makes every failure expensive to read, bloats the repository, and pushes an
+enormous, highly repetitive artefact through whatever reads it. Store it in three
+tiers instead.
+
+**Tier 1, the fingerprint.** For each leg, a single line: the seed, the tick
+count, the event count, and one FNV-1a hash of the canonical serialisation of the
+whole event stream. Use `tests/kernel/canonical.ts`, which WP-01 already built
+and which exists so that two structurally identical streams hash identically.
+This is what the golden file contains, and it is what CI compares. A passing run
+reads four numbers.
+
+**Tier 2, the structural summary.** Committed beside the fingerprint: per event
+type, the count and the first and last tick it appears on. Roughly forty lines
+per leg. On a mismatch this is what gets compared first, and it localises almost
+every regression on its own, because a scheduling change shows up as a changed
+`context.switch` count long before anyone needs to read individual events.
+
+**Tier 3, the full log.** Never committed. Regenerated on demand from the seed,
+which determinism guarantees is exact. When tiers 1 and 2 disagree, the harness
+materialises both runs, finds the first diverging event, and emits that event
+plus 50 events of context on each side. That window, not the run, is what a human
+or an agent reads. A typical failure is a few hundred tokens.
+
+Provide `npm run golden:update` to regenerate tiers 1 and 2, and
+`npm run golden:explain <legId>` to produce the tier 3 divergence window.
+
+### Context compression
+
+Tier 3 output is the only artefact in this project cleared for the context
+compression layer described in `docs/06-AGENT-TOOLCHAIN.md` section 3, and
+`tools/headroom/policy.json` already encodes the rules. Nothing else is. The
+specifications, the frozen contracts, the fixtures and the gate output are all on
+the hard exclusion list, because they carry exact numbers whose whole value is
+being exact.
+
+Before the compression layer is trusted with tier 3 output, write
+`tests/toolchain/headroom.canary.test.ts`. It takes a known golden log and a
+document containing a table of numeric test vectors, sends each through compress
+and then expand, and asserts both come back byte identical. If either round trip
+is lossy, the layer stays in shadow mode and is not used. Add this canary to the
+acceptance criteria above.
