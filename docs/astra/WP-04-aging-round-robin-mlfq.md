@@ -10,6 +10,23 @@ three levels, demotion on quantum expiry, preemption by a higher-level arrival,
 voluntary release that keeps the level, and promotion by aging. A golden-file
 suite pins every Gantt chart so a future refactor cannot quietly change one.
 
+## Two notes before you start
+
+**Aging is on `SchedulerHooks`, not on `SchedulerPolicy`.** `SchedulerPolicy` is
+frozen and has no aging method. Phase 6's entry point lives on a separate
+`SchedulerHooks` object that the kernel holds alongside the policy, and the
+`onAge` hook this package implements is on `SchedulerBase`. Neither goes on the
+frozen interface. Older text that said to call aging on the policy was wrong.
+
+**This package is where round robin first gets tested.** Before WP-03 replaced
+the bootstrap, both `fcfs` and `rr` resolved to an internal `BootstrapFcfs`, so
+the reference determinism tests were passing under FCFS in both cases and
+validated nothing about round robin. WP-03 replaced the bootstrap and delivered
+real FCFS. Real round robin is yours, which means `SCHED-RR-1`, `SCHED-RR-2a`,
+`SCHED-RR-2c` and the quantum-sensitivity table are the first genuine RR coverage
+in the repository. Treat a green suite inherited from WP-02 or WP-03 as no
+evidence about `rr` at all.
+
 ## Prerequisites
 
 WP-03 complete and green.

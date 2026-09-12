@@ -6,8 +6,10 @@ When this package is done every one of the 26 `SyscallName` values has a real
 handler with its documented preconditions, effects, return value and errno set;
 argument validation runs at the gate before any handler; the seven errno
 substitutions are implemented with their exact message prefixes; `snapshot()` and
-`restore()` round-trip the complete kernel state; and all forty invariants run in
-phase 11 of every dev and test build. This is the integration package: it is the
+`restore()` round-trip the complete kernel state, including a populated
+`subsystems.process` and a `restore` that refuses an incomplete snapshot; and all
+forty invariants run in phase 11 of every dev and test build. This is the
+integration package: it is the
 first point at which the whole simulator is exercised together, and fixtures
 `DET-D2`, `INV-ALL-1` and `INV-ALL-2` become meaningful.
 
@@ -36,6 +38,11 @@ each exposing the operations its package reported.
   fixtures, positive and negative)
 - `01-ARCHITECTURE.md` section 8.3 (`SaveFile`) and 8.4 (checksum), so
   `KernelSnapshot` is structurally cloneable and canonicalisable
+- `docs/07-CONTRACT-AMENDMENTS.md` amendment 1 in full, then the
+  "amendment 1: the subsystem state channel" block in `src/kernel/types.ts`.
+  This package owns the process contribution and the `restore` completeness
+  check, so read the decision before reading §5 below
+- `02-KERNEL-SIM-SPEC.md` section 1.5 (the subsystem state channel)
 
 ## Files you will create
 
@@ -122,8 +129,25 @@ export interface KernelSnapshot {
   readonly journal: readonly JournalEntry[];
   readonly domains: readonly ProtectionDomain[];
   readonly metrics: { readonly scheduling: SchedulingMetrics; readonly memory: MemoryMetrics };
+
+  /* amendment 1: the subsystem state channel */
+  readonly completeness?: SnapshotCompleteness;   // 'init_only' | 'full', absent means 'init_only'
+  readonly subsystems?: SubsystemSnapshots;
+}
+
+export interface SubsystemSnapshots {
+  readonly process?: ProcessSnapshotState;        // fully typed, this package implements it
+  readonly memory?: SubsystemEnvelope;            // WP-05
+  readonly sync?: SubsystemEnvelope;              // WP-07
+  readonly storage?: SubsystemEnvelope;           // WP-09
+  readonly fs?: SubsystemEnvelope;                // WP-10
+  readonly security?: SubsystemEnvelope;          // WP-10
 }
 ```
+
+Read the amendment 1 block in `src/kernel/types.ts` for the full shape of
+`ProcessSnapshotState`, `ProgramSnapshot`, `ThreadSnapshot`, `IdCounters`,
+`IpcSnapshot`, `SubsystemEnvelope` and `JsonValue`. Use those names exactly.
 
 The `Kernel` methods this package completes:
 
@@ -137,16 +161,28 @@ Note that `SyscallName` has 27 members listed above. The sim spec's reference
 table has 27 entries and calls the set "26 calls" in prose. **Implement every
 member of the union.** Count from the union, never from the prose.
 
-`KernelSnapshot` has no slot for the side tables the subsystem packages were told
-to keep (parent links, COW ref counts, raw burst figures, working-set rings,
-store buffers, capability seals, rollback checkpoints, the live device-mode
-table, `switchesToDomain`). That is a genuine gap in the frozen contract and it
-is the most likely escalation in this package. **Before escalating, try this**:
-every side table is derivable from, or attachable to, an existing snapshot field.
-Serialise each one into a deterministic position inside a field that already
-exists, and document the encoding in one comment block at the top of
-`snapshot.ts`. If a side table genuinely cannot be encoded that way, stop and
-report per the escalation procedure rather than adding a field.
+Earlier revisions of this package said `KernelSnapshot` had no slot for the side
+tables the subsystem packages were told to keep (parent links, COW ref counts,
+raw burst figures, working-set rings, store buffers, capability seals, rollback
+checkpoints, the live device-mode table, `switchesToDomain`), and told you to
+encode them into existing fields. That was a real gap in the frozen contract,
+WP-02 escalated it, and it is now closed: `completeness` and `subsystems` are the
+channel. Put side-table state in its owning subsystem slot. Do not encode it into
+an unrelated field, and do not add a field.
+
+**This package owns three things because of that amendment**, all described in
+§5 below:
+
+1. `ProcessSnapshotState`, implemented completely, every field, from the side
+   tables WP-02 built.
+2. The `restore` completeness check, which throws rather than silently dropping
+   state.
+3. Resolving WP-02's init-only guard, which throws today and carries
+   `// TODO(astra): blocked on contract change, see report`. That TODO is this
+   package's to remove.
+
+See `docs/07-CONTRACT-AMENDMENTS.md` amendment 1 for the decision and its
+reasoning.
 
 ## Specification
 
@@ -314,12 +350,92 @@ Rules:
   be excluded from `processes`, as WP-02 already excludes it from
   `Kernel.processes`.
 - **Metrics are recomputed at snapshot time, never carried from a stale field.**
+- **`completeness` is set from what the kernel actually holds.** Emit `'full'`
+  whenever any user process has existed or any program is registered, and
+  populate `subsystems` to match. Emit `'init_only'` only for a kernel with no
+  workload state at all.
+
+#### 5.1 `ProcessSnapshotState`, in full
+
+Build `subsystems.process` from WP-02's side tables. Every field of
+`ProcessSnapshotState` is populated: `version`, `programs`, `threads`, `rawWork`,
+`lwpBindings`, `counters`, `pendingChildReturns`, `cowRefCounts`, `ipc`, `tuning`
+and `executionDebt`. Each `ProgramSnapshot` carries its `pid`, `name`,
+`instructions`, `programCounter`, `repeating`, `referenceString` and
+`serialFraction`. Each `ThreadSnapshot` carries its `tid`, `pid`,
+`programCounter`, `state` and `blockedOn`. `counters` is an `IdCounters` with
+`nextPid`, `nextTid` and `nextAddressSpace`, so a restored kernel never reissues
+a live id. `ipc` is an `IpcSnapshot` holding shared regions with their frames,
+attached address spaces and value, and mailboxes with their capacity, messages in
+order and waiters.
+
+**A shallow PCB snapshot is insufficient and will not pass review.** A snapshot
+that records process control blocks and stops cannot resume a workload: the
+programs have no instruction stream, the threads have no program counters, the
+allocators restart and reissue live ids, and the raw pre-acceleration figures are
+gone, so the Amdahl recomputation of sim spec 4.3 produces different bursts after
+a restore than before it. If a field of `ProcessSnapshotState` has no obvious
+source in WP-02's tables, that is a question for the report, not a field to leave
+empty.
+
+Apply the same snapshot rules to this slot as to the shared tables: deterministic
+array order (programs and `rawWork` ascending by pid, threads and `lwpBindings`
+ascending by tid, `cowRefCounts` ascending by frame id, shared regions and
+mailboxes ascending by lexicographic id, messages and waiters in queue order),
+deep copy on the way out, and no `Map`, `Set`, function or non-finite number
+anywhere. `JsonValue` is structurally cloneable JSON and nothing else, so
+`instructions` and `tuning` must be plain data.
+
+#### 5.2 The five envelopes
+
+`memory`, `sync`, `storage`, `fs` and `security` each arrive as a
+`SubsystemEnvelope`: an `owner`, a `version`, and a `payload` of `JsonValue`.
+This package carries them through `snapshot()` and hands each one back to its
+owning subsystem on `restore()`. The owner validates its own payload and throws
+on a version it does not understand. You do not interpret another subsystem's
+payload here, and you do not repair one; an envelope that fails its owner's
+validation is a failed restore.
+
+Those five subsystems will each promote their envelope to a typed interface. When
+one lands, this package's snapshot code changes only where it names the slot.
+
+#### 5.3 The completeness check
+
+`restore` is the enforcement point, because the fields are optional and the type
+system therefore cannot prove a snapshot is complete.
+
+```
+if the snapshot's completeness is weaker than the state being restored into,
+throw
+```
+
+An absent `completeness` counts as `'init_only'`. Restoring an init-only snapshot
+into a kernel that has run a workload **throws**. It does not reset the kernel,
+it does not restore the shared tables and leave the side tables stale, and it
+does not log a warning and continue. A silently misread save is worse than a
+refused one, and this check is the only thing standing between the game's save
+model and a save that loads into a subtly wrong kernel.
+
+The same rule applies one level down: a snapshot claiming `'full'` whose
+`subsystems.process` is absent, or whose envelope set omits a subsystem in
+`enabledSubsystems` that holds state, is inconsistent and throws.
+
+This check is also what resolves WP-02's init-only guard. WP-02 throws on any
+restore into a non-empty kernel and marks it
+`// TODO(astra): blocked on contract change, see report`. Replace that guard with
+the real check and delete the marker.
+
+#### 5.4 `restore`
 
 `restore(snapshot)` replaces state in place:
 
 - Validate `version === 1`; anything else throws `KernelConfigError`.
+- Run the completeness check of §5.3 before touching any state, so a refused
+  restore leaves the kernel exactly as it was.
 - Call `Rng.restore` on the **existing** stream objects, never construct new
   ones, because subsystems hold references.
+- Hand each populated `subsystems` slot to its owner: `process` to WP-02's
+  tables, each envelope to the subsystem named by `owner`.
 - Rebuild every derived structure: the scheduler's queues from the process
   states, the free list from the frame table, the wait-for graph on demand, the
   dentry cache empty, the TLB empty or restored, whichever the subsystem's owner
@@ -453,6 +569,36 @@ structure it so a bundler can drop the module.
 24. `git diff --exit-code src/kernel/types.ts src/game/types.ts` exits 0.
 25. The forbidden-identifier scan still returns zero matches, and `DET-D1`,
     `DET-D3` and `DET-D4` still pass.
+26. Every field of `ProcessSnapshotState` is populated. A test enumerates the
+    interface's keys against a snapshot taken from a running workload and asserts
+    none is `undefined` and no array field is empty where the corresponding live
+    table is non-empty. `programs` and `threads` have one entry per live program
+    and per live thread respectively, counted from the kernel rather than from a
+    hand-written expected count.
+27. **Workload round trip.** Build a kernel with at least 4 user processes, at
+    least 3 of which have 2 or more threads, at least one shared memory region
+    with two attachers, at least one mailbox holding messages, and at least one
+    uncollected child exit code. Run 1,500 ticks. Snapshot. Construct a fresh
+    kernel from the same `KernelConfig`, `restore` the snapshot into it, and run
+    both kernels forward 1,500 more ticks. The two continuation event logs are
+    byte-identical under `canonical`, and the two final snapshots are
+    byte-identical under `canonical`. This is the criterion that a shallow PCB
+    snapshot cannot pass.
+28. **A truncated snapshot is rejected.** Four cases, each asserting a throw and
+    asserting that the target kernel's snapshot is canonically unchanged
+    afterwards: an otherwise valid snapshot with `completeness` deleted restored
+    into a kernel that has run a workload; the same with `completeness` set to
+    `'init_only'`; a snapshot with `completeness: 'full'` and `subsystems`
+    deleted; a snapshot with `completeness: 'full'` and `subsystems.process`
+    deleted. Silent acceptance fails this criterion, and so does acceptance with
+    a warning.
+29. `subsystems.process` survives `structuredClone` and `canonical` unchanged,
+    and `restore` of a `structuredClone`d snapshot behaves identically to
+    `restore` of the original.
+30. WP-02's init-only restore guard is gone, along with its
+    `// TODO(astra): blocked on contract change, see report` marker, replaced by
+    the completeness check of §5.3. Verified by a grep for that marker returning
+    zero matches under `src/kernel/`.
 
 ## Tests you must write
 
@@ -517,8 +663,15 @@ errno for each of the 27 calls. Use sim spec 14.3 as the checklist and sim spec
 | `array orders` | every array in the snapshot is in the documented order, asserted per field |
 | `pid 0 excluded` | `snapshot().processes` contains no pid 0 |
 | `version guard` | restoring a snapshot with `version` other than 1 throws `KernelConfigError` |
-| `side tables survive` | for each side table you encoded, a value set before the snapshot is present after the restore; one case per table |
+| `side tables survive` | for each side table, a value set before the snapshot is present after the restore, read back from its subsystem slot; one case per table |
 | `no emit during restore` | `restore` produces zero events |
+| `process state complete` | per acceptance criterion 26 |
+| `workload round trip` | per acceptance criterion 27 |
+| `truncated rejected` | per acceptance criterion 28, four cases |
+| `clone stable` | per acceptance criterion 29 |
+| `init-only guard resolved` | per acceptance criterion 30 |
+| `envelope version refused` | an envelope whose `version` its owner does not understand makes `restore` throw, and the target kernel is canonically unchanged |
+| `id counters` | after a restore, the next `fork` and the next `thread_create` issue ids above every id live in the snapshot |
 
 ### `tests/kernel/invariants.test.ts`
 
@@ -577,12 +730,12 @@ report the wall time.
 
 State:
 
-1. Pass or fail for each of the twenty-five acceptance criteria, by number.
+1. Pass or fail for each of the thirty acceptance criteria, by number.
 2. The three verification command outcomes.
-3. The complete list of side tables you encoded into `KernelSnapshot`, with the
-   field each was encoded into and the encoding used, so a future reader can
-   decode them.
-4. Any side table that could not be encoded, escalated per the procedure.
+3. The complete list of side tables you carried into `KernelSnapshot`, with the
+   `subsystems` slot each went into and, for the envelopes, the `owner` and
+   `version` you recorded.
+4. Any side table with no home in the channel, escalated per the procedure.
 5. Every subsystem file you added `snapshotContribution` or
    `restoreContribution` to.
 6. The measured phase 11 cost as a percentage of total step time, and the wall

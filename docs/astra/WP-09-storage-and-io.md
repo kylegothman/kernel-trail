@@ -564,6 +564,41 @@ driver. Document the command set each driver accepts in a comment above its
 
 `net0` draws packet loss from `root/io` and from no other stream.
 
+### 12. The storage and I/O snapshot contribution
+
+This package owns the storage subsystem's contribution to `KernelSnapshot`. The
+channel is `subsystems.storage`, added by `docs/07-CONTRACT-AMENDMENTS.md`
+amendment 1, and it starts as a `SubsystemEnvelope`:
+
+```ts
+{ owner: 'storage', version: 1, payload: /* JsonValue */ }
+```
+
+`owner` is this subsystem's `SubsystemId`. `version` starts at 1 and this package
+bumps it whenever the payload shape changes. The payload carries the state the
+shared `diskQueue`, `diskHead` and `devices` tables cannot express: the disk
+policy in force with its direction and sweep position, the NVM wear and mapping
+state, the RAID layout and any rebuild in progress, the per-device mode table,
+the interrupt controller's pending lines, masks and in-service line, the storm
+window counters, the buffer and block cache contents, and the spool queues. It
+must be plain `JsonValue`, so no `Map`, no `Set`, no function and no non-finite
+number. Validate the payload on restore and throw on a `version` this package
+does not understand, because a silently misread save is worse than a refused one.
+
+`SubsystemSnapshots` has no separate `io` slot, so the I/O half travels in this
+envelope under its own named key of the payload. If the typed promotion needs a
+slot of its own, that is an amendment to raise at that point, recorded the same
+way this one was.
+
+**Promote the envelope to a typed interface in the same commit that implements
+the subsystem**, additively, the way amendment 1 was made, and record the
+promotion in `docs/07-CONTRACT-AMENDMENTS.md`. The envelope is a transition
+mechanism. Shipping with an opaque envelope means this package is not finished.
+
+WP-11 carries the envelope through `snapshot()` and hands it back on `restore()`.
+It does not interpret the payload, so nothing else will catch a field you leave
+out.
+
 ## Acceptance criteria
 
 1. `npm run typecheck` exits 0.
@@ -615,6 +650,12 @@ driver. Document the command set each driver accepts in a comment above its
 21. `git diff --exit-code src/kernel/types.ts src/game/types.ts` exits 0.
 22. The forbidden-identifier scan still returns zero matches, and `DET-D1`,
     `DET-D3` and `DET-D4` still pass.
+23. Storage and I/O state survives a snapshot and restore round trip. Reach a
+    mid-sweep state under `scan` with a non-empty disk queue, a pending interrupt
+    line, a device in polling mode after a storm, and a non-empty spool queue;
+    take the envelope; restore it into a fresh subsystem; and `projectedPath`,
+    the next interrupt delivered and the next spool job served all match the
+    kernel that was never interrupted.
 
 ## Tests you must write
 

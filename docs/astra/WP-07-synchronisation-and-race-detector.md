@@ -425,6 +425,36 @@ which phase 4 already delegates to it.
 Wakes from a primitive with `ordered: true` are taken from the **head** of
 `waitQueue` only, so bounded waiting is preserved.
 
+### 9. The sync snapshot contribution
+
+This package owns the sync subsystem's contribution to `KernelSnapshot`. The
+channel is `subsystems.sync`, added by `docs/07-CONTRACT-AMENDMENTS.md`
+amendment 1, and it starts as a `SubsystemEnvelope`:
+
+```ts
+{ owner: 'sync', version: 1, payload: /* JsonValue */ }
+```
+
+`owner` is this subsystem's `SubsystemId`. `version` starts at 1 and this package
+bumps it whenever the payload shape changes. The payload carries the state the
+shared `syncPrimitives` table cannot express: the shared cell table, the store
+buffers with their pending writes in order, the race detector's access history,
+the scenario state for the bounded buffer, readers-writers and philosophers, and
+the sorted key array that makes primitive iteration deterministic. It must be
+plain `JsonValue`, so no `Map`, no `Set`, no function and no non-finite number,
+and the primitive table has to be flattened to a sorted array of pairs on the way
+out. Validate the payload on restore and throw on a `version` this package does
+not understand, because a silently misread save is worse than a refused one.
+
+**Promote the envelope to a typed interface in the same commit that implements
+the subsystem**, additively, the way amendment 1 was made, and record the
+promotion in `docs/07-CONTRACT-AMENDMENTS.md`. The envelope is a transition
+mechanism. Shipping with an opaque envelope means this package is not finished.
+
+WP-11 carries the envelope through `snapshot()` and hands it back on `restore()`.
+It does not interpret the payload, so nothing else will catch a field you leave
+out.
+
 ## Acceptance criteria
 
 1. `npm run typecheck` exits 0.
@@ -472,6 +502,10 @@ Wakes from a primitive with `ordered: true` are taken from the **head** of
 19. `git diff --exit-code src/kernel/types.ts src/game/types.ts` exits 0.
 20. The forbidden-identifier scan still returns zero matches, and `DET-D1`,
     `DET-D3` and `DET-D4` still pass.
+21. Sync state survives a snapshot and restore round trip. Run the bounded buffer
+    scenario to a mid-scenario tick with a non-empty store buffer and a non-empty
+    `waitQueue`, take the envelope, restore it into a fresh subsystem, step both
+    forward, and the two continuation event logs are canonically identical.
 
 ## Tests you must write
 

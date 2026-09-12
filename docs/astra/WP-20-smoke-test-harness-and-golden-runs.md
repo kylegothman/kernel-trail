@@ -22,6 +22,15 @@ so a leg can be tested against it is testing the harness.
 
 WP-19 complete and green. WP-11, WP-17 and WP-18 complete and green.
 
+**This package depends on full workload restore, which is WP-11.** A golden run
+resumes mid-journey and compares the continuation, so an init-only restore makes
+every golden file after the first leg meaningless: the harness would be pinning
+the output of a kernel that lost its workload at the seam. While `restore` is
+init-only, this package cannot be accepted. See
+`docs/07-CONTRACT-AMENDMENTS.md` amendment 1. Before starting, confirm that
+`snapshot().completeness` reads `'full'` for a running workload, that
+`subsystems.process` is populated, and that `DET-D2` passes un-skipped.
+
 Files that must already exist:
 
 - `src/game/LegRunner.ts`, `RunDirector.ts` and `LegSandbox.ts` from WP-19

@@ -414,6 +414,44 @@ one that catches an `Rng.fork` implementation that advances the parent. D4 is
 cheap insurance against a subsystem that happens to be deterministic only for
 seed 0.
 
+### 1.5 The subsystem state channel
+
+D2 only works if a snapshot can carry everything a running workload is made of.
+The shared tables in `KernelSnapshot` cannot: every subsystem keeps some state in
+side tables of its own, and a PCB array has nowhere to put a program's
+instruction stream, a thread's program counter, an id allocator or an IPC
+mailbox. `KernelSnapshot` therefore has two more fields, both optional, both
+added by `docs/07-CONTRACT-AMENDMENTS.md` amendment 1.
+
+- `completeness?: SnapshotCompleteness`, either `'init_only'` or `'full'`. Absent
+  means `'init_only'`. An init-only snapshot says the shared tables are the whole
+  truth: no user process has existed, no program is registered, and restore is
+  exact. `'full'` says `subsystems` carries the side-table state.
+- `subsystems?: SubsystemSnapshots`, one slot per subsystem.
+
+`SubsystemSnapshots` is deliberately hybrid. The `process` slot is a fully typed
+`ProcessSnapshotState`, because the process subsystem is built and its state is
+known exactly: `ProgramSnapshot[]`, `ThreadSnapshot[]`, raw pre-acceleration
+work, light-weight process bindings, an `IdCounters` allocator triple, exit codes
+a parent has not collected, copy-on-write reference counts, an `IpcSnapshot`, the
+tuning object in force, and accumulated execution debt. The other five slots
+(`memory`, `sync`, `storage`, `fs`, `security`) are `SubsystemEnvelope`: an
+`owner`, a `version` the owning subsystem bumps whenever its payload shape
+changes, and a `payload` of `JsonValue`. The owner validates its own payload on
+restore and throws rather than accepting a version it does not understand,
+because a silently misread save is worse than a refused one.
+
+The envelope is a transition mechanism. Each subsystem replaces its envelope with
+a typed interface in the same additive way, in the commit that implements the
+subsystem, and records the promotion in `docs/07-CONTRACT-AMENDMENTS.md`. A
+subsystem that ships leaving its state opaque has not finished.
+
+Because both fields are optional, the type system no longer proves a snapshot is
+complete. `restore` is the enforcement point instead: **it must reject a snapshot
+whose completeness is weaker than the state it is being restored into, and throw
+rather than silently dropping state.** Restoring an init-only snapshot into a
+kernel that has run a workload is an error, not a reset. WP-11 owns that check.
+
 ---
 
 ## 2. Kernel step order
@@ -982,8 +1020,10 @@ entity. `lwp` is `null` for every thread.
 - Parallel speedup: up to `min(threads.length, coreCount)`.
 - Cost: each thread creation charges `threadCreateTicks` (default 2) to the
   creating process, and the kernel enforces `maxThreadsPerProcess` (default 16),
-  returning `EAGAIN` beyond it. Over-threading is the Leg 2 failure, and this is
-  where its cost comes from.
+  returning `EAGAIN` beyond it. That charge is applied *after* the Amdahl
+  division and scales with `N`, the thread count of §4.3, so coordination cost is
+  never accelerated by the parallelism that incurred it. Over-threading is the
+  Leg 2 failure, and this is where its cost comes from.
 
 **Many-to-many (Ch. 4.3.3).** `n` user threads multiplexed onto `m` kernel
 entities, `m = min(threads.length, lwpPoolSize)`, `lwpPoolSize` defaulting to
@@ -1034,10 +1074,14 @@ function usableCores(pcb: ProcessControlBlock, cfg: ThreadConfig): number {
 }
 ```
 
-**Serial fraction.** Each `ProcessSpec` carries a `serialFraction` (defaulted to
-0.25 when unspecified, which is the value used in the Leg 2 fixtures). It is a
-property of the workload and the player cannot change it. That is the lesson:
-adding threads cannot buy back the serial part.
+**Serial fraction.** Each `ProcessSpec` carries an optional
+`serialFraction?: number`. When it is absent the kernel uses the tuning value
+`defaultSerialFraction`, which is 0.25, and that is the value used in the Leg 2
+fixtures. It is a property of the workload and the player cannot change it. That
+is the lesson: adding threads cannot buy back the serial part. The field is
+optional on `ProcessSpec` as of `docs/07-CONTRACT-AMENDMENTS.md` amendment 1; a
+leg declares its processes only through `ProcessSpec`, so this is the only way a
+leg sets its own serial fractions.
 
 **How speedup is applied to burst times.** Speedup is applied at *burst
 admission*, never continuously, so that `cpuBurstRemaining` stays an integer and
@@ -1048,38 +1092,61 @@ admission, after each unblock, and after any `thread.created` or
 `thread.joined` event:
 
 1. `raw = pcb.rawBurstRemaining` (the un-accelerated figure, stored alongside).
-2. `N = usableCores(pcb, cfg)`; `S = spec.serialFraction`.
+2. `N = usableCores(pcb, cfg)`; `S` is the process's serial fraction.
 3. `sp = amdahlSpeedup(S, N)`.
-4. `accelerated = raw / sp`.
-5. `pcb.cpuBurstRemaining = Math.max(1, Math.round(accelerated))`.
-6. `pcb.serviceRemaining` is recomputed the same way from `rawServiceRemaining`.
-7. Charge `threadCreateTicks` per newly created thread to `serviceRemaining`
-   **before** step 4, so thread creation overhead is itself subject to nothing
-   and always costs full price.
+4. `accelerated = Math.ceil(raw / sp)`.
+5. `overhead = tuning.threadCreateTicks * N`, charged **after** step 4.
+6. `pcb.cpuBurstRemaining = Math.max(1, accelerated + overhead)`.
+7. `pcb.serviceRemaining` is recomputed the same way from `rawServiceRemaining`.
 
-Rounding at step 5 uses `Math.round` with the half-up convention JavaScript
-already provides, and the `Math.max(1, ...)` floor guarantees progress. Because
-rounding happens once per recomputation rather than per tick, the total is stable
-under snapshot and restore.
+So the whole burst accounting is:
 
-**Verified table.** `amdahlSpeedup` values, and the accelerated burst for a raw
-burst of 100 ticks with `S = 0.25`:
+```
+effective = ceil( R / S(s, N) ) + O * N
+```
 
-| N | speedup(0.25, N) | burst from raw 100 | speedup(0.10, N) | speedup(0.50, N) |
+where `R` is the raw figure, `s` is the serial fraction, `O` is
+`threadCreateTicks` and `N` is the usable core count of step 2.
+
+Earlier drafts charged the overhead into raw service *before* the division,
+`(R + O*N) / S(N)`. That made over-threading nearly free, because the division
+accelerated the coordination cost along with the work, and coordination cost is
+precisely the part that parallelism cannot accelerate. Charging it afterwards and
+scaling it by thread count gives the curve a real minimum and a real penalty past
+it, which is the hazard Leg 2 is built on. See
+`docs/07-CONTRACT-AMENDMENTS.md` amendment 2.
+
+Step 4 uses `Math.ceil`, not `Math.round`. `R / S` lands on an exact half at
+`N = 2` (66.5 for `R = 100, s = 0.25`), and a half-way tie rounds differently
+across implementations: JavaScript's `Math.round` gives 67 and Python's `round`
+gives 66. A fixture whose value depends on which language ran it is not a
+fixture. `ceil` also never under-charges service, which is the right bias for a
+scheduler. The `Math.max(1, ...)` floor guarantees progress, and because the
+arithmetic happens once per recomputation rather than per tick, the total is
+stable under snapshot and restore.
+
+**Verified table.** `amdahlSpeedup` values, and the effective burst for a raw
+burst of 100 ticks with `s = 0.25` and `O = 2`:
+
+| N | speedup(0.25, N) | effective from raw 100, O = 2 | speedup(0.10, N) | speedup(0.50, N) |
 |---|---|---|---|---|
-| 1 | 1.0000 | 100 | 1.0000 | 1.0000 |
-| 2 | 1.6000 | 63 | 1.8182 | 1.3333 |
-| 4 | 2.2857 | 44 | 3.0769 | 1.6000 |
-| 8 | 2.9091 | 34 | 4.7059 | 1.7778 |
-| 16 | 3.3684 | 30 | 6.4000 | 1.8824 |
-| 32 | 3.6571 | 27 | 7.8049 | 1.9394 |
-| ∞ | 4.0000 | 25 | 10.0000 | 2.0000 |
+| 1 | 1.0000 | 102 | 1.0000 | 1.0000 |
+| 2 | 1.6000 | 67 | 1.8182 | 1.3333 |
+| 4 | 2.2857 | 52 | 3.0769 | 1.6000 |
+| 8 | 2.9091 | 51 | 4.7059 | 1.7778 |
+| 16 | 3.3684 | 62 | 6.4000 | 1.8824 |
+| 32 | 3.6571 | 92 | 7.8049 | 1.9394 |
+| ∞ | 4.0000 | unbounded | 10.0000 | 2.0000 |
 
-Test fixture `AMDAHL-1`. The teaching moment is the 8-to-16 row: doubling the
-cores buys 4 ticks, while each of those 8 extra threads costs 2 ticks to create,
-so the sixteen-thread version finishes *later* than the eight-thread version.
-Leg 2's over-threading failure is exactly this arithmetic, and the player is
-expected to read it off the HUD.
+The speedup columns are test fixture `AMDAHL-1`; the effective burst column is
+`AMDAHL-2`. The effective figure has no limit at `N = ∞` because `O * N` grows
+without bound, which is the point.
+
+The teaching moment is now the whole shape of the curve rather than one row. The
+minimum sits at 6 threads, at 50 ticks. Eight threads costs 51, sixteen costs 62,
+and thirty-two costs 92, which is 1.85x worse than the optimum and slower than
+four threads. Leg 2's over-threading failure is exactly this arithmetic, and the
+player is expected to read it off the HUD.
 
 ### 4.4 Thread syscalls and events
 
@@ -1087,8 +1154,10 @@ Thread creation and joining are not in the frozen `SyscallName` union, so they
 are driven by `Instruction` variants rather than by `syscall()`:
 
 - `thread_create` emits `thread.created` with the owning `pid` and new `tid`,
-  appends to `pcb.threads`, charges `threadCreateTicks`, and triggers the burst
-  recomputation of §4.3.
+  appends to `pcb.threads`, and triggers the burst recomputation of §4.3, which
+  is where `threadCreateTicks` is charged. The charge belongs to the
+  recomputation rather than to the syscall path, because it is applied after the
+  division and scaled by `N`, and both of those are only known there.
 - `thread_join` emits `thread.joined`, removes the tid from `pcb.threads`,
   folds the joined thread's remaining service into the joiner, and triggers
   recomputation.
@@ -5504,11 +5573,20 @@ Per-process detail for the assertions that need it:
 | `AMDAHL-1` | `amdahlSpeedup(0.25, N)` for N = 1, 2, 4, 8, 16, 32 | 1.0000, 1.6000, 2.2857, 2.9091, 3.3684, 3.6571 (tolerance 1e-4) |
 | `AMDAHL-1b` | `amdahlSpeedup(0.10, N)` same N | 1.0000, 1.8182, 3.0769, 4.7059, 6.4000, 7.8049 |
 | `AMDAHL-1c` | `amdahlSpeedup(0.50, N)` same N | 1.0000, 1.3333, 1.6000, 1.7778, 1.8824, 1.9394 |
-| `AMDAHL-2` | raw burst 100, S = 0.25, N = 1, 2, 4, 8, 16, 32 | accelerated bursts 100, 63, 44, 34, 30, 27 |
+| `AMDAHL-2` | raw burst 100, s = 0.25, O = 2, N = 1, 2, 4, 8, 16, 32 | effective bursts 102, 67, 52, 51, 62, 92 |
 | `AMDAHL-3` | `amdahlSpeedup(1.0, 1024)` | exactly 1 |
 | `THREAD-M1` | many-to-one, 4 threads, one blocks | the whole PCB moves to `waiting`; zero ticks delivered to the other three |
 | `THREAD-11` | one-to-one, 4 threads, coreCount 4, one blocks | PCB stays `ready`; `usableCores` drops from 4 to 3 |
 | `THREAD-MM` | many-to-many, 8 threads, lwpPoolSize 4, coreCount 4 | `usableCores` = 4; lwp assignment is round-robin over ascending tid |
+
+`AMDAHL-2` asserts `effective = ceil( R / S(s, N) ) + O * N`, per §4.3 and
+`docs/07-CONTRACT-AMENDMENTS.md` amendment 2: overhead is charged after the
+division and scales with `N`. The exact values before the ceiling are 102.00000,
+66.50000, 51.75000, 50.37500, 61.68750 and 91.34375. The rounding step is
+`Math.ceil`, not `Math.round`, because the `N = 2` value is an exact half and a
+half-way tie rounds differently across implementations (JavaScript's `Math.round`
+gives 67, Python's `round` gives 66). `amdahlSpeedup` itself did not change, so
+`AMDAHL-1`, `AMDAHL-1b`, `AMDAHL-1c` and `AMDAHL-3` keep their values.
 
 ### 16.5 Main memory (Ch. 9)
 
@@ -5714,7 +5792,9 @@ independently testable against the fixtures named.
 13. Rings, domains, the access matrix, ACL and capabilities, RBAC. Fixtures
     `SEC-*`.
 14. The syscall table, all 26 handlers, argument validation. §14 is the checklist.
-15. `snapshot()` and `restore()` over the complete state. Fixture `DET-D2`.
+15. `snapshot()` and `restore()` over the complete state, including
+    `completeness` and every populated slot of `subsystems` (§1.5). Fixture
+    `DET-D2`.
 16. The full invariant set. Fixtures `INV-*`.
 
 Stages 4, 6, 7, 8, 10, 11, 12 and 13 touch disjoint directories and depend only

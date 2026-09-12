@@ -41,6 +41,8 @@ leg.
 - `docs/05-CURRICULUM-MAP.md`, "Leg 2. THE WEAVE" in full.
 - `docs/02-KERNEL-SIM-SPEC.md`, section 4 (Threads, Ch. 4) in full; section 16.4 (the thread
   and Amdahl test vectors).
+- `docs/07-CONTRACT-AMENDMENTS.md`, amendment 2 (the Amdahl burst model), which sets this leg's
+  payoff curve, and amendment 1 for `ProcessSpec.serialFraction`.
 - `docs/04-NARRATIVE-BIBLE.md`, section 7 entries for `cache_thrash`, `false_sharing`,
   `memory_leak` and `lock_convoy`; section 8 leg 2 event table; section 6.1 (pace and quantum).
 - `docs/03-VISUAL-BIBLE.md`, section 10 "Leg 2, The Weave"; section 13 (quality tiers).
@@ -145,8 +147,15 @@ export interface ProcessSpec {
   readonly pages: number;
   /** Page reference string, if this leg drives memory deterministically. */
   readonly referenceString?: readonly number[];
+  /** Per-process serial fraction. Absent means the tuning default, 0.25. */
+  readonly serialFraction?: number;
 }
 ```
+
+`serialFraction` was added by `docs/07-CONTRACT-AMENDMENTS.md` amendment 1, and it is how this
+leg declares the serial fraction of each of its own processes. It is optional, and absent means
+the kernel tuning value `defaultSerialFraction`, which is 0.25. Every `S` in the segment table
+below is set through this field; nothing else in the game layer can set it.
 
 ### Evaluation and outcome
 
@@ -535,14 +544,50 @@ Use the `AMDAHL-*` fixtures so the leg is verifiable against the sim spec's own 
 `amdahlSpeedup(0.25, N)` for N = 1, 2, 4, 8, 16, 32 is 1.0000, 1.6000, 2.2857, 2.9091, 3.3684,
 3.6571 (fixture `AMDAHL-1`). `amdahlSpeedup(0.10, N)` is 1.0000, 1.8182, 3.0769, 4.7059,
 6.4000, 7.8049 (`AMDAHL-1b`). `amdahlSpeedup(0.50, N)` is 1.0000, 1.3333, 1.6000, 1.7778,
-1.8824, 1.9394 (`AMDAHL-1c`). A raw burst of 100 at S = 0.25 accelerates to 100, 63, 44, 34,
-30, 27 at those N (`AMDAHL-2`). Use these to set the strand dial's payoff curve; do not invent
+1.8824, 1.9394 (`AMDAHL-1c`). Use these to set the strand dial's payoff curve; do not invent
 your own.
 
-`obj.the_weave.stop_adding_strands` needs the marginal-speedup knee to be findable. On
-`seg.braid_two` at S = 0.40 over 4 cores, marginal speedup drops under 0.03 at the fifth
-strand. The objective therefore passes at strand counts 1 through 5 and fails at 6 and above.
-Record the exact knee as a frozen fixture once the first correct implementation establishes it.
+### The burst model, and the over-threading hazard
+
+Per `docs/07-CONTRACT-AMENDMENTS.md` amendment 2, thread overhead is charged after the speedup
+division and scales with thread count:
+
+```
+effective = ceil( R / S(s, N) ) + O * N
+```
+
+`R` is the raw service figure, `s` is the serial fraction, `O` is `threadCreateTicks` (2 by
+default) and `N` is the strand count. An earlier version of the arithmetic charged the overhead
+before the division, which let the division accelerate the coordination cost along with the
+work and made over-threading nearly free. This leg could not teach its own lesson under that
+model, so the model moved.
+
+At `R = 100`, `s = 0.25`, `O = 2`, which is the strand dial's reference curve, the crossing
+costs:
+
+| N strands | exact | effective ticks |
+|---|---|---|
+| 1 | 102.00000 | 102 |
+| 2 | 66.50000 | 67 |
+| 4 | 51.75000 | 52 |
+| 6 | 49.50000 | **50** |
+| 8 | 50.37500 | 51 |
+| 16 | 61.68750 | 62 |
+| 32 | 91.34375 | 92 |
+
+The optimum is 6 strands, at 50 ticks. Thirty-two strands costs 92, which is 1.85x worse than
+the optimum and slower than 4 strands. Over-threading is a real failure mode now: the deck
+widens, then narrows again, and the player who keeps spawning pays for it in crossing time
+rather than watching the curve flatten harmlessly. `ceil` is the rounding rule, not `round`,
+because `R / S` at 2 strands is exactly 66.5 and a half-way tie rounds differently across
+implementations.
+
+`obj.the_weave.stop_adding_strands` is assessed against that optimum. The player passes by
+committing a strand count within one of the segment's optimum, so 5, 6 or 7 on the reference
+curve, and fails by overshooting it. Overshooting is penalised in proportion: the debrief
+quotes the optimum's tick count against the committed count's tick count, which at 32 strands
+is 50 against 92. Record the optimum per segment as a frozen fixture once the first correct
+implementation establishes it, computed from the formula above rather than measured by hand.
 
 ### The tally slab
 
@@ -773,8 +818,10 @@ The leg is survived when at least one convoy Program is alive at leg end. Death 
 uncommon by design: the Weave is the relief slope before the Quantum Pass and it should hurt
 without killing.
 
-Past roughly six strands on a four-core segment the context switch count climbs faster than the
-work completes, cache lines bounce between cores, and the strands acquire `cache_thrash` (1
+Past six strands, which is the optimum on the reference curve, the crossing gets slower with
+every strand added: 50 ticks at 6, 62 at 16, 92 at 32. The context switch count climbs faster
+than the work completes, cache lines bounce between cores, and the strands acquire
+`cache_thrash` (1
 integrity per travel tick, drains only) and `false_sharing` (1.5 per tick, drains only) if the
 tally was left shared without padding. Neither is fatal on its own. If a Program does reach
 zero integrity it derezzes with `TerminationReason: 'thrashing_collapse'`, and the epitaph must
@@ -792,7 +839,7 @@ the tally.
 | Objective | Computed from |
 |---|---|
 | `obj.the_weave.speedup_prediction` | `abs(measured / predicted - 1) < 0.15` for the committed strand count, where measured is the segment's tick count against the single-strand baseline the leg records at entry, and predicted is `amdahlSpeedup(S, cores)`. |
-| `obj.the_weave.stop_adding_strands` | The highest strand count committed is at or below the first N where marginal speedup drops under 0.03, **and** closing `bandwidth` is at least 20 percent of the leg's opening bandwidth. |
+| `obj.the_weave.stop_adding_strands` | The highest strand count committed is within one of the segment's optimum under `ceil(R / S(s, N)) + O * N`, which is 5, 6 or 7 on the reference curve where the optimum is 6, **and** closing `bandwidth` is at least 20 percent of the leg's opening bandwidth. A count above optimum plus one fails, and the overshoot is quoted in the debrief as the optimum's tick count against the committed count's. |
 | `obj.the_weave.shared_versus_private` | Zero `false_sharing` afflictions acquired **and** the tally value at segment end equals the sum the leg computed serially. |
 | `obj.the_weave.model_choice` | `one_to_one` was committed at the model gate for `seg.blocking_read`. |
 | `obj.the_weave.pool_sizing` | From the pool's own instrumentation: max queue wait under 20 ticks and worker idle fraction under 0.30. |
@@ -818,8 +865,10 @@ the tally.
 
 Counterfactual, in priority order:
 
-1. **Over-threaded past the knee.** `"At ${knee} strands this segment finishes in ${t1} ticks.
-   At ${strands} it finishes in ${t2}, and the difference went to context switches."`
+1. **Over-threaded past the optimum.** `"At ${optimum} strands this segment finishes in ${t1}
+   ticks. At ${strands} it finishes in ${t2}, and the difference went to coordination you paid
+   for per strand."` On the reference curve at 32 strands that reads 6 and 50 against 32 and
+   92.
 2. **False sharing occurred.** `"The scratch counters shared a cache line with the tally. Moving
    them to thread-local storage costs nothing and would have removed ${count} false-sharing
    events."`
@@ -843,12 +892,16 @@ Counterfactual, in priority order:
 5. Every objective can be met by the known-good decision sequence; all seven met in one run.
 6. The known-bad sequence produces the intended failure: sixteen strands on the four-core
    segment with the scratch counters left shared, producing `cache_thrash` and `false_sharing`
-   on at least three Programs and measured speedup below 1.4.
-7. Amdahl arithmetic matches fixtures `AMDAHL-1`, `AMDAHL-1b`, `AMDAHL-1c`, `AMDAHL-2` and
-   `AMDAHL-3` to a tolerance of 1e-4.
+   on at least three Programs, and a crossing slower than the same segment at four strands
+   (62 ticks against 52 on the reference curve).
+7. Amdahl arithmetic matches fixtures `AMDAHL-1`, `AMDAHL-1b`, `AMDAHL-1c` and `AMDAHL-3` to a
+   tolerance of 1e-4, and `AMDAHL-2` exactly: effective bursts 102, 67, 52, 51, 62, 92 at
+   N = 1, 2, 4, 8, 16, 32 for raw 100, `s = 0.25`, `O = 2`.
 8. Thread model semantics match `THREAD-M1`, `THREAD-11` and `THREAD-MM` exactly.
-9. The single-core braid finishes the batch in the same wall time at 1 strand and at 8 strands,
-   within 5 percent. The four-core braid finishes at roughly a quarter with 8 strands.
+9. The single-core braid gets no faster from strands: at 1 strand and at 8 strands it finishes
+   no sooner, because `S(s, 1)` is 1.0 at every strand count while `O * N` still grows. On the
+   reference curve the four-core braid finishes in about half the single-strand time at 8
+   strands (102 ticks at 1, 51 at 8), and at 32 strands it finishes later than at 4.
 10. Async cancellation mid-update produces exactly one `fs.corruption` event; deferred
     cancellation produces zero.
 11. The tally experiment with eight strands on a shared unprotected counter produces a value
@@ -874,8 +927,10 @@ independence; `agingInterval === 0`.
 
 **`populate.test.ts`**: eight spawns, five binds, zero resource and sync declarations.
 
-**`amdahl.test.ts`**: the five Amdahl fixtures to 1e-4; the knee on `seg.braid_two` at S = 0.40
-over 4 cores is at strand 5 and is frozen as a fixture.
+**`amdahl.test.ts`**: the four speedup fixtures to 1e-4 and `AMDAHL-2` exactly; the optimum on
+the reference curve (`R = 100`, `s = 0.25`, `O = 2`) is 6 strands at 50 ticks, 32 strands costs
+92 and is slower than 4 strands at 52, and each segment's optimum is frozen as a fixture
+computed from `ceil(R / S(s, N)) + O * N`.
 
 **`models.test.ts`**: `THREAD-M1`: many-to-one, 4 threads, one blocks, the whole PCB moves to
 `waiting`, zero ticks to the other three. `THREAD-11`: one-to-one, PCB stays `ready`,
@@ -955,8 +1010,8 @@ tests/legs/the_weave/**
 
 1. Commit or branch, and the full `tests/legs/the_weave/` output.
 2. Golden playthrough hash and its checked-in path.
-3. The frozen knee fixture: the strand count at which marginal speedup first drops under 0.03
-   on each of the four segments.
+3. The frozen optimum fixture: the strand count with the lowest effective tick count under
+   `ceil(R / S(s, N)) + O * N` on each of the four segments, and that tick count.
 4. Measured speedup at 1, 2, 4, 8 and 16 strands on both braids, as a table, against the Amdahl
    prediction.
 5. Draw calls at each tier, and the measured deck width at 8 and 12 filaments.

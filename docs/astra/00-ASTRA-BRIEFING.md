@@ -72,6 +72,16 @@ frame. Do not. Keep the extra state in a private side table keyed by `Pid` or
 `FrameId` inside your subsystem, and include it in `snapshot()` through the
 channel the package specifies.
 
+**Amendments happen.** The contract is frozen against you, not against the
+project. When an escalation is upheld, a human approves a change and it is
+recorded in `docs/07-CONTRACT-AMENDMENTS.md`, which is the authoritative record
+of what moved and why. Two amendments exist already: the subsystem state channel
+on `KernelSnapshot`, and the Amdahl burst model. So if a frozen contract seems to
+disagree with the package you are holding, read that file before doing anything
+else; the answer is often there, and the package is the stale half. None of this
+relaxes the rule above. The escalation path is the only way a contract changes,
+and it has now worked twice.
+
 ---
 
 ## 3. Dependency direction and import boundaries

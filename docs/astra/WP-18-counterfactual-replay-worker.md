@@ -15,6 +15,15 @@ sentence a player reads.
 
 WP-11 and WP-17 complete and green.
 
+**This package depends on full workload restore, which is WP-11.** A replay
+re-executes a leg from a snapshot, so a snapshot that can only be restored into
+an empty kernel gives this package nothing to replay. While `restore` is
+init-only, this package cannot be accepted: its numbers would come from a replay
+that started from a blank kernel. See `docs/07-CONTRACT-AMENDMENTS.md`
+amendment 1. Before starting, confirm that `snapshot().completeness` reads
+`'full'` for a running workload, that `subsystems.process` is populated, and that
+`DET-D2` passes un-skipped.
+
 Files that must already exist:
 
 - `src/kernel/` complete, with `snapshot()`, `restore()` and `DET-D2` passing

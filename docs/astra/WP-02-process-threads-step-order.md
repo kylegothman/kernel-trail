@@ -13,6 +13,36 @@ in. `createKernel(REFERENCE_CONFIG)` constructs, steps, and produces a
 deterministic event log. This is the critical-path package: five wave-2 packages
 block on it.
 
+## Follow-ups after amendments 1 and 2
+
+This package was implemented faithfully against the contract and the spec as they
+stood, and both escalations it raised were correct: the snapshot had nowhere to
+put subsystem state, and the burst arithmetic made over-threading nearly free.
+Kyle approved both. `docs/07-CONTRACT-AMENDMENTS.md` is the record. Three things
+in this document moved as a result, and they are follow-ups on a completed
+package rather than defects in its report.
+
+1. **The Amdahl arithmetic moves**, per amendment 2. Overhead is charged after
+   the speedup division and scales with thread count:
+   `effective = ceil( R / S(s, N) ) + O * N`.
+   `src/kernel/process/threads.ts` currently charges overhead into `rawService`
+   before the division, which is what §7 below and sim spec 4.3 used to say. It
+   needs to move after. `amdahlSpeedup` itself does not change, so `AMDAHL-1`,
+   `AMDAHL-1b`, `AMDAHL-1c` and `AMDAHL-3` keep their values and only `AMDAHL-2`
+   is replaced.
+2. **Aging lives on a separate `SchedulerHooks` object**, not on the frozen
+   `SchedulerPolicy`. This document previously said to call
+   `ageAndDetectStarvation(ctx)` on the policy, which has no such method. The
+   implementation already does the right thing; phase 6 below is the text that
+   was wrong.
+3. **Transition T1 is construction plus a `process.created` event.** Generic
+   `process.state_changed` events begin at T2. There is no null `from` on a
+   `process.state_changed`, and none is being added.
+
+The init-only snapshot guard this package ships is correct and stays. Its
+`// TODO(astra): blocked on contract change, see report` marker is now WP-11's to
+resolve, using the `completeness` field amendment 1 added.
+
 ## Prerequisites
 
 WP-01 complete and green.
@@ -272,14 +302,22 @@ directly (a woken process always passes through `ready`, otherwise every I/O
 completion becomes an implicit priority boost) and `zombie -> ready` (a zombie is
 a record; `kill` on a zombie returns `ESRCH`).
 
-Every transition emits `process.state_changed` with the exact `from` and `to`,
-in addition to whatever specific event the triggering site emits. The world layer
-draws the specific event; the HUD counts the generic one.
+Every transition from T2 onwards emits `process.state_changed` with the exact
+`from` and `to`, in addition to whatever specific event the triggering site
+emits. The world layer draws the specific event; the HUD counts the generic one.
+
+T1 is the exception, and deliberately so. T1 is construction: the PCB comes into
+existence in state `new` and emits `process.created`. It emits no
+`process.state_changed`, because there is no prior state to report. A
+`process.state_changed` never carries a null `from`, and nothing in this package
+or a later one adds one.
 
 Side effects per edge, taken from the table:
 
-- T2 `new -> ready`: `readySince = tick`, call `onAdmit`, emit
-  `process.created` if not already emitted.
+- T1, construction into `new`: emit `process.created`. No
+  `process.state_changed`.
+- T2 `new -> ready`: `readySince = tick`, call `onAdmit`. This is the first
+  generic `process.state_changed` a process produces.
 - T3 `ready -> running`: `readySince = null`, `lastScheduledTick = tick`,
   `priority = basePriority`, `sliceElapsed = 0`.
 - T4 `running -> ready`: `readySince = tick`, append to the tail of its queue; on
@@ -492,10 +530,22 @@ export function usableCores(threadsRunnable: number, cfg: ThreadConfig): number 
 Speedup is applied at **burst admission only**, never continuously, so
 `cpuBurstRemaining` stays an integer and the Gantt charts stay legible. The
 seven-step recomputation procedure in sim spec 4.3 runs at admission, after each
-unblock, and after any `thread.created` or `thread.joined` event. Step 7 matters:
-charge `threadCreateTicks` per newly created thread to `serviceRemaining`
-**before** dividing by the speedup, so thread creation overhead always costs full
-price. Rounding at step 5 is `Math.max(1, Math.round(accelerated))`, once per
+unblock, and after any `thread.created` or `thread.joined` event.
+
+The overhead ordering is the correction from amendment 2. Charge
+`threadCreateTicks` **after** the division, scaled by `N`:
+
+```
+effective = ceil( R / S(s, N) ) + O * N
+```
+
+so `pcb.cpuBurstRemaining = Math.max(1, Math.ceil(raw / sp) + O * N)`, and
+`serviceRemaining` the same way from `rawServiceRemaining`. Charging it into
+`rawService` before the division, which is what this document used to say, let
+the division accelerate the coordination cost along with the work and made
+over-threading nearly free. The rounding step is `Math.ceil`, not `Math.round`,
+because `R / S` at `N = 2` is an exact half (66.5 for `R = 100, s = 0.25`) and a
+half-way tie rounds differently across implementations. It runs once per
 recomputation rather than per tick, which is what makes it stable under snapshot
 and restore.
 
@@ -564,9 +614,12 @@ Admission calls `SchedulerPolicy.onAdmit`, allocates the address space, and move
 `new -> ready`. Iterate candidates in ascending pid order. Recompute the burst
 per sim spec 4.3 at admission.
 
-**Phase 6, age and detect starvation.** WP-03 owns this. Call
-`this.scheduler.ageAndDetectStarvation(ctx)` on the policy object; provide a
-default that does nothing.
+**Phase 6, age and detect starvation.** WP-03 owns this. Aging is **not** a
+method on the frozen `SchedulerPolicy`; it lives on a separate `SchedulerHooks`
+object that the kernel holds alongside the policy. Call
+`ageAndDetectStarvation(ctx)` on the hooks object; provide a default that does
+nothing. Earlier text here said to call it on the policy, which has no such
+method.
 
 **Phase 7, scheduler decision.** Build a `SchedulerContext` over the current
 state and call `SchedulerPolicy.onTick`. Apply the returned decision: if `next`
@@ -721,7 +774,7 @@ package must not import.
 | `init exists` | `kernel.process(asPid(1))?.name === 'init'` |
 | `idle hidden` | `kernel.processes.every(p => p.pid !== 0)`; `kernel.process(asPid(0))` returns the idle PCB |
 | `transition legality` | for each of T1..T11 the edge succeeds; `waiting -> running` throws `KernelInvariantError` with `invariant === 11`; `zombie -> ready` throws the same |
-| `state_changed on every edge` | each successful transition emits exactly one `process.state_changed` with matching `from`/`to` |
+| `state_changed on every edge` | each successful transition from T2 onwards emits exactly one `process.state_changed` with matching `from`/`to`; T1 emits `process.created` and no `process.state_changed`, and no emitted `process.state_changed` anywhere in the run has a null `from` |
 | `fork copies fields` | child has `parent === parentPid`, `state === 'new'`, `arrivalTick === tick`, `totalCpuUsed === 0`, `queueLevel === 0`, exactly one tid, empty `heldResources` and `requestedResources`, `blockedOn === null`, `domain` equal to the parent's |
 | `fork name` | child `name` equals parent name plus a single apostrophe |
 | `fork COW` | after fork, every parent PTE and every child PTE has `writable === false` and points at the same `FrameId`; `cowRefCount` is 2 for each; zero `memory.allocated` events fire during the fork |
@@ -748,14 +801,15 @@ package must not import.
 | `AMDAHL-1` | `amdahlSpeedup(0.25, N)` for N = 1, 2, 4, 8, 16, 32 equals 1.0000, 1.6000, 2.2857, 2.9091, 3.3684, 3.6571 within 1e-4 |
 | `AMDAHL-1b` | `amdahlSpeedup(0.10, N)` same N equals 1.0000, 1.8182, 3.0769, 4.7059, 6.4000, 7.8049 within 1e-4 |
 | `AMDAHL-1c` | `amdahlSpeedup(0.50, N)` same N equals 1.0000, 1.3333, 1.6000, 1.7778, 1.8824, 1.9394 within 1e-4 |
-| `AMDAHL-2` | raw burst 100 with S = 0.25 gives accelerated bursts 100, 63, 44, 34, 30, 27 for N = 1, 2, 4, 8, 16, 32, as exact integers |
+| `AMDAHL-2` | raw burst 100 with s = 0.25 and O = 2 gives effective bursts 102, 67, 52, 51, 62, 92 for N = 1, 2, 4, 8, 16, 32, as exact integers, from `ceil(R / S(s, N)) + O * N` |
 | `AMDAHL-3` | `amdahlSpeedup(1.0, 1024)` returns exactly 1 |
 | `amdahl guards` | `amdahlSpeedup(-0.1, 4)` throws `RangeError`; `amdahlSpeedup(0.5, 0)` throws; `amdahlSpeedup(0.5, 2.5)` throws |
 | `THREAD-M1` | many-to-one, 4 threads, one blocks: the whole PCB moves to `waiting` and zero ticks are delivered to the other three |
 | `THREAD-11` | one-to-one, 4 threads, `coreCount` 4, one blocks: the PCB stays `ready` and `usableCores` drops from 4 to 3 |
 | `THREAD-MM` | many-to-many, 8 threads, `lwpPoolSize` 4, `coreCount` 4: `usableCores` is 4 and lwp assignment is round-robin over ascending tid, so tids sorted ascending map to lwp 0,1,2,3,0,1,2,3 |
 | `thread cap` | creating a 17th thread with `maxThreadsPerProcess` 16 returns `EAGAIN` |
-| `thread create cost` | creating a thread adds exactly `threadCreateTicks` to `rawServiceRemaining` before the speedup division |
+| `thread create cost` | creating a thread leaves `rawServiceRemaining` unchanged and adds exactly `threadCreateTicks * N` to the recomputed `serviceRemaining`, after the speedup division |
+| `over-threading is a hazard` | effective ticks at N = 32 exceed effective ticks at N = 4 for raw 100, s = 0.25, O = 2, so spawning past the optimum costs the player something |
 | `empty threads exits` | joining the last thread exits the process with code 0 |
 | `lwp assignment is pure` | assigning lwps twice over the same sorted tid list produces identical results |
 

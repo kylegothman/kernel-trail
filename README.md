@@ -140,6 +140,7 @@ labels to that plane. There are no flat 2D simulation overlays.
 | `docs/04-NARRATIVE-BIBLE.md` | World, Programs, economy, event tables, epitaphs |
 | `docs/05-CURRICULUM-MAP.md` | Chapter mapping, objectives, assessment, misconceptions |
 | `docs/06-AGENT-TOOLCHAIN.md` | Environment pinning, the contract guard, context compression policy |
+| `docs/07-CONTRACT-AMENDMENTS.md` | Every approved change to the frozen contracts, with its reasoning |
 | `docs/astra/` | Sequenced build packages, 20 engine and 14 leg |
 
 Start with `docs/astra/00-ASTRA-BRIEFING.md` and `docs/astra/00-PACKAGE-INDEX.md`.

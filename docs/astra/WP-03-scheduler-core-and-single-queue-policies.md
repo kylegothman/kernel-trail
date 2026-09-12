@@ -10,6 +10,22 @@ matches the sim spec's test vector appendix exactly. `Kernel.setScheduler` swaps
 policies mid-run. WP-04 adds the remaining three policies on top of what you
 build here, so the base class and the registry are the contract WP-04 depends on.
 
+## Two notes before you start
+
+**Aging is on `SchedulerHooks`, not on `SchedulerPolicy`.** `SchedulerPolicy` is
+frozen and has no aging method. Phase 6's entry point lives on a separate
+`SchedulerHooks` object that the kernel holds alongside the policy, and the
+`onAge` hook of section 6 below is on `SchedulerBase`. Neither goes on the frozen
+interface. Older text that said to call aging on the policy was wrong.
+
+**The reference determinism tests do not currently validate round robin.** The
+kernel WP-02 shipped runs an internal `BootstrapFcfs`, so both `fcfs` and `rr`
+resolve to FCFS until you replace it. The green determinism suite you inherit
+therefore proves FCFS twice and proves nothing about round robin. This package
+replaces the bootstrap and delivers the real `fcfs`; real round robin belongs to
+WP-04. Nobody should read that green suite as RR coverage, and no report from
+this package should imply it does.
+
 ## Prerequisites
 
 WP-02 complete and green.
@@ -311,9 +327,9 @@ Phase 6's starvation half, from sim spec 5.9. For each ready process in
 
 Phase 6's aging half belongs to WP-04, because only `priority_aging` and `mlfq`
 use it. Export the phase-6 entry point as
-`ageAndDetectStarvation(ctx, policy)` and have it call
-`policy.onAge?.(ctx)` before the starvation loop, so WP-04 can add aging without
-editing this file. Aging must run before the scheduler decision, because a
+`ageAndDetectStarvation(ctx, policy)` on the `SchedulerHooks` object, separate
+from the frozen `SchedulerPolicy`, and have it call `policy.onAge?.(ctx)` before
+the starvation loop, so WP-04 can add aging without editing this file. Aging must run before the scheduler decision, because a
 process that just aged into the top priority must not lose the CPU for one more
 tick.
 

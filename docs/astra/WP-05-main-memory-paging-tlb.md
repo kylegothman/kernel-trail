@@ -394,6 +394,34 @@ Implement now:
 `selectVictim` and everything under `src/kernel/memory/replacement/` belong to
 WP-06. Do not create that directory.
 
+### 11. The memory snapshot contribution
+
+This package owns the memory subsystem's contribution to `KernelSnapshot`. The
+channel is `subsystems.memory`, added by `docs/07-CONTRACT-AMENDMENTS.md`
+amendment 1, and it starts as a `SubsystemEnvelope`:
+
+```ts
+{ owner: 'memory', version: 1, payload: /* JsonValue */ }
+```
+
+`owner` is this subsystem's `SubsystemId`. `version` starts at 1 and this package
+bumps it whenever the payload shape changes. The payload carries the state the
+shared snapshot tables cannot express: the hole list with its placement order,
+the TLB entries with the replacement position, the allocation strategy in force,
+and the counters behind `metrics()`. It must be plain `JsonValue`, so no `Map`,
+no `Set`, no function and no non-finite number. Validate the payload on restore
+and throw on a `version` this package does not understand, because a silently
+misread save is worse than a refused one.
+
+**Promote the envelope to a typed interface in the same commit that implements
+the subsystem**, additively, the way amendment 1 was made, and record the
+promotion in `docs/07-CONTRACT-AMENDMENTS.md`. The envelope is a transition
+mechanism. Shipping with an opaque envelope means this package is not finished.
+
+WP-11 carries the envelope through `snapshot()` and hands it back on `restore()`.
+It does not interpret the payload, so nothing else will catch a field you leave
+out.
+
 ## Acceptance criteria
 
 1. `npm run typecheck` exits 0.
@@ -431,6 +459,12 @@ WP-06. Do not create that directory.
 16. The forbidden-identifier scan still returns zero matches.
 17. `createKernel(REFERENCE_CONFIG).run(5000)` still passes `DET-D1`, `DET-D3`
     and `DET-D4`.
+18. Memory state survives a snapshot and restore round trip. Drive the subsystem
+    to a non-default state (a fragmented hole list, a populated TLB, a
+    non-default allocation strategy), take the envelope, restore it into a fresh
+    subsystem, and every observable reading agrees: the same next allocation, the
+    same TLB hit or miss for the same lookups, and a canonically identical second
+    envelope.
 
 ## Tests you must write
 

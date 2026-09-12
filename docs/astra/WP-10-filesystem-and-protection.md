@@ -564,6 +564,46 @@ With default configuration, 5,000 ticks produce **exactly five**
 `security.escalation_attempt` events, all `blocked: true`, and the probe
 terminates with `terminationReason: 'protection_fault'`.
 
+### 11. The file system and security snapshot contributions
+
+This package owns two contributions to `KernelSnapshot`, one per subsystem. The
+channels are `subsystems.fs` and `subsystems.security`, added by
+`docs/07-CONTRACT-AMENDMENTS.md` amendment 1, and each starts as a
+`SubsystemEnvelope`:
+
+```ts
+{ owner: 'fs',       version: 1, payload: /* JsonValue */ }
+{ owner: 'security', version: 1, payload: /* JsonValue */ }
+```
+
+`owner` is the subsystem's `SubsystemId`. `version` starts at 1 in each and this
+package bumps it whenever that payload's shape changes. Keep them separate
+envelopes: they have different owners and they will be promoted separately.
+
+The `fs` payload carries what the shared `inodes` and `journal` tables cannot
+express: the directory table and its parent links, the dentry cache policy state,
+the free space representation in force with its bitmap or list contents, open
+file tables with offsets, and any in-flight transaction not yet committed. The
+`security` payload carries the access matrix in its materialised form, the ACL
+and capability representations including every seal, the RBAC role bindings, the
+ring stacks, and `switchesToDomain` per inode.
+
+Both payloads must be plain `JsonValue`, so no `Map`, no `Set`, no function and
+no non-finite number. `kernelSecret` goes in neither payload: invariant I-37 and
+the `secret not in snapshot` case forbid the secret from reaching any snapshot
+field, and an envelope payload is a snapshot field. Validate each payload on
+restore and throw on a `version` this package does not understand, because a
+silently misread save is worse than a refused one.
+
+**Promote each envelope to a typed interface in the same commit that implements
+its subsystem**, additively, the way amendment 1 was made, and record both
+promotions in `docs/07-CONTRACT-AMENDMENTS.md`. The envelope is a transition
+mechanism. Shipping with an opaque envelope means this package is not finished.
+
+WP-11 carries both envelopes through `snapshot()` and hands them back on
+`restore()`. It does not interpret either payload, so nothing else will catch a
+field you leave out.
+
 ## Acceptance criteria
 
 1. `npm run typecheck` exits 0.
@@ -627,6 +667,14 @@ terminates with `terminationReason: 'protection_fault'`.
 26. `git diff --exit-code src/kernel/types.ts src/game/types.ts` exits 0.
 27. The forbidden-identifier scan still returns zero matches, and `DET-D1`,
     `DET-D3` and `DET-D4` still pass.
+28. File system and security state survives a snapshot and restore round trip.
+    Reach a state with a nested directory tree, open files at non-zero offsets,
+    an uncommitted journal transaction, materialised ACL and capability
+    representations and a non-empty ring stack; take both envelopes; restore them
+    into a fresh subsystem pair; and path resolution, the next free block, the
+    journal recovery decision and every `checkAccess` answer match the kernel
+    that was never interrupted. Neither restored payload contains
+    `kernelSecret`.
 
 ## Tests you must write
 

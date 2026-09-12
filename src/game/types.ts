@@ -295,6 +295,14 @@ export interface ProcessSpec {
   readonly pages: number;
   /** Page reference string, if this leg drives memory deterministically. */
   readonly referenceString?: readonly number[];
+  /**
+   * Fraction of this process's work that cannot be parallelised, 0 to 1.
+   *
+   * Amendment 1. Leg 2 needs per-process serial fractions to set up the Amdahl
+   * lesson, and a leg declares its processes only through this type. Omitted
+   * means the kernel tuning default, currently 0.25.
+   */
+  readonly serialFraction?: number;
 }
 
 export interface LegEvaluationContext {

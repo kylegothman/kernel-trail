@@ -685,6 +685,153 @@ export interface KernelSnapshot {
   readonly journal: readonly JournalEntry[];
   readonly domains: readonly ProtectionDomain[];
   readonly metrics: { readonly scheduling: SchedulingMetrics; readonly memory: MemoryMetrics };
+
+  /* ---- amendment 1: the subsystem state channel ---- */
+
+  /**
+   * Whether this snapshot can reconstruct a running workload.
+   *
+   * 'init_only' means the tables above are the whole truth: no user process has
+   * existed, no program is registered, and restore is exact. 'full' means
+   * `subsystems` carries the side-table state the shared tables cannot express.
+   *
+   * Optional, and absent means 'init_only'. That is deliberate rather than lazy:
+   * an init-only snapshot genuinely has no workload state to record, and making
+   * the field required would break every snapshot construction site the moment
+   * this amendment landed. `restore` is the enforcement point. It must reject a
+   * snapshot whose completeness is weaker than the state it is being restored
+   * into, rather than silently dropping it.
+   */
+  readonly completeness?: SnapshotCompleteness;
+
+  /**
+   * Per-subsystem state that the shared tables above cannot express, because it
+   * lives in side tables private to a subsystem.
+   *
+   * This field exists because the original contract had nowhere to put it, which
+   * blocked workload snapshot and restore in WP-02 and would have blocked every
+   * subsystem after it. See docs/07-CONTRACT-AMENDMENTS.md, amendment 1.
+   */
+  readonly subsystems?: SubsystemSnapshots;
+}
+
+export type SnapshotCompleteness = 'init_only' | 'full';
+
+/**
+ * One slot per subsystem. The process slot is fully typed, because WP-02 is
+ * built and its state is known. The other five are versioned envelopes, because
+ * those subsystems do not exist yet and inventing their internals now would mean
+ * amending this contract again the moment they did.
+ *
+ * As each subsystem lands, its package replaces its envelope with a typed
+ * interface in the same additive way this amendment was made, and records it in
+ * docs/07-CONTRACT-AMENDMENTS.md. The envelope is the transition mechanism, not
+ * the destination.
+ */
+export interface SubsystemSnapshots {
+  readonly process?: ProcessSnapshotState;
+  readonly memory?: SubsystemEnvelope;
+  readonly sync?: SubsystemEnvelope;
+  readonly storage?: SubsystemEnvelope;
+  readonly fs?: SubsystemEnvelope;
+  readonly security?: SubsystemEnvelope;
+}
+
+/**
+ * A subsystem's own serialisable state, opaque to everything except that
+ * subsystem. The owner validates its payload on restore and throws rather than
+ * accepting a version it does not understand, because a silently misread save is
+ * worse than a refused one.
+ */
+export interface SubsystemEnvelope {
+  readonly owner: SubsystemId;
+  /** Bumped by the owning subsystem whenever its payload shape changes. */
+  readonly version: number;
+  readonly payload: JsonValue;
+}
+
+/** Structurally cloneable JSON. Envelopes may not carry functions or class instances. */
+export type JsonValue =
+  | null
+  | boolean
+  | number
+  | string
+  | readonly JsonValue[]
+  | { readonly [key: string]: JsonValue };
+
+/**
+ * The process subsystem's snapshot contribution (Ch. 3 and 4).
+ *
+ * Every field here is state that a PCB array cannot carry, which is why a
+ * shallow process snapshot was insufficient. Named rather than enveloped because
+ * WP-11 has to reconstruct it exactly and a typed shape is what makes that
+ * checkable at compile time.
+ */
+export interface ProcessSnapshotState {
+  readonly version: 1;
+  /** Executable descriptions, so a restored process can keep running. */
+  readonly programs: readonly ProgramSnapshot[];
+  /** Thread control blocks, including each thread's program counter. */
+  readonly threads: readonly ThreadSnapshot[];
+  /** Pre-acceleration service, which the accelerated figure cannot recover. */
+  readonly rawWork: readonly (readonly [Pid, number])[];
+  /** Many-to-many light-weight process bindings, by tid. */
+  readonly lwpBindings: readonly (readonly [Tid, number])[];
+  /** Allocators, so a restored kernel never reissues a live id. */
+  readonly counters: IdCounters;
+  /** Exit codes a parent has not yet collected through wait. */
+  readonly pendingChildReturns: readonly (readonly [Pid, number])[];
+  /** Copy-on-write reference counts per frame. Ch. 10.3. */
+  readonly cowRefCounts: readonly (readonly [FrameId, number])[];
+  /** Shared memory and message passing state. Ch. 3.5 and 3.6. */
+  readonly ipc: IpcSnapshot;
+  /** The immutable tuning object in force, since it changes computed service. */
+  readonly tuning: JsonValue;
+  /** CPU spent on context switches and copies, charged to no process. */
+  readonly executionDebt: number;
+}
+
+export interface ProgramSnapshot {
+  readonly pid: Pid;
+  readonly name: string;
+  /** Instruction stream, as the program's own serialisable description. */
+  readonly instructions: JsonValue;
+  readonly programCounter: number;
+  readonly repeating: boolean;
+  /** Ch. 10.4 scenarios that drive memory from a fixed reference string. */
+  readonly referenceString: readonly PageId[] | null;
+  readonly serialFraction: number;
+}
+
+export interface ThreadSnapshot {
+  readonly tid: Tid;
+  readonly pid: Pid;
+  readonly programCounter: number;
+  readonly state: ProcessState;
+  readonly blockedOn: BlockReason | null;
+}
+
+export interface IdCounters {
+  readonly nextPid: number;
+  readonly nextTid: number;
+  readonly nextAddressSpace: number;
+}
+
+export interface IpcSnapshot {
+  /** Shared regions and the address spaces attached to each. */
+  readonly sharedRegions: readonly {
+    readonly id: string;
+    readonly frames: readonly FrameId[];
+    readonly attached: readonly AddressSpaceId[];
+    readonly value: number;
+  }[];
+  /** Message queues, in order, so delivery stays deterministic. */
+  readonly mailboxes: readonly {
+    readonly id: string;
+    readonly capacity: number;
+    readonly messages: readonly JsonValue[];
+    readonly waiters: readonly Pid[];
+  }[];
 }
 
 /* ------------------------------------------------------------------ */
