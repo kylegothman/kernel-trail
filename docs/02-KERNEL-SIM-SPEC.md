@@ -668,7 +668,7 @@ interface Program {
 
 `ProcessSpec.referenceString` from `@game/types` is turned into a `Program` of
 `access` instructions padded with `compute` to reach `service` ticks. A spec with
-no reference string gets a program generated from `root/process` at spawn time,
+no reference string gets a program generated from `root/vm` at spawn time (all locality draws share that stream, per section 7.7),
 using the locality model of §7.7 so that working sets are meaningful rather than
 uniform noise.
 
@@ -2095,12 +2095,12 @@ EAT = (1 - p) * ma + p * 8,000,000
 |---|---|---|
 | 0 | 200.0000 ns | 1.0000x |
 | 1e-6 | 207.9998 ns | 1.0400x |
-| 2.5000625e-6 | 219.9995 ns | 1.1000x |
+| 1/399990 (approximately 2.5000625e-6) | 220.0000 ns | 1.1000x |
 | 1e-5 | 279.9980 ns | 1.4000x |
 | 1e-4 | 999.9800 ns | 4.9999x |
 | 1e-3 | 8199.8000 ns | 41.0x |
 
-For degradation under 10 percent, `p < 2.5000625e-6`, which is **fewer than one
+For degradation under 10 percent, `p < 1/399990` (approximately 2.5000625e-6), which is **fewer than one
 fault per 399,990 memory accesses**. Test fixture `VM-EAT-1`. That number is the
 single most persuasive figure in Ch. 10 and it is printed on the Leg 8 debrief
 card.
@@ -2412,11 +2412,17 @@ changing the physics.
 **Program reference generation.** Unscripted processes generate references from a
 locality model so that working sets mean something:
 
-1. A process has a current locality: a contiguous run of `localitySize` pages
-   (default 4), starting at `localityBase`.
+1. A process has a current locality: a contiguous run of `effectiveSize` pages
+   starting at `localityBase`, where `effectiveSize = min(localitySize, pageCount)`
+   and `localitySize` defaults to 4. A process with zero pages generates compute
+   only and consumes no locality draws.
 2. With probability `1 - localityShiftChance` (default 0.98) the next reference
-   is `localityBase + rng.int(0, localitySize)`.
-3. Otherwise the locality shifts: `localityBase = rng.int(0, pageCount - localitySize)`.
+   is `localityBase + rng.int(0, effectiveSize)`.
+3. Otherwise the locality shifts:
+   `localityBase = rng.int(0, pageCount - effectiveSize + 1)`. The `+ 1` matters:
+   `Rng.int` is max-exclusive, so without it the final legal window is never
+   chosen and `pageCount === localitySize` throws. Choosing the same base again is
+   a legal shift, so a shift test counts shift decisions, not base changes.
 4. Writes occur with probability `writeRatio` (default 0.3).
 
 All draws come from `root/vm`. This gives phase behaviour that the working set
@@ -2438,11 +2444,21 @@ uses both because each catches a case the other misses.
 ```ts
 // integer-friendly EWMA with alpha = 1/8, updated every tick
 faultAccumulator = faultAccumulator - (faultAccumulator >> 3) + faultsThisTick;
+if (faultsThisTick === 0 && faultAccumulator < 8) faultAccumulator = 0;   // see below
 faultRate = (faultAccumulator * 1000) / (8 * 1);       // faults per 1000 ticks
 ```
 
 The shift-based EWMA is used rather than a float multiply so that the value is
 bit-identical after a snapshot restore. `MemoryMetrics.faultRate` is this number.
+
+The clamp on the second line is required, not cosmetic. Under zero input the
+recurrence `A = A - (A >> 3)` has a fixed point at `A = 7`, because `7 >> 3` is
+`0`. Without the clamp an accumulator that has ever reached 8 decays to 7 and stays
+there forever, reporting a rate of 875 faults per thousand ticks, above the
+default critical threshold, so a convoy could never recover from an ordinary fault
+burst. Clamping a residual below 8 to zero when no faults arrived that tick
+preserves integer arithmetic, preserves the eight-fault steady-state ceiling of
+8000, and makes recovery reachable. Found by the WP-06 pre-flight review.
 
 *Signal B, the demand ratio.* `D / m` where `D = Σ WSS_true` and
 `m = totalFrames`.
@@ -5629,8 +5645,8 @@ stack-algorithm property.
 
 | Fixture | Input | Expected |
 |---|---|---|
-| `VM-EAT-1` | `(1-p)*200 + p*8e6` for p = 0, 1e-6, 2.5000625e-6, 1e-5, 1e-4, 1e-3 | 200.0000, 207.9998, 219.9995, 279.9980, 999.9800, 8199.8000 ns |
-| `VM-EAT-2` | p for 10% degradation | 2.5000625e-6, one fault per 399,990 accesses |
+| `VM-EAT-1` | `(1-p)*200 + p*8e6` for p = 0, 1e-6, 1/399990, 1e-5, 1e-4, 1e-3 | 200.0000, 207.9998, 220.0000, 279.9980, 999.9800, 8199.8000 ns. The third p is the exact rational 20/7999800, so its EAT is exactly 220; a decimal approximation of p misses 220 by about 1.25e-8 and fails a 1e-9 equality |
+| `VM-EAT-2` | p for 10% degradation | exactly 1/399990, one fault per 399,990 accesses |
 | `VM-WS-1` | window Δ=10 over `2 6 1 5 7 7 7 7 5 1` | WS = {1,2,5,6,7}, WSS = 5 |
 | `VM-WS-2` | window Δ=10 over `3 4 3 4 4 4 3 4 4 4` | WS = {3,4}, WSS = 2 |
 | `VM-THRASH-1` | D = 70 with m = 64 frames | `memory.thrashing { severity: 'warning' }`; admission stops |
