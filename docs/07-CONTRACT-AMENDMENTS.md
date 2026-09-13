@@ -295,3 +295,34 @@ seam costs less than merging two versions of it.
 branch, because all four packages grant `Kernel.ts` and `index.ts` and a shared
 checkout loses work silently. WP-03 merges first. See
 `docs/astra/00-KICKOFF-PROMPT.md`.
+
+## 2026-09-13: WP-05, snapshot slots, tlb_flush and the miss gate
+
+**Raised by:** the WP-05 agent, asking before editing.
+
+Fifth instance of a package requiring an outcome while its file grant excluded the
+means. The three requests were snapshot save and restore for the `memory` and `vm`
+slots, `ioctl("tlb_flush")`, and a gate so a TLB miss on a resident page costs
+`tlbMissTicks` without becoming a page fault. Every one is in the specification:
+the syscall table row, the exec semantics, the package's own `tlbMissTicks = 2`,
+and an acceptance test that calls the ioctl by name.
+
+Worth recording that the reviewer nearly declined the ioctl from first principles
+(an ASID-tagged TLB does not need a flush on context switch, so why expose one)
+before reading the spec, which had already settled it: the flush is exec's
+mechanism and a teaching verb. Consistency with a decided specification beats
+re-deriving the design at review time. Read first.
+
+**Decision.** All three approved, shaped for the two packages merging next:
+snapshot save and restore becomes a dispatch over installed hooks rather than a
+growing literal, the ioctl gains exactly one subcommand with `EINVAL` on anything
+else and a marker for WP-11, and the miss costs come from two new `KernelTuning`
+keys rather than literals.
+
+**The root cause is now clear enough to fix at the source.** Every "Nothing else
+in this file" grant was written narrower than the package's own specification.
+Before WP-07 and WP-09 start, their grants should be audited against their
+specifications and against the current `Kernel.ts`, `config.ts` and the syscall
+dispatch, so the sixth and seventh escalations do not happen. `config.ts` is a
+fourth shared file, alongside `Kernel.ts`, `index.ts` and the snapshot sites, and
+every subsystem will add tuning knobs to it.

@@ -72,6 +72,41 @@ src/kernel/index.ts    (add the ALLOCATORS export)
 
 Nothing else.
 
+### Scope correction 2, 2026-09-13
+
+Raised by the implementing agent, asking before editing. The grant above excluded
+three things this package itself requires, and the request named all three
+precisely. Approved as follows.
+
+**Snapshot save and restore for the `memory` and `vm` slots.** Required by the
+acceptance criteria and by amendment 3. Do it as a dispatch over installed hooks,
+not by adding keys to the object literal WP-03 left in `snapshot()`: give the hook
+objects `saveState` and `restoreState`, and have the kernel iterate whatever is
+installed. WP-07 and WP-09 need the identical lines next, and a dispatch means they
+register rather than edit. Leave WP-03's existing scheduler line exactly as it is;
+WP-04 folds it in when it promotes the scheduler slot.
+
+**`ioctl("tlb_flush")`.** Required by sim spec section 14 (the kernel
+pseudo-device row) and by the `explicit flush` acceptance test. Add that one
+subcommand and nothing else to the ioctl branch. An unknown subcommand returns
+`EINVAL`, because WP-11 owns full argument validation for the whole table and will
+rebase onto this. Mark the branch `// TODO(astra): WP-11 validates ioctl arguments`.
+Report how `exec` reaches the flush: the spec says exec flushes the caller's TLB
+entries, exec lives in WP-02's lifecycle code which is not in your grant, so if it
+needs a lifecycle edit, escalate rather than widen.
+
+**The access-completion gate.** A TLB miss on a resident page costs
+`tlbMissTicks` and is not a fault. That three-way classification (hit, resident
+miss, non-resident fault) is the page fault ownership decision this package was
+asked to settle, and WP-06 builds directly on it. Approved with two conditions:
+the costs come from tuning, never a literal, and all eleven phase bodies stay
+unchanged, which you already committed to.
+
+**`src/kernel/config.ts`, additive only.** `tlbHitTicks` and `tlbMissTicks` belong
+in `KernelTuning` with the same validation pattern the existing knobs use. Add
+those two keys and nothing else. This file is shared with WP-07 and WP-09, who will
+add their own knobs, so keep the addition to distinct keys and do not reformat.
+
 ### Scope correction, 2026-09-12
 
 This package recomputes `MemoryMetrics.tlbHitRate` in phase 10, and WP-03 is being
