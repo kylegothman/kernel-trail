@@ -524,22 +524,22 @@ State:
 
 ---
 
-## Added scope, 2026-09-13: the scheduler snapshot contribution
+## Added scope, 2026-09-13: extending and promoting the scheduler snapshot
 
-Amendment 3 added a `scheduler` slot to `SubsystemSnapshots`. WP-03 left a
-persistence stub there because half the state worth persisting did not exist yet:
-aging timers, round robin position and MLFQ per-level state all arrive with this
-package.
+Amendment 3 added a `scheduler` slot to `SubsystemSnapshots`, and WP-03 filled it
+for the four policies it implements: the ready queues, quantum remaining, the
+starvation timers and the metrics accumulators. Read what it built before you
+extend it.
 
-You own the whole thing:
+You own the rest:
 
-1. Fill the `scheduler` envelope with everything needed to resume a scheduler
-   mid-run. That means the queues at every level, quantum remaining, the aging
-   clock, the starvation timers, and the metrics accumulators. Not the computed
-   averages: the accumulators behind them.
-2. Remove WP-03's persistence stub.
-3. Promote the envelope to a typed interface in the same commit, and record the
-   promotion in `docs/07-CONTRACT-AMENDMENTS.md`.
+1. Extend the envelope with the state this package adds: the aging clock, round
+   robin position, and MLFQ per-level queues and demotion counters. Bump the
+   envelope version. Extending a versioned envelope is what it is for.
+2. Promote the envelope to a typed interface once the scheduler is complete, and
+   record the promotion in `docs/07-CONTRACT-AMENDMENTS.md`.
+3. Persist accumulators, never computed averages. An average restored as an
+   average silently resets a run's history.
 
 `SchedulerSnapshot` is not the answer and must not be reused for this. It is a
 per-tick read-only view for the HUD and the world, it carries computed averages

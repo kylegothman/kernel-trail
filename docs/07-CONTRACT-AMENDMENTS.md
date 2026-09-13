@@ -226,16 +226,25 @@ interface when the scheduler is complete, and records that here.
 
 ### Consequences
 
-- **WP-04** owns the scheduler snapshot contribution end to end: fill the
-  `scheduler` envelope, remove WP-03's persistence stub, and promote the envelope
-  to a typed interface, all in one package.
+- **WP-03** fills the `scheduler` envelope for the four policies it implements,
+  with tests, and removes its own persistence stub.
+- **WP-04** extends that envelope with the state it adds (aging clock, round robin
+  position, MLFQ per-level queues) and then promotes it to a typed interface.
 
-  This was initially split, with WP-03 filling the envelope and WP-04 promoting it.
-  That was the wrong seam. Filling and promoting are the same piece of thinking
-  about the same state, and WP-04 is adding priority aging, round robin and
-  three-level MLFQ, so half the state to persist does not exist until it lands.
-  Splitting the work would mean deriving the shape twice and amending twice.
-  WP-03's stub stays in place until then, which is correct and harmless.
+  This was changed twice and the second change was wrong. The reasoning for moving
+  the whole thing to WP-04 was that filling and promoting are one piece of thinking
+  and half the state does not exist yet, so splitting means deriving the shape
+  twice. That reasoning assumed the work had not been done. It had: WP-03 had a
+  tested implementation on disk when the decision was made, and discarding working
+  code so a later package could rederive it is waste, not tidiness.
+
+  The envelope is versioned precisely so it can be extended. WP-04 bumping the
+  version and adding its fields is the mechanism working as designed, not churn.
+
+  The real lesson is about process rather than factoring: this plan changed while
+  the package was in flight, and the agent found the contradiction by reading the
+  repository rather than being told. Do not rescope a package that is still
+  running without telling the agent running it.
 - **WP-05, WP-07, WP-09** each now have a slot that exists, so the obligation in
   their kickoff card is satisfiable. WP-05 owns both `memory` and `vm`.
 - **WP-11** reconstructs all ten, and its restore completeness check now has ten
