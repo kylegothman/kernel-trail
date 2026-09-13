@@ -734,10 +734,10 @@ export interface SubsystemSnapshots {
    *  metrics accumulators, none of which SchedulerSnapshot carries: that type is a
    *  read-only view for the HUD and the world, not a restore format. */
   readonly scheduler?: SubsystemEnvelope;
-  readonly memory?: SubsystemEnvelope;
+  readonly memory?: MemorySnapshotState;
   /** Amendment 3. Demand paging state distinct from the frame table: the working
    *  set window, the replacement policy's own ordering, and the fault counters. */
-  readonly vm?: SubsystemEnvelope;
+  readonly vm?: VmSnapshotState;
   readonly sync?: SubsystemEnvelope;
   /** Amendment 3. Detection interval position and the wait-for graph edges that
    *  are not recoverable from the resource table alone. */
@@ -747,6 +747,74 @@ export interface SubsystemSnapshots {
   readonly io?: SubsystemEnvelope;
   readonly fs?: SubsystemEnvelope;
   readonly security?: SubsystemEnvelope;
+}
+
+/** WP-05 placement, frame, page-table and content metadata. Plain JSON only. */
+export interface MemorySnapshotState {
+  readonly owner: 'memory';
+  readonly version: 1;
+  readonly payload: MemorySnapshotPayload;
+}
+export type MemorySnapshotPayload = {
+  readonly pageSize: number;
+  readonly frames: {
+    readonly totalFrames: number;
+    readonly freePoolRetain: number;
+    readonly frames: readonly { readonly [K in keyof Frame]: Frame[K] }[];
+    readonly freeList: readonly FrameId[];
+    readonly freePool: readonly FrameId[];
+  };
+  readonly pageTables: {
+    readonly spaces: readonly {
+      readonly space: AddressSpaceId;
+      readonly entries: readonly { readonly [K in keyof PageTableEntry]: PageTableEntry[K] }[];
+    }[];
+  };
+  readonly holes: {
+    readonly totalBytes: number;
+    readonly minBlock: number;
+    readonly strategy: AllocationStrategy;
+    readonly holes: readonly { readonly start: number; readonly size: number }[];
+    readonly partitions: readonly { readonly pid: Pid; readonly base: number; readonly limit: number; readonly requested: number }[];
+    readonly reserved: readonly { readonly start: number; readonly size: number }[];
+  };
+  readonly contents: readonly (readonly [FrameId, number])[];
+  readonly nextContent: number;
+  readonly requestedBytes: readonly (readonly [AddressSpaceId, number])[];
+  readonly rations: 'generous' | 'standard' | 'lean' | 'starved';
+  readonly allocationScheme: 'equal' | 'proportional';
+  readonly replacementScope: 'local' | 'global';
+};
+
+/** WP-05 translation cache and unfinished access costs; WP-06 extends fault state. */
+export interface VmSnapshotState {
+  readonly owner: 'vm';
+  readonly version: 1;
+  readonly payload: {
+    readonly tick: Tick;
+    readonly tlbHitTicks: number;
+    readonly tlbMissTicks: number;
+    readonly tlb: {
+      readonly version: 1;
+      readonly entries: readonly {
+        readonly space: AddressSpaceId;
+        readonly page: PageId;
+        readonly frame: FrameId;
+        readonly valid: boolean;
+        readonly lastUsedTick: Tick;
+      }[];
+    };
+    readonly tlbHits: number;
+    readonly tlbMisses: number;
+    readonly pending: readonly {
+      readonly key: string;
+      readonly pid: Pid;
+      readonly page: PageId;
+      readonly write: boolean;
+      readonly remaining: number;
+      readonly lastAttemptTick: Tick;
+    }[];
+  };
 }
 
 /**

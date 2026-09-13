@@ -86,6 +86,8 @@ describe('process construction and transitions', () => {
 describe('fork, exit, wait and exec', () => {
   it('fork copies fields, appends one apostrophe, retains descriptors and starts one thread at the continuation', () => {
     const { kernel, parent, fork } = family();
+    // The first access is now timed; fork must not race its completion.
+    kernel.run(kernel.tuning.tlbMissTicks - 1);
     const retained: FileDescriptor[] = []; kernel.installHooks({ fs: { retainDescriptor: fd => retained.push(fd) } });
     const source = live(kernel, parent); source.openFiles = [4 as FileDescriptor]; source.heldResources = [asResourceId('lock')]; source.queueLevel = 2;
     const child = fork(); const pcb = live(kernel, child);
@@ -243,16 +245,17 @@ describe('programs and configuration', () => {
 describe('lifecycle cleanup regressions', () => {
   it('exec detaches only its shared mappings before freeing private pages', () => {
     const { kernel, parent, fork, call } = family(); const second = fork(); kernel.step(); const id = asResourceId('exec-shared'); const space = 99 as AddressSpaceId;
-    const template = kernel.pageTables.get(live(kernel, parent).addressSpaceId)?.[0]; const frame = kernel.frame(asFrameId(0));
+    const template = kernel.pageTables.get(live(kernel, parent).addressSpaceId)?.[0]; const backing = kernel.memorySubsystem.loadPage(space, asPageId(0));
+    const frame = backing === null ? undefined : kernel.frame(backing);
     if (template === undefined || frame === undefined) throw new Error('missing memory fixture');
     frame.owner = space; frame.page = asPageId(0); kernel.pageTables.set(space, [{ ...template, valid: true, frame: frame.id }]);
     kernel.ipc.createSharedRegion({ id, space, pages: [asPageId(0)], attached: [], value: 0 });
     const freed: number[] = []; kernel.installHooks({ security: { rights: () => ['read', 'write'] }, memory: { freeFrame: id => freed.push(id) } });
     kernel.ipc.mmap(parent, id); kernel.ipc.mmap(second, id);
     kernel.registerProgram('fresh', instructionProgram([{ kind: 'compute' }]));
-    call('exec', parent, ['fresh']); expect(kernel.ipc.sharedRegion(id)?.attached).toEqual([second]); expect(frame.pinned).toBe(true); expect(freed).not.toContain(0);
+    call('exec', parent, ['fresh']); expect(kernel.ipc.sharedRegion(id)?.attached).toEqual([second]); expect(frame.pinned).toBe(true); expect(freed).not.toContain(frame.id);
     expect(() => kernel.ipc.refreshSharedMappings()).not.toThrow();
-    call('exec', second, ['fresh']); expect(kernel.ipc.sharedRegion(id)?.attached).toEqual([]); expect(frame.pinned).toBe(false); expect(freed).not.toContain(0);
+    call('exec', second, ['fresh']); expect(kernel.ipc.sharedRegion(id)?.attached).toEqual([]); expect(frame.pinned).toBe(false); expect(freed).not.toContain(frame.id);
   });
   it('exec closes adjacent close-on-exec descriptors even when closing mutates the descriptor array', () => {
     const { kernel, parent, call } = family(); const pcb = live(kernel, parent); pcb.openFiles = [3 as FileDescriptor, 4 as FileDescriptor];

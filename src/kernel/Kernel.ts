@@ -13,6 +13,7 @@ import { ProcessLifecycle } from './process/lifecycle';
 import { ThreadManager, type ThreadControlBlock } from './process/threads';
 import { generatedProgram, scriptedProgram, instructionProgram, type Program, type ProgramSpec } from './process/Program';
 import { IpcManager } from './process/ipc';
+import { MemorySubsystem } from './memory/MemorySubsystem';
 import type {
   AddressSpaceId,
   AllocationStrategy,
@@ -45,14 +46,14 @@ import type {
   SchedulerParams,
   SchedulerPolicy,
   SchedulingMetrics,
-  SubsystemId, SubsystemEnvelope,
+  SubsystemId, SubsystemEnvelope, SubsystemSnapshots,
   SyncPrimitive,
   SyscallRequest,
   SyscallResult,
   Tick,
   Tid, BlockReason, DomainId, FileDescriptor, DeviceId, AccessRight, Unsubscribe,
 } from './types';
-import { asFrameId, asTick, asPid, asPageId } from './types';
+import { asTick, asPid, asPageId } from './types';
 
 const EMPTY_SCHEDULING_METRICS: SchedulingMetrics = {
   averageWaitingTime: 0,
@@ -143,7 +144,13 @@ export interface MetricsHooks {
   memory(tick: Tick): MemoryMetrics;
 }
 export interface InvariantHooks { check(kernel: KernelImpl): void }
+export interface SnapshotHooks {
+  saveState(): Partial<SubsystemSnapshots>;
+  /** Validate first and return the commit, so one invalid contribution changes nothing. */
+  restoreState(snapshot: KernelSnapshot): () => void;
+}
 export interface KernelHooks {
+  snapshots?: SnapshotHooks;
   memory: Partial<MemoryHooks>; sync: Partial<SyncHooks>; io: Partial<IoHooks>;
   storage: Partial<StorageHooks>; fs: Partial<FsHooks>; security: Partial<SecurityHooks>;
   deadlock: Partial<DeadlockHooks>; scheduler: Partial<SchedulerHooks>; metrics: Partial<MetricsHooks>; invariants: InvariantHooks;
@@ -159,6 +166,8 @@ export class KernelImpl implements Kernel {
   readonly threads: ThreadManager;
   readonly lifecycle: ProcessLifecycle;
   readonly ipc: IpcManager;
+  readonly memorySubsystem: MemorySubsystem;
+  private readonly snapshotHooks: SnapshotHooks[] = [];
   readonly pageTables = new Map<AddressSpaceId, PageTableEntry[]>();
   private currentTick = asTick(0);
   private readonly rng: StreamRegistry;
@@ -185,7 +194,7 @@ export class KernelImpl implements Kernel {
   private contextSwitches = 0;
   private frames: Frame[] = [];
   private freeList: FrameId[] = [];
-  private tlb: TlbEntry[] = [];
+  private tlb: readonly Readonly<TlbEntry>[] = [];
   private syncPrimitives: SyncPrimitive[] = [];
   private resources: ResourceType[] = [];
   private diskQueue: DiskRequest[] = [];
@@ -198,11 +207,7 @@ export class KernelImpl implements Kernel {
   private memoryMetrics: MemoryMetrics = EMPTY_MEMORY_METRICS;
   private readonly invariantSlowInterval: number;
 
-  // TODO(astra): WP-05 and WP-06 supply allocation, access and TLB timers.
-  private memory: MemoryHooks = { expireTimers: noop, admit: noop, access: () => ({ hit: true }),
-    isSatisfied: () => false,
-    // TODO(astra): WP-05 provides the frame table.
-    allocateFrame: () => null, freeFrame: noop, copyFrame: noop };
+  private memory: MemoryHooks;
   // TODO(astra): WP-07 supplies ordered synchronization waits and condition timers.
   private sync: SyncHooks = { expireTimers: noop, isSatisfied: () => false,
     acquire: noop, release: noop, releaseAll: noop, removeWaiter: noop };
@@ -227,9 +232,7 @@ export class KernelImpl implements Kernel {
   private readonly schedulingAccounting = new SchedulingAccounting();
   private metricsHooks: MetricsHooks = {
     scheduler: tick => this.schedulingAccounting.recompute(tick, this.processes, this.contextSwitches, this.scheduler),
-    // TODO(astra): WP-05 registers its metrics hook here
-    memory: () => ({ ...EMPTY_MEMORY_METRICS, totalFrames: this.frames.length,
-      freeFrames: this.freeList.length, workingSets: new Map() }),
+    memory: () => this.memorySubsystem.metrics(),
   };
   // TODO(astra): WP-11 extends the existing invariant harness to the full set.
   private invariants: InvariantHooks = { check: kernel => kernel.checkInvariants() };
@@ -245,6 +248,22 @@ export class KernelImpl implements Kernel {
     this.schedulerParams = { ...config.schedulerParams };
     this.scheduler = this.makeScheduler(config.scheduler);
     this.diskHead = { cylinder: 0, direction: 'up', totalCylinders: config.totalCylinders };
+    this.memorySubsystem = new MemorySubsystem(this.config, {
+      tick: () => this.tick, process: pid => this.process(pid), processes: () => this.processes,
+      pageTables: this.pageTables, emit: event => this.publish(event),
+      refreshSharedMappings: () => this.ipc.refreshSharedMappings(),
+      accessKey: pid => this.executingThread === undefined ? undefined : `${pid}:${this.executingThread}`,
+      releaseAddressSpace: space => {
+        const pcb = this.table.filterAscending(process => process.addressSpaceId === space)[0];
+        if (pcb !== undefined) this.lifecycle.releaseAddressSpace(pcb);
+      },
+    }, { tuning: this.tuning });
+    const memory = this.memorySubsystem;
+    this.memory = { expireTimers: tick => memory.expireTimers(tick), admit: pcb => memory.admit(pcb),
+      access: (pid, page, write) => memory.access(pid, page, write), isSatisfied: (pid, reason) => memory.isSatisfied(pid, reason),
+      allocateFrame: (space, page) => memory.allocateFrame(space, page), freeFrame: frame => memory.freeFrame(frame),
+      copyFrame: (from, to) => memory.copyFrame(from, to) };
+    this.snapshotHooks.push({ saveState: () => memory.saveState(), restoreState: snapshot => memory.prepareKernelRestore(snapshot) });
     this.threads = new ThreadManager({ model: this.tuning.threadModel,
       coreCount: this.tuning.coreCount, lwpPoolSize: this.tuning.lwpPoolSize,
       maxThreadsPerProcess: this.tuning.maxThreadsPerProcess, threadCreateTicks: this.tuning.threadCreateTicks },
@@ -263,7 +282,7 @@ export class KernelImpl implements Kernel {
       },
       clearThreads: pcb => this.threads.clear(pcb),
       programNamed: name => this.namedPrograms.get(name),
-      detachIpc: pcb => this.ipc.removeProcess(pcb.pid),
+      detachIpc: pcb => { this.ipc.removeProcess(pcb.pid); this.memorySubsystem.detachAddressSpace(pcb.addressSpaceId); },
       replaceProgram: (pcb, program) => {
         this.programs.set(pcb.pid, program);
         this.burstSizes.set(pcb.pid, program.length);
@@ -280,7 +299,7 @@ export class KernelImpl implements Kernel {
       closeDescriptor: (pcb, fd) => this.fs.closeDescriptor(pcb, fd),
       closeOnExec: (pcb, fd) => this.fs.closeOnExec(pcb, fd),
       releaseResources: pcb => this.sync.releaseAll(pcb),
-      removeFromWaitQueues: pcb => { this.sync.removeWaiter(pcb.pid); this.io.removeWaiter(pcb.pid); this.ipc.removeProcess(pcb.pid); },
+      removeFromWaitQueues: pcb => { this.sync.removeWaiter(pcb.pid); this.io.removeWaiter(pcb.pid); this.ipc.removeProcess(pcb.pid); this.memorySubsystem.detachAddressSpace(pcb.addressSpaceId); },
       wakeParent: pid => { this.wakeable.add(pid); },
       chargeCowCopy: (pcb, ticks) => { this.copyDebt.set(pcb.pid, (this.copyDebt.get(pcb.pid) ?? 0) + ticks); },
       memory: { pageTables: this.pageTables,
@@ -315,7 +334,8 @@ export class KernelImpl implements Kernel {
     this.probes.add(probe); return () => { this.probes.delete(probe); };
   }
   installHooks(hooks: Partial<KernelHooks>): void {
-    this.hooksInstalled = true;
+    this.hooksInstalled ||= Object.keys(hooks).some(key => key !== 'snapshots');
+    if (hooks.snapshots !== undefined) this.snapshotHooks.push(hooks.snapshots);
     this.memory = { ...this.memory, ...hooks.memory }; this.sync = { ...this.sync, ...hooks.sync };
     this.io = { ...this.io, ...hooks.io }; this.storage = { ...this.storage, ...hooks.storage };
     this.fs = { ...this.fs, ...hooks.fs }; this.security = { ...this.security, ...hooks.security };
@@ -412,6 +432,10 @@ export class KernelImpl implements Kernel {
         if (target === undefined || target.pid === asPid(0)) return failure('ESRCH', 'process not found');
         return this.exitProcess(target, 137, target.parent === pcb.pid ? 'killed_by_parent' : 'killed_by_user');
       }
+      case 'ioctl':
+        // TODO(astra): WP-11 validates ioctl arguments.
+        if (arg !== 'tlb_flush') return failure('EINVAL', 'unknown kernel ioctl subcommand');
+        this.memorySubsystem.flush(); return { ok: true, value: null };
       case 'nice':
         if (typeof arg !== 'number' || !Number.isSafeInteger(arg) || arg < 0 || arg > 39) return failure('EINVAL', 'priority must be in [0, 39]');
         pcb.priority = arg; return { ok: true, value: arg };
@@ -448,9 +472,9 @@ export class KernelImpl implements Kernel {
     // TODO(astra): WP-06 implements this.
     throw new Error('not implemented: setReplacementPolicy');
   }
-  setAllocationStrategy(_strategy: AllocationStrategy): void {
-    // TODO(astra): WP-05 implements this.
-    throw new Error('not implemented: setAllocationStrategy');
+  setAllocationStrategy(strategy: AllocationStrategy): void {
+    this.memorySubsystem.setAllocationStrategy(strategy);
+    this.currentConfig = cloneConfig({ ...this.config, allocationStrategy: strategy });
   }
   setDiskPolicy(_id: DiskSchedulingId): void {
     // TODO(astra): WP-09 implements this.
@@ -492,7 +516,7 @@ export class KernelImpl implements Kernel {
   /** The scaffold's init-only replay remains supported. Workload saves need WP-11's contract channel. */
   snapshot(): KernelSnapshot {
     this.requireSnapshotChannel('snapshot');
-    return {
+    return this.withSnapshotContributions({
       version: 1, tick: this.tick, seq: this.events.seq, config: cloneConfig({ ...this.config, scheduler: this.requestedScheduler, schedulerParams: this.schedulerParams }), rng: this.rng.save(),
       processes: this.processes.map(clonePcb), frames: this.frames.map(frame => ({ ...frame })),
       pageTables: [...this.pageTables].sort(([a], [b]) => a - b).map(([space, entries]) => [space, entries.map(entry => ({ ...entry }))] as const),
@@ -503,7 +527,16 @@ export class KernelImpl implements Kernel {
       domains: this.domains.map(d => ({ ...d, rights: new Map([...d.rights].map(([key, rights]) => [key, [...rights]])) })),
       subsystems: { scheduler: this.saveSchedulerState() },
       metrics: { scheduling: { ...this.schedulingMetrics }, memory: { ...this.memoryMetrics, workingSets: new Map(this.memoryMetrics.workingSets) } },
-    };
+    });
+  }
+  private withSnapshotContributions(snapshot: KernelSnapshot): KernelSnapshot {
+    const subsystems: SubsystemSnapshots = { ...snapshot.subsystems };
+    for (const hooks of this.snapshotHooks) {
+      const contribution = hooks.saveState();
+      if (Object.keys(contribution).some(key => key in subsystems)) throw new Error('duplicate snapshot subsystem registration');
+      Object.assign(subsystems, contribution);
+    }
+    return { ...snapshot, subsystems };
   }
   restore(snapshot: KernelSnapshot): void {
     if (snapshot.version !== 1) throw new Error(`unsupported snapshot version ${String(snapshot.version)}`);
@@ -513,6 +546,7 @@ export class KernelImpl implements Kernel {
       ...this.schedulerContext(), tick: snapshot.tick, running: null, readyQueue: [],
       process: pid => snapshot.processes.find(pcb => pcb.pid === pid),
     }, this.schedulingAccounting, pid => this.burstSizes.get(pid), snapshot.config);
+    const restoreContributions = this.snapshotHooks.map(hooks => hooks.restoreState(snapshot));
     this.currentConfig = cloneConfig(snapshot.config); this.enabled = new Set(this.config.enabledSubsystems);
     this.schedulerParams = { ...snapshot.config.schedulerParams }; this.requestedScheduler = this.config.scheduler;
     this.currentTick = snapshot.tick; this.events.beginFrame(); this.events.setSeq(snapshot.seq); this.rng.restore(snapshot.rng);
@@ -539,6 +573,8 @@ export class KernelImpl implements Kernel {
     this.wakeable.clear(); this.admittedThisTick.clear(); this.scheduler = this.makeScheduler(this.config.scheduler);
     if (snapshot.subsystems?.scheduler !== undefined) this.restoreSchedulerState(snapshot.subsystems.scheduler);
     else this.schedulingAccounting.reset();
+    for (const commit of restoreContributions) commit();
+    this.initialiseFrameTable();
     this.syncSchedulerView();
   }
   private requireSnapshotChannel(name: string): void {
@@ -685,6 +721,9 @@ export class KernelImpl implements Kernel {
           this.publish({ type: 'memory.page_fault', pid: pcb.pid, page: instruction.page, major: true });
           this.blockProcess(pcb.pid, { kind: 'page_fault', page: instruction.page }, thread.tid);
         }
+        if (result.hit && !this.memorySubsystem.accessComplete(pcb.pid)) {
+          this.threads.deferServiceCharge(); return false;
+        }
         return result.hit;
       }
       case 'syscall': {
@@ -792,8 +831,8 @@ export class KernelImpl implements Kernel {
     this.programs.set(init.pid, instructionProgram([{ kind: 'compute' }]));
   }
   private initialiseFrameTable(): void {
-    this.frames = Array.from({ length: this.config.totalFrames }, (_, index) => ({ id: asFrameId(index),
-      owner: null, page: null, pinned: false, loadedAtTick: null, lastAccessTick: null, referenceBit: false }));
+    this.frames = this.memorySubsystem.frameTable.frames;
+    this.tlb = this.memorySubsystem.tlb.entries;
     this.rebuildFreeList();
   }
   private rebuildFreeList(): void {

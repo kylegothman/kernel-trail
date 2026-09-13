@@ -252,6 +252,54 @@ interface when the scheduler is complete, and records that here.
 
 ---
 
+## Amendment 4, 2026-09-13: typed memory and vm contributions
+
+**Raised by:** the implementing WP-05 agent, before editing the frozen contract.
+**Approved by:** Kyle, after reviewing the exact typed-slot promotion patch.
+**Status:** applied on wp-05. Hash regeneration was explicitly human-approved in
+that review. The amendment number is provisional until merge order is known.
+
+### What was an envelope
+
+`SubsystemSnapshots.memory` and `.vm` were optional `SubsystemEnvelope` slots.
+Their presence allowed persistence, but their payloads did not describe the state
+that a complete restore must retain.
+
+### What changed
+
+The slots now name `MemorySnapshotState` and `VmSnapshotState`. Both retain their
+owner, version 1 and plain JSON payload; optional slot presence is unchanged.
+
+The memory contribution contains frame ownership and retained/free ordering,
+page tables, contiguous holes and placement order, content-copy tags, requested
+byte counts and allocation policy. The vm contribution contains ASID-tagged TLB
+slots in replacement order, lookup counters, TLB timing and pending instruction
+access costs. The split keeps physical placement separate from translation and
+its unfinished work. There are no Maps, Sets or class instances in either payload.
+
+### Review observations
+
+- The mapped types over `Frame` and `PageTableEntry` couple this versioned save
+  format to frozen interfaces. A later change to either must review the persisted
+  shape and its version; mapped types do not remove that obligation.
+- `rations` is game vocabulary in the kernel, as required by sim spec 6.6. Its
+  literal union is mirrored without importing game code.
+- `replacementScope` and `allocationScheme` pre-declare WP-06 territory. WP-05
+  records the selected allocation parameters; it does not implement replacement.
+
+### Consequences
+
+WP-06 extends the vm contribution with demand-fault service state, replacement
+ordering, fault counters and working-set state, and versions the shape when it
+changes. WP-11 reconstructs both typed contributions through installed snapshot
+hooks. Full process-workload restore remains WP-11's responsibility.
+
+The contract and approved hash update are committed separately from the WP-05
+implementation, as directed in the review. If another promotion takes amendment
+4 first, this number is changed at merge, not on this branch.
+
+---
+
 # Package scope corrections
 
 Not contract changes, so no hash moves and no amendment number. Recorded here

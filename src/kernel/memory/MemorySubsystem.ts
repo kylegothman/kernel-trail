@@ -1,0 +1,408 @@
+import { DEFAULT_TUNING, type KernelTuning } from '../config';
+import type { MemoryHooks } from '../Kernel';
+import type { EmittableEvent } from '../EventBus';
+import type {
+  AddressSpaceId, AllocationStrategy, BlockReason, FrameId, JsonValue, KernelConfig, KernelSnapshot,
+  MemoryContext, MemoryMetrics, PageId, PageTableEntry, Pid, ProcessControlBlock, Rng,
+  SubsystemEnvelope, Tick, MemorySnapshotState, VmSnapshotState,
+} from '../types';
+import { asFrameId, asPageId, asPid, asTick } from '../types';
+import { FrameTable, memoryArray, memoryBoolean, memoryInteger, memoryObject, memorySpace } from './FrameTable';
+import { PageTable } from './PageTable';
+import { Tlb } from './Tlb';
+import { HoleList } from './contiguous/HoleList';
+import type { AllocationScheme, ReplacementScope, Rations } from './rations';
+import { framesPerProcess } from './rations';
+import { pagingFragmentation, contiguousFragmentation } from './fragmentation';
+
+export interface MemoryHost {
+  tick(): Tick;
+  process(pid: Pid): Readonly<ProcessControlBlock> | undefined;
+  processes(): readonly Readonly<ProcessControlBlock>[];
+  readonly pageTables: Map<AddressSpaceId, PageTableEntry[]>;
+  emit(event: EmittableEvent): void;
+  refreshSharedMappings?(): void;
+  /** Undefined outside instruction execution; each thread has its own access. */
+  accessKey?(pid: Pid): string | undefined;
+  releaseAddressSpace?(space: AddressSpaceId): void;
+}
+export interface MemoryOptions {
+  readonly contiguousBytes?: number;
+  readonly minBlock?: number;
+  readonly freePoolRetain?: number;
+  readonly tuning?: Pick<KernelTuning, 'tlbHitTicks' | 'tlbMissTicks'>;
+  readonly rations?: Rations;
+  readonly allocationScheme?: AllocationScheme;
+  readonly replacementScope?: ReplacementScope;
+}
+export interface DemandPagingHooks {
+  /** Pending major faults return false; synchronous minor faults return true. */
+  fault(pid: Pid, page: PageId, write: boolean): { readonly hit: boolean };
+  expireTimers?(tick: Tick): void;
+}
+type PendingAccess = { pid: Pid; page: PageId; write: boolean; remaining: number; lastAttemptTick: Tick };
+
+export type { MemorySnapshotState, VmSnapshotState } from '../types';
+
+/** Memory owns translation and placement; lifecycle owns COW reference counts. */
+export class MemorySubsystem implements MemoryHooks {
+  readonly frameTable: FrameTable;
+  readonly pageTables: PageTable;
+  readonly tlb: Tlb;
+  readonly holes: HoleList;
+  private tlbHits = 0;
+  private tlbMisses = 0;
+  private nextContent = 0;
+  private readonly timing: Pick<KernelTuning, 'tlbHitTicks' | 'tlbMissTicks'>;
+  private readonly contents = new Map<FrameId, number>();
+  private readonly requestedBytes = new Map<AddressSpaceId, number>();
+  private readonly pending = new Map<string, PendingAccess>();
+  private rations: Rations;
+  private allocationScheme: AllocationScheme;
+  private replacementScope: ReplacementScope;
+  private demandPaging: DemandPagingHooks = {
+    fault: () => {
+      // TODO(astra): WP-06 implements the fault service path
+      throw new Error('not implemented: page fault');
+    },
+  };
+
+  constructor(readonly config: Readonly<KernelConfig>, private readonly host: MemoryHost, options: MemoryOptions = {}) {
+    this.config = Object.freeze({ ...config });
+    const tuning = options.tuning ?? DEFAULT_TUNING;
+    this.timing = Object.freeze({ tlbHitTicks: tuning.tlbHitTicks, tlbMissTicks: tuning.tlbMissTicks });
+    memoryInteger(this.timing.tlbHitTicks, 'TLB hit ticks', 1);
+    memoryInteger(this.timing.tlbMissTicks, 'TLB miss ticks', 1);
+    this.frameTable = new FrameTable(config.totalFrames, { freePoolRetain: options.freePoolRetain ?? 4, tick: () => host.tick() });
+    this.pageTables = new PageTable(host.pageTables);
+    this.tlb = new Tlb(config.tlbEntries, id => this.frameTable.frames[id]);
+    const bytes = options.contiguousBytes ?? 2 ** Math.ceil(Math.log2(config.totalFrames * config.pageSize));
+    this.holes = new HoleList(bytes, config.allocationStrategy, options.minBlock ?? Math.min(4096, bytes));
+    this.rations = options.rations ?? 'standard';
+    this.allocationScheme = options.allocationScheme ?? 'equal';
+    this.replacementScope = options.replacementScope ?? 'local';
+  }
+
+  setDemandPaging(hooks: DemandPagingHooks): void { this.demandPaging = hooks; }
+  setAllocationStrategy(strategy: AllocationStrategy): void { this.holes.setStrategy(strategy); }
+  get activeAllocationStrategy(): AllocationStrategy { return this.holes.strategy; }
+  setFramePolicy(rations: Rations, scheme: AllocationScheme = 'equal', scope: ReplacementScope = 'local'): void {
+    validatePolicy(rations, scheme, scope);
+    this.rations = rations; this.allocationScheme = scheme; this.replacementScope = scope;
+  }
+  get framePolicy() { return { rations: this.rations, allocationScheme: this.allocationScheme, replacementScope: this.replacementScope }; }
+
+  expireTimers(tick: Tick): void {
+    this.demandPaging.expireTimers?.(tick);
+    this.pruneTlb();
+  }
+  admit(pcb: ProcessControlBlock): void {
+    if (pcb.pid <= 1) return;
+    const entries = this.pageTables.pageTable(pcb.addressSpaceId);
+    const count = entries.size;
+    if (count === 0) return;
+    this.requestedBytes.set(pcb.addressSpaceId, count * this.config.pageSize);
+    const active = this.host.processes().filter(process => process.pid > 1 && !['zombie', 'terminated'].includes(process.state));
+    const totalPages = active.reduce((sum, process) => sum + this.pageTables.pageTable(process.addressSpaceId).size, 0);
+    const budget = framesPerProcess(this.rations, this.config.totalFrames, Math.max(1, active.length), {
+      allocationScheme: this.allocationScheme, pageCount: count, totalPageCount: totalPages,
+    });
+    const allocated: FrameId[] = [];
+    let resident = [...entries.values()].filter(entry => entry.valid).length;
+    for (const page of [...entries.keys()].sort((a, b) => a - b)) {
+      if (resident >= budget) break;
+      const entry = entries.get(page);
+      if (entry?.valid) continue;
+      const frame = this.loadPage(pcb.addressSpaceId, page);
+      if (frame === null) break;
+      resident += 1; allocated.push(frame);
+    }
+    if (allocated.length > 0) this.host.emit({ type: 'memory.allocated', pid: pcb.pid, frames: allocated, strategy: this.holes.strategy });
+    if (resident === 0) this.host.emit({ type: 'memory.allocation_failed', pid: pcb.pid, requested: Math.min(count, budget), reason: 'no_space' });
+  }
+
+  access(pid: Pid, page: PageId, write: boolean): { readonly hit: boolean } {
+    const pcb = this.host.process(pid);
+    if (pcb === undefined || pcb.pid <= 1) throw new Error('memory access requires a user process');
+    const tick = this.host.tick();
+    const key = this.host.accessKey?.(pid);
+    const pending = key === undefined ? undefined : this.pending.get(key);
+    if (pending !== undefined && pending.pid === pid && pending.page === page && pending.write === write) {
+      if (tick > pending.lastAttemptTick) { pending.remaining -= 1; pending.lastAttemptTick = tick; }
+      if (pending.remaining === 0 && key !== undefined) this.pending.delete(key);
+      return { hit: true };
+    }
+    const pte = this.pageTables.ensure(pcb.addressSpaceId, page);
+    this.pruneTlb();
+    const cached = this.tlb.lookup(pcb.addressSpaceId, page, tick);
+    const tlbHit = cached !== null;
+    if (tlbHit) this.tlbHits += 1;
+    else {
+      this.tlbMisses += 1;
+      this.host.emit({ type: 'tlb.miss', pid, page });
+    }
+    if (!pte.valid || pte.frame === null) {
+      const result = this.demandPaging.fault(pid, page, write);
+      if (!result.hit) return result;
+    }
+    const entry = this.pageTables.get(pcb.addressSpaceId, page);
+    if (entry === undefined || !entry.valid || entry.frame === null) throw new Error('fault service returned success without a resident page');
+    const frame = this.frameTable.frames[entry.frame];
+    if (frame === undefined || frame.owner === null) throw new Error('resident page has no frame');
+    entry.referenced = true; entry.dirty ||= write; entry.lastAccessTick = tick; entry.accessCount += 1;
+    frame.referenceBit = true; frame.lastAccessTick = tick;
+    if (!tlbHit) this.tlb.install(pcb.addressSpaceId, page, entry.frame, tick);
+    this.host.emit({ type: 'memory.access', pid, page, write, hit: tlbHit });
+    const cost = tlbHit ? this.timing.tlbHitTicks : this.timing.tlbMissTicks;
+    if (cost > 1 && key !== undefined) this.pending.set(key, { pid, page, write, remaining: cost - 1, lastAttemptTick: tick });
+    return { hit: true };
+  }
+
+  /** The kernel gates instruction retirement separately from page availability. */
+  accessComplete(pid: Pid): boolean {
+    const key = this.host.accessKey?.(pid);
+    return key === undefined || !this.pending.has(key);
+  }
+  isSatisfied(pid: Pid, reason: BlockReason): boolean {
+    const pcb = this.host.process(pid);
+    return reason.kind === 'page_fault' && pcb !== undefined
+      && this.pageTables.get(pcb.addressSpaceId, reason.page)?.valid === true;
+  }
+  allocateFrame(space: AddressSpaceId, page: PageId): FrameId | null {
+    const old = this.pageTables.get(space, page)?.frame;
+    if (old !== undefined && old !== null) this.tlb.shootdown(old);
+    const frame = this.frameTable.allocate(space, page, false);
+    if (frame !== null) { this.tlb.shootdown(frame); this.contents.set(frame, this.nextContent++); }
+    return frame;
+  }
+  loadPage(space: AddressSpaceId, page: PageId, pinned = false): FrameId | null {
+    const entry = this.pageTables.ensure(space, page);
+    if (entry.valid && entry.frame !== null) return entry.frame;
+    const frame = this.allocateFrame(space, page);
+    if (frame === null) return null;
+    entry.frame = frame; entry.valid = true; entry.swapped = false;
+    const live = this.frameTable.frames[frame];
+    if (live !== undefined) live.pinned = pinned;
+    this.host.refreshSharedMappings?.();
+    return frame;
+  }
+  freeFrame(frame: FrameId): void {
+    this.tlb.shootdown(frame);
+    this.contents.delete(frame);
+    this.frameTable.discard(frame);
+  }
+  copyFrame(from: FrameId, to: FrameId): void {
+    if (this.frameTable.frames[from]?.owner === null || this.frameTable.frames[to]?.owner === null
+      || this.frameTable.frames[from] === undefined || this.frameTable.frames[to] === undefined) throw new Error('copy requires two allocated frames');
+    let tag = this.contents.get(from);
+    if (tag === undefined) { tag = this.nextContent++; this.contents.set(from, tag); }
+    this.contents.set(to, tag);
+    this.tlb.shootdown(to);
+  }
+  contentTag(frame: FrameId): number | undefined { return this.contents.get(frame); }
+  flush(space?: AddressSpaceId): void { this.tlb.flush(space); }
+  detachAddressSpace(space: AddressSpaceId): void {
+    this.flush(space); this.requestedBytes.delete(space);
+    for (const pcb of this.host.processes()) if (pcb.addressSpaceId === space) this.holes.free(pcb.pid);
+    this.discardUnusedFrames(space);
+    for (const [key, value] of this.pending) {
+      if (this.host.process(value.pid)?.addressSpaceId === space) this.pending.delete(key);
+    }
+  }
+  freeAddressSpace(space: AddressSpaceId): void {
+    this.detachAddressSpace(space);
+    if (this.host.releaseAddressSpace !== undefined) { this.host.releaseAddressSpace(space); this.discardUnusedFrames(space); return; }
+    const frames = [...this.pageTables.pageTable(space).values()].flatMap(entry => entry.frame === null ? [] : [entry.frame]);
+    this.pageTables.deleteSpace(space);
+    this.discardUnusedFrames(space);
+    for (const frame of new Set(frames)) {
+      const shared = this.pageTables.spaces().some(other => [...this.pageTables.pageTable(other).values()].some(entry => entry.valid && entry.frame === frame));
+      if (!shared) this.freeFrame(frame);
+    }
+  }
+  allocateContiguous(pid: Pid, bytes: number) {
+    const result = this.holes.allocate(pid, bytes);
+    if (result.ok) this.host.emit({ type: 'memory.allocated', pid, frames: [], strategy: this.holes.strategy });
+    else this.host.emit({ type: 'memory.allocation_failed', pid, requested: bytes, reason: result.reason });
+    return result;
+  }
+  contiguousMetrics() { return contiguousFragmentation(this.holes.holes, this.holes.partitions); }
+  /** Byte-granular scenarios supply this alongside their page reservation. */
+  setRequestedBytes(space: AddressSpaceId, bytes: number): void {
+    memorySpace(space, 'requested address space'); memoryInteger(bytes, 'requested bytes');
+    this.requestedBytes.set(space, bytes);
+  }
+  metrics(): MemoryMetrics {
+    const allocations = this.pageTables.spaces().map(space => {
+      const resident = [...this.pageTables.pageTable(space).values()].filter(entry => entry.valid);
+      const requested = this.requestedBytes.get(space);
+      const bytesRequested = resident.reduce((sum, entry) => sum + (requested === undefined ? this.config.pageSize
+        : Math.min(this.config.pageSize, Math.max(0, requested - entry.page * this.config.pageSize))), 0);
+      return { framesHeld: resident.length, bytesRequested };
+    });
+    const fragmentation = pagingFragmentation(allocations, this.config.pageSize);
+    return {
+      totalFrames: this.config.totalFrames, freeFrames: this.frameTable.available,
+      externalFragmentation: fragmentation.externalFragmentation, internalFragmentation: fragmentation.internalFragmentation,
+      tlbHitRate: this.tlbHits + this.tlbMisses === 0 ? 0 : this.tlbHits / (this.tlbHits + this.tlbMisses),
+      // TODO(astra): WP-06 fills these fault, eviction and working-set metrics.
+      pageFaults: 0, majorFaults: 0, evictions: 0, writeBacks: 0, faultRate: 0, workingSets: new Map(),
+    };
+  }
+  context(rng: Rng, futureReferences: readonly PageId[] | null = null, space?: AddressSpaceId): MemoryContext {
+    const frames = this.frameTable.unpinnedFrames().flatMap(id => {
+      const frame = this.frameTable.frames[id];
+      return frame !== undefined && (this.replacementScope === 'global' || space === undefined || frame.owner === space) ? [frame] : [];
+    });
+    return { tick: this.host.tick(), rng, futureReferences, frames,
+      pageTable: address => this.pageTables.pageTable(address), emit: event => this.host.emit(event) };
+  }
+
+  saveState(): { memory: MemorySnapshotState; vm: VmSnapshotState } {
+    this.pruneTlb();
+    for (const frame of this.contents.keys()) if (this.frameTable.frames[frame]?.owner === null) this.contents.delete(frame);
+    return {
+      memory: { owner: 'memory', version: 1, payload: {
+        pageSize: this.config.pageSize, frames: this.frameTable.saveState(), pageTables: this.pageTables.saveState(), holes: this.holes.saveState(),
+        contents: [...this.contents].sort(([a], [b]) => a - b), nextContent: this.nextContent,
+        requestedBytes: [...this.requestedBytes].sort(([a], [b]) => a - b), ...this.framePolicy,
+      } },
+      vm: { owner: 'vm', version: 1, payload: {
+        tick: this.host.tick(), ...this.timing, tlb: this.tlb.saveState(), tlbHits: this.tlbHits, tlbMisses: this.tlbMisses,
+        pending: [...this.pending].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([key, value]) => ({ key, ...value })),
+      } },
+    };
+  }
+
+  /** All parsers complete before any current table, counter or live view changes. */
+  prepareRestore(memory: SubsystemEnvelope, vm: SubsystemEnvelope, tick: Tick = this.host.tick()): () => void {
+    if (memory.owner !== 'memory' || memory.version !== 1 || vm.owner !== 'vm' || vm.version !== 1) throw new Error('unsupported memory or vm snapshot');
+    const saved = memoryObject(memory.payload, 'contribution');
+    const virtual = memoryObject(vm.payload, 'vm contribution');
+    if (saved['pageSize'] !== this.config.pageSize || virtual['tick'] !== tick
+      || virtual['tlbHitTicks'] !== this.timing.tlbHitTicks || virtual['tlbMissTicks'] !== this.timing.tlbMissTicks) throw new Error('memory snapshot configuration or tick mismatch');
+    const nextFrames = new FrameTable(this.config.totalFrames, { freePoolRetain: this.frameTable.freePoolRetain });
+    nextFrames.restoreState(saved['frames']);
+    for (const frame of nextFrames.frames) {
+      if ((frame.loadedAtTick !== null && frame.loadedAtTick > tick) || (frame.lastAccessTick !== null && frame.lastAccessTick > tick)) throw new Error('saved frame timestamp exceeds snapshot tick');
+    }
+    const nextPages = new PageTable(); nextPages.restoreState(saved['pageTables']);
+    for (const space of nextPages.spaces()) {
+      for (const entry of nextPages.pageTable(space).values()) {
+        if (entry.lastAccessTick !== null && entry.lastAccessTick > tick) throw new Error('saved page timestamp exceeds snapshot tick');
+        if (entry.valid && (entry.frame === null || nextFrames.frames[entry.frame]?.owner === null || nextFrames.frames[entry.frame] === undefined || nextFrames.freePool.includes(entry.frame))) {
+          throw new Error('resident saved page has no frame');
+        }
+      }
+    }
+    const commitFrames = this.frameTable.prepareRestore(saved['frames']);
+    const commitPages = this.pageTables.prepareRestore(saved['pageTables']);
+    const nextHoles = new HoleList(this.holes.totalBytes, this.holes.strategy, this.holes.minBlock);
+    nextHoles.restoreState(saved['holes']);
+    const holes = nextHoles.saveState();
+    const nextTlb = new Tlb(this.config.tlbEntries, id => nextFrames.frames[id]);
+    nextTlb.restoreState(virtual['tlb'], tick);
+    for (const entry of nextTlb.entries) {
+      const pte = nextPages.get(entry.space, entry.page);
+      if (entry.valid && (pte?.valid !== true || pte.frame !== entry.frame)) throw new Error('saved TLB and page table disagree');
+    }
+    const commitTlb = this.tlb.prepareRestore(virtual['tlb'], tick, id => nextFrames.frames[id]);
+    const rations = saved['rations']; const scheme = saved['allocationScheme']; const scope = saved['replacementScope'];
+    if (!isRations(rations) || !isScheme(scheme) || !isScope(scope)) throw new Error('invalid saved frame policy');
+    const contents = new Map<FrameId, number>();
+    const nextContent = memoryInteger(saved['nextContent'], 'next content tag');
+    for (const value of memoryArray(saved['contents'], 'content tags')) {
+      const row = memoryArray(value, 'content tag');
+      const frame = asFrameId(memoryInteger(row[0], 'tag frame')); const tag = memoryInteger(row[1], 'content tag');
+      if (row.length !== 2 || contents.has(frame) || tag >= nextContent || nextFrames.frames[frame]?.owner === null || nextFrames.frames[frame] === undefined) throw new Error('invalid saved frame tag');
+      contents.set(frame, tag);
+    }
+    const requested = new Map<AddressSpaceId, number>();
+    for (const value of memoryArray(saved['requestedBytes'], 'requested byte counts')) {
+      const row = memoryArray(value, 'requested bytes'); const space = memorySpace(row[0], 'request space');
+      const bytes = memoryInteger(row[1], 'requested byte count');
+      if (row.length !== 2 || requested.has(space) || !nextPages.spaces().includes(space)) throw new Error('invalid saved byte request');
+      requested.set(space, bytes);
+    }
+    const pending = new Map<string, PendingAccess>();
+    for (const value of memoryArray(virtual['pending'], 'pending accesses')) {
+      const row = memoryObject(value, 'pending access'); const key = row['key'];
+      const pid = asPid(memoryInteger(row['pid'], 'pending pid', 2));
+      const page = asPageId(memoryInteger(row['page'], 'pending page'));
+      const remaining = memoryInteger(row['remaining'], 'remaining access ticks', 1);
+      const lastAttemptTick = asTick(memoryInteger(row['lastAttemptTick'], 'last access attempt'));
+      const pcb = this.host.process(pid);
+      if (typeof key !== 'string' || pending.has(key) || pcb === undefined || lastAttemptTick > tick || remaining >= Math.max(this.timing.tlbHitTicks, this.timing.tlbMissTicks)
+        || nextPages.get(pcb.addressSpaceId, page)?.valid !== true) throw new Error('invalid saved pending access');
+      pending.set(key, { pid, page, write: memoryBoolean(row['write'], 'access write flag'), remaining, lastAttemptTick });
+    }
+    const hits = memoryInteger(virtual['tlbHits'], 'TLB hits'); const misses = memoryInteger(virtual['tlbMisses'], 'TLB misses');
+    return () => {
+      commitFrames(); commitPages(); this.holes.restoreState(holes); commitTlb();
+      this.contents.clear(); for (const [frame, tag] of contents) this.contents.set(frame, tag);
+      this.requestedBytes.clear(); for (const [space, bytes] of requested) this.requestedBytes.set(space, bytes);
+      this.pending.clear(); for (const [key, value] of pending) this.pending.set(key, value);
+      this.nextContent = nextContent; this.tlbHits = hits; this.tlbMisses = misses;
+      this.rations = rations; this.allocationScheme = scheme; this.replacementScope = scope;
+    };
+  }
+  restoreState(memory: SubsystemEnvelope, vm: SubsystemEnvelope): void { this.prepareRestore(memory, vm)(); }
+  prepareKernelRestore(snapshot: KernelSnapshot): () => void {
+    const memory = snapshot.subsystems?.memory; const vm = snapshot.subsystems?.vm;
+    if (memory !== undefined && vm !== undefined) {
+      const commit = this.prepareRestore(memory, vm, snapshot.tick);
+      if (snapshot.config.totalFrames !== memory.payload.frames.totalFrames || snapshot.config.pageSize !== memory.payload.pageSize
+        || snapshot.config.tlbEntries !== vm.payload.tlb.entries.length || snapshot.config.allocationStrategy !== memory.payload.holes.strategy) {
+        throw new Error('memory contribution disagrees with snapshot configuration');
+      }
+      const pages = new PageTable(new Map(snapshot.pageTables.map(([space, entries]) => [space, entries.map(entry => ({ ...entry }))])));
+      if (!sameJson(memory.payload.frames.frames, snapshot.frames.map(frame => ({ ...frame }))) || !sameJson(memory.payload.pageTables, pages.saveState())) {
+        throw new Error('memory contribution disagrees with shared snapshot tables');
+      }
+      return commit;
+    }
+    if (memory !== undefined || vm !== undefined) throw new Error('memory and vm contributions must be restored together');
+    const empty = new MemorySubsystem(snapshot.config, { ...this.host, tick: () => snapshot.tick, pageTables: new Map() }, { tuning: this.timing });
+    empty.frameTable.restoreState({ totalFrames: snapshot.frames.length, freePoolRetain: 4,
+      frames: snapshot.frames, freePool: [], freeList: snapshot.frames.filter(frame => frame.owner === null).map(frame => frame.id) });
+    for (const [space, entries] of snapshot.pageTables) for (const entry of entries) empty.pageTables.set(space, { ...entry });
+    const state = empty.saveState();
+    return this.prepareRestore(state.memory, state.vm, snapshot.tick);
+  }
+
+
+  private discardUnusedFrames(space: AddressSpaceId): void {
+    for (const frame of this.frameTable.framesOf(space)) {
+      const mapped = this.pageTables.spaces().some(other => [...this.pageTables.pageTable(other).values()].some(entry => entry.valid && entry.frame === frame));
+      if (!mapped) this.freeFrame(frame);
+    }
+  }
+  private pruneTlb(): void {
+    for (const entry of this.tlb.entries) {
+      if (!entry.valid) continue;
+      const pte = this.pageTables.get(entry.space, entry.page);
+      const frame = this.frameTable.frames[entry.frame];
+      if (pte?.valid !== true || pte.frame !== entry.frame || frame?.owner !== entry.space || frame.page !== entry.page) this.tlb.shootdown(entry.frame);
+    }
+  }
+}
+
+function validatePolicy(rations: string, scheme: string, scope: string): void {
+  if (!['generous', 'standard', 'lean', 'starved'].includes(rations) || !['equal', 'proportional'].includes(scheme)
+    || !['local', 'global'].includes(scope)) throw new Error('invalid frame allocation policy');
+}
+
+function isRations(value: unknown): value is Rations { return value === 'generous' || value === 'standard' || value === 'lean' || value === 'starved'; }
+function isScheme(value: unknown): value is AllocationScheme { return value === 'equal' || value === 'proportional'; }
+function isScope(value: unknown): value is ReplacementScope { return value === 'local' || value === 'global'; }
+
+function jsonRecord(value: JsonValue | undefined): value is { readonly [key: string]: JsonValue } {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+function sameJson(a: JsonValue | undefined, b: JsonValue | undefined): boolean {
+  if (a === b) return true;
+  if (Array.isArray(a) && Array.isArray(b)) return a.length === b.length && a.every((value: JsonValue, index: number) => sameJson(value, b[index]));
+  if (!jsonRecord(a) || !jsonRecord(b)) return false;
+  const keys = Object.keys(a).sort((x, y) => x < y ? -1 : x > y ? 1 : 0); const other = Object.keys(b).sort((x, y) => x < y ? -1 : x > y ? 1 : 0);
+  return keys.length === other.length && keys.every((key, index) => key === other[index] && sameJson(a[key], b[key]));
+}
