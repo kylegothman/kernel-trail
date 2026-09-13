@@ -786,10 +786,10 @@ export type MemorySnapshotPayload = {
   readonly replacementScope: 'local' | 'global';
 };
 
-/** WP-05 translation cache and unfinished access costs; WP-06 extends fault state. */
+/** WP-06 demand paging, replacement and control state. Plain JSON only. */
 export interface VmSnapshotState {
   readonly owner: 'vm';
-  readonly version: 1;
+  readonly version: 2;
   readonly payload: {
     readonly tick: Tick;
     readonly tlbHitTicks: number;
@@ -806,6 +806,40 @@ export interface VmSnapshotState {
     };
     readonly tlbHits: number;
     readonly tlbMisses: number;
+    /** VM-disabled memory-only kernels retain the WP-05 admission behavior. */
+    readonly enabled: boolean;
+    readonly settings: VmSettingsSnapshot;
+    readonly replacement: VmReplacementState;
+    readonly demand: VmDemandState;
+    readonly counters: {
+      readonly pageFaults: number;
+      readonly majorFaults: number;
+      readonly evictions: number;
+      readonly writeBacks: number;
+      readonly faultsThisTick: number;
+      readonly faultAccumulator: number;
+      readonly lastMetricsTick: Tick | null;
+    };
+    readonly workingSets: {
+      readonly preciseEstimates: boolean;
+      readonly noiseDraws: number;
+      /** Canonical PID order; each ring is stored oldest reference first. */
+      readonly processes: readonly {
+        readonly pid: Pid;
+        readonly references: readonly PageId[];
+        readonly noise: number;
+        readonly nextNoiseTick: Tick;
+      }[];
+    };
+    readonly thrashing: VmThrashingState;
+    readonly controls: {
+      readonly prefetchCredits: readonly (readonly [Pid, number])[];
+      /** Persistent logical-reference remaps applied before translation/lookahead. */
+      readonly localityRemaps: readonly {
+        readonly pid: Pid;
+        readonly pages: readonly (readonly [PageId, PageId])[];
+      }[];
+    };
     readonly pending: readonly {
       readonly key: string;
       readonly pid: Pid;
@@ -816,6 +850,101 @@ export interface VmSnapshotState {
     }[];
   };
 }
+
+/** Parameters that affect VM continuation; validated against the installed tuning. */
+export type VmSettingsSnapshot = {
+  readonly minorFaultTicks: number;
+  readonly majorFaultTicks: number;
+  readonly workingSetWindow: number;
+  readonly faultRateWindow: number;
+  readonly lfuAging: number;
+  readonly thrashingThreshold: number;
+  readonly thrashingCriticalFaultMultiplier: number;
+  readonly thrashingCriticalDemandRatio: number;
+  readonly thrashingSuspendInterval: number;
+  readonly thrashingSuspendDuration: number;
+  readonly thrashingRecoveryTicks: number;
+  readonly thrashingControl: 'working_set' | 'pff';
+  readonly pffUpperBound: number;
+  readonly pffLowerBound: number;
+};
+
+/** Frame/PTE timestamps, LFU counts and reference bits remain in the memory slot. */
+export type VmReplacementState = {
+  readonly policy: PageReplacementId;
+  readonly order: readonly FrameId[];
+  readonly nextIndex: number;
+  readonly handIndex: number | null;
+  readonly lastAgingTick: Tick | null;
+};
+
+export type VmDemandState = {
+  readonly nextRequestId: number;
+  /** Queue order resolves simultaneous completions without consulting a Map. */
+  readonly requests: readonly {
+    readonly id: number;
+    readonly kind: 'major' | 'cow';
+    readonly pid: Pid;
+    readonly space: AddressSpaceId;
+    readonly page: PageId;
+    readonly write: boolean;
+    readonly faultTick: Tick;
+    readonly phase: 'queued' | 'write_back' | 'read' | 'copy';
+    readonly dueTick: Tick | null;
+    readonly frame: FrameId | null;
+    readonly sourceFrame: FrameId | null;
+    readonly victim: {
+      readonly space: AddressSpaceId;
+      readonly page: PageId;
+      readonly dirty: boolean;
+      readonly policy: PageReplacementId;
+    } | null;
+  }[];
+  /** One logical reference across faults and instruction retries, keyed by thread. */
+  readonly references: readonly {
+    readonly key: string;
+    readonly pid: Pid;
+    readonly space: AddressSpaceId;
+    readonly page: PageId;
+    readonly write: boolean;
+    readonly requestId: number | null;
+    readonly fault: 'none' | 'minor' | 'major';
+    readonly loaded: boolean;
+  }[];
+  /** Accounting markers only; backing mappings remain owned by the IPC slot. */
+  readonly sharedTouches: readonly {
+    readonly pid: Pid;
+    readonly space: AddressSpaceId;
+    readonly page: PageId;
+  }[];
+};
+
+export type VmThrashingState = {
+  readonly severity: 'healthy' | 'warning' | 'critical';
+  readonly healthyTicks: number;
+  readonly nextSuspendTick: Tick;
+  readonly nextResumeTick: Tick;
+  readonly degreeOfMultiprogramming: number;
+  /** Canonical PID order; per-thread prior waits survive whole-process suspension. */
+  readonly suspended: readonly {
+    readonly pid: Pid;
+    readonly suspendedAt: Tick;
+    readonly untilTick: Tick;
+    readonly previousState: 'ready' | 'running' | 'waiting';
+    readonly previousBlockedOn: BlockReason | null;
+    readonly threads: readonly {
+      readonly tid: Tid;
+      readonly state: 'ready' | 'running' | 'waiting' | 'terminated';
+      readonly blockedOn: BlockReason | null;
+    }[];
+  }[];
+  readonly pff: readonly {
+    readonly pid: Pid;
+    readonly frameBudget: number;
+    readonly faultTicks: readonly (readonly [Tick, number])[];
+    readonly nextAdjustmentTick: Tick;
+  }[];
+};
 
 /**
  * Compile-time proof that every SubsystemId has a slot above. Amendment 1 shipped

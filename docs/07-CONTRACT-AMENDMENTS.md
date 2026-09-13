@@ -300,6 +300,53 @@ implementation, as directed in the review. If another promotion takes amendment
 
 ---
 
+## Amendment 5, 2026-09-13: demand paging and VM continuation
+
+**Raised by:** the implementing WP-06 agent in the pre-flight grant review.
+**Approved by:** Kyle, explicitly approving the exact patch and human-approved
+hash regeneration before application.
+**Status:** applied on wp-06. Number 5 is provisional until merge order is known.
+
+### What was incomplete
+
+`VmSnapshotState` version 1 described only translation cache state and unfinished
+TLB access costs. Demand paging needs to preserve pending faults, replacement
+ordering, working-set measurements and suspension state across a restore.
+
+### What changed
+
+The exact reviewed patch promotes only the vm contribution to version 2. It
+retains its prior fields and adds installed settings, policy order/cursors and
+aging position, ordered paging requests and reserved frames, logical-reference
+accounting, fault counters, working-set rings and noise deadlines, thrashing and
+PFF control, prior waits for suspended threads, prefetch credits and locality
+remaps. The memory contribution remains version 1 and is unchanged.
+
+### Why this shape
+
+Every value is plain JSON. Frame and PTE metadata, retained-frame order and
+content tags remain in memory. The shared vm RNG remains in KernelSnapshot's RNG
+registry and is restored once; no second copy is placed in vm. Generated programs
+are eagerly materialized, so their instructions remain in the process slot.
+Suspension records retain original thread waits so recovery does not incorrectly
+release an I/O, semaphore or child wait. Request ordering and deadlines preserve
+fault-before-eviction-before-load events without serializing callbacks.
+
+### Consequences
+
+WP-06 writes vm version 2 and rejects explicit version 1 rather than guessing
+missing fault state. Restore continues to prepare and validate all contributions
+before committing. WP-11 still owns full workload reconstruction and must account
+for reserved page-in/write-back frames and suspension metadata alongside the
+retained-frame and shared/COW alias exceptions documented by WP-05.
+
+The PageId-only OPT lookahead remains a known limit for global OPT across address
+spaces; this amendment does not widen it. The approved contract and regenerated
+hash are committed separately from implementation. Renumber at merge if another
+package takes amendment 5 first.
+
+---
+
 # Package scope corrections
 
 Not contract changes, so no hash moves and no amendment number. Recorded here
