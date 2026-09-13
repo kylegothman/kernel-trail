@@ -4,7 +4,7 @@ import type { ProgramSpec } from '@kernel/process/Program';
 
 export const REFERENCE_CONFIG: KernelConfig = {
   seed: 0x4b54524c,
-  scheduler: 'rr',
+  scheduler: 'fcfs',
   schedulerParams: {
     quantum: 4, levelQuanta: [4, 8, 16], agingInterval: 50,
     starvationThreshold: 120, starvationFatalThreshold: 300, preemptive: true,

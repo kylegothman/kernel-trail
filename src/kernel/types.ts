@@ -730,12 +730,33 @@ export type SnapshotCompleteness = 'init_only' | 'full';
  */
 export interface SubsystemSnapshots {
   readonly process?: ProcessSnapshotState;
+  /** Amendment 3. Queues, quantum remaining, aging and starvation timers, and the
+   *  metrics accumulators, none of which SchedulerSnapshot carries: that type is a
+   *  read-only view for the HUD and the world, not a restore format. */
+  readonly scheduler?: SubsystemEnvelope;
   readonly memory?: SubsystemEnvelope;
+  /** Amendment 3. Demand paging state distinct from the frame table: the working
+   *  set window, the replacement policy's own ordering, and the fault counters. */
+  readonly vm?: SubsystemEnvelope;
   readonly sync?: SubsystemEnvelope;
+  /** Amendment 3. Detection interval position and the wait-for graph edges that
+   *  are not recoverable from the resource table alone. */
+  readonly deadlock?: SubsystemEnvelope;
   readonly storage?: SubsystemEnvelope;
+  /** Amendment 3. In-flight requests, interrupt queue, and DMA transfers. */
+  readonly io?: SubsystemEnvelope;
   readonly fs?: SubsystemEnvelope;
   readonly security?: SubsystemEnvelope;
 }
+
+/**
+ * Compile-time proof that every SubsystemId has a slot above. Amendment 1 shipped
+ * six slots for ten subsystems, and nothing caught it until WP-03 needed the
+ * seventh. This makes the next omission a type error instead of an escalation.
+ */
+type _EverySubsystemHasASlot = SubsystemId extends keyof SubsystemSnapshots ? true : never;
+const _subsystemSlotCheck: _EverySubsystemHasASlot = true;
+void _subsystemSlotCheck;
 
 /**
  * A subsystem's own serialisable state, opaque to everything except that

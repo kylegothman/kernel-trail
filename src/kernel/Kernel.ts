@@ -1,7 +1,9 @@
 /** KERNEL TRAIL: deterministic process engine and eleven-phase orchestrator. */
 import { KernelEventBus, type EmittableEvent } from './EventBus';
 import { createStreams, type StreamRegistry } from './rngStreams';
-import { createScheduler, isMetricsAware, isRunningAware } from './scheduler/SchedulerRegistry';
+import { createScheduler, configureSchedulerWorkload, isMetricsAware, isRunningAware } from './scheduler/SchedulerRegistry';
+import { createSchedulerHooks } from './scheduler/starvation';
+import { SchedulingAccounting } from './scheduler/metrics';
 import { KernelInvariantError } from './errors';
 import { DEFAULT_TUNING, resolveTuning, validateConfig, type KernelTuning } from './config';
 import { ProcessTable } from './process/ProcessTable';
@@ -47,7 +49,7 @@ import type {
   SyscallRequest,
   SyscallResult,
   Tick,
-  Tid, BlockReason, DomainId, FileDescriptor, DeviceId, AccessRight, Unsubscribe, SchedulerSnapshot,
+  Tid, BlockReason, DomainId, FileDescriptor, DeviceId, AccessRight, Unsubscribe,
 } from './types';
 import { asFrameId, asTick, asPid, asPageId } from './types';
 
@@ -135,47 +137,17 @@ export interface SecurityHooks { rights(pid: Pid, resource: ResourceId): readonl
 export interface DeadlockHooks { maybeDetect(tick: Tick): void }
 // SchedulerPolicy has no aging member. Keep this hook separate from the contract.
 export interface SchedulerHooks { ageAndDetectStarvation(ctx: SchedulerContext): void }
+export interface MetricsHooks {
+  scheduler(tick: Tick): SchedulingMetrics;
+  memory(tick: Tick): MemoryMetrics;
+}
 export interface InvariantHooks { check(kernel: KernelImpl): void }
 export interface KernelHooks {
   memory: Partial<MemoryHooks>; sync: Partial<SyncHooks>; io: Partial<IoHooks>;
   storage: Partial<StorageHooks>; fs: Partial<FsHooks>; security: Partial<SecurityHooks>;
-  deadlock: Partial<DeadlockHooks>; scheduler: Partial<SchedulerHooks>; invariants: InvariantHooks;
+  deadlock: Partial<DeadlockHooks>; scheduler: Partial<SchedulerHooks>; metrics: Partial<MetricsHooks>; invariants: InvariantHooks;
 }
 const noop = (): void => {};
-
-// TODO(astra): replaced by the scheduler registry in WP-03
-class BootstrapFcfs implements SchedulerPolicy {
-  readonly id = 'fcfs';
-  readonly displayName = 'Bootstrap FCFS';
-  readonly isPreemptive = false;
-  private readonly queue: Pid[] = [];
-  private running: Pid | null = null;
-  private metrics: SchedulingMetrics = EMPTY_SCHEDULING_METRICS;
-  private readonly view: SchedulerSnapshot;
-  constructor() {
-    const self = this;
-    this.view = { policy: 'fcfs', queues: [this.queue], quantumRemaining: 0,
-      get running() { return self.running; }, get metrics() { return self.metrics; } };
-  }
-  configure(_params: SchedulerParams): void {}
-  onAdmit(pcb: ProcessControlBlock, _ctx: SchedulerContext): void { this.enqueue(pcb.pid); }
-  onUnblock(pcb: ProcessControlBlock, _ctx: SchedulerContext): void { this.enqueue(pcb.pid); }
-  onBlock(pcb: ProcessControlBlock, _ctx: SchedulerContext): void { this.remove(pcb.pid); }
-  onExit(pcb: ProcessControlBlock, _ctx: SchedulerContext): void { this.remove(pcb.pid); }
-  onTick(ctx: SchedulerContext) {
-    const current = ctx.running === null ? undefined : ctx.process(ctx.running);
-    const next = current?.state === 'running' ? current.pid : this.queue.shift() ?? null;
-    return { next, isContextSwitch: next !== ctx.running, rationale: 'FCFS: earliest ready process' };
-  }
-  snapshot(): SchedulerSnapshot { return this.view; }
-  setRunning(pid: Pid | null): void { this.running = pid; }
-  acceptMetrics(metrics: SchedulingMetrics): void { this.metrics = metrics; }
-  private enqueue(pid: Pid): void { if (!this.queue.includes(pid)) this.queue.push(pid); }
-  private remove(pid: Pid): void {
-    const index = this.queue.indexOf(pid);
-    if (index >= 0) this.queue.splice(index, 1);
-  }
-}
 
 export class KernelImpl implements Kernel {
   private currentConfig: Readonly<KernelConfig>;
@@ -201,6 +173,7 @@ export class KernelImpl implements Kernel {
   private readonly admittedThisTick = new Set<Pid>();
   private nextSpace = 2;
   private running: Pid | null = null;
+  private readonly readyQueue: Pid[] = [];
   private lastCpuOwner: Pid | null = null;
   private executingThread: Tid | undefined;
   private sliceElapsed = 0;
@@ -243,8 +216,20 @@ export class KernelImpl implements Kernel {
   private security: SecurityHooks = { rights: () => [] };
   // TODO(astra): WP-08 supplies periodic wait-for graph detection.
   private deadlock: DeadlockHooks = { maybeDetect: noop };
-  // TODO(astra): WP-03 supplies aging and starvation detection.
-  private schedulerHooks: SchedulerHooks = { ageAndDetectStarvation: noop };
+  private schedulerHooks: SchedulerHooks = createSchedulerHooks(() => this.scheduler, {
+    emit: event => this.publish(event),
+    terminate: pcb => {
+      this.schedulingAccounting.complete(pcb, asTick(this.tick - 1));
+      this.lifecycle.exit(pcb, -1, 'starvation');
+    },
+  });
+  private readonly schedulingAccounting = new SchedulingAccounting();
+  private metricsHooks: MetricsHooks = {
+    scheduler: tick => this.schedulingAccounting.recompute(tick, this.processes, this.contextSwitches, this.scheduler),
+    // TODO(astra): WP-05 registers its metrics hook here
+    memory: () => ({ ...EMPTY_MEMORY_METRICS, totalFrames: this.frames.length,
+      freeFrames: this.freeList.length, workingSets: new Map() }),
+  };
   // TODO(astra): WP-11 extends the existing invariant harness to the full set.
   private invariants: InvariantHooks = { check: kernel => kernel.checkInvariants() };
 
@@ -335,6 +320,7 @@ export class KernelImpl implements Kernel {
     this.fs = { ...this.fs, ...hooks.fs }; this.security = { ...this.security, ...hooks.security };
     this.deadlock = { ...this.deadlock, ...hooks.deadlock };
     this.schedulerHooks = { ...this.schedulerHooks, ...hooks.scheduler };
+    this.metricsHooks = { ...this.metricsHooks, ...hooks.metrics };
     if (hooks.invariants !== undefined) this.invariants = hooks.invariants;
   }
 
@@ -635,6 +621,7 @@ export class KernelImpl implements Kernel {
     const delivered = this.threads.deliver(pcb, thread => this.execute(pcb, thread));
     this.executingThread = undefined;
     if (delivered === null) return;
+    this.schedulingAccounting.accountBusyTick();
     this.sliceElapsed += 1;
     if (pcb.state === 'running' && pcb.serviceRemaining === 0) this.lifecycle.exit(pcb, 0);
     else if (pcb.cpuBurstRemaining === 0 && pcb.serviceRemaining > 0 && !['zombie', 'terminated'].includes(pcb.state)) {
@@ -685,19 +672,9 @@ export class KernelImpl implements Kernel {
   }
   private phase10_updateMetrics(): void {
     this.probe(10);
-    let cpu = 0; let finished = 0; let worstWait = 0;
-    this.table.forEachAscending(pcb => {
-      if (pcb.pid <= 1) return;
-      cpu += pcb.totalCpuUsed;
-      if (pcb.state === 'zombie' || pcb.state === 'terminated') finished += 1;
-      if (pcb.readySince !== null) worstWait = Math.max(worstWait, this.tick - pcb.readySince);
-    });
-    this.schedulingMetrics = { ...EMPTY_SCHEDULING_METRICS,
-      cpuUtilisation: this.tick === 0 ? 0 : cpu / this.tick,
-      contextSwitches: this.contextSwitches, throughput: this.tick === 0 ? 0 : finished / this.tick, worstWait };
+    if (this.enabled.has('scheduler')) this.schedulingMetrics = this.metricsHooks.scheduler(this.tick);
     this.rebuildFreeList();
-    // TODO(astra): WP-05 and WP-06 compute memory metrics beyond frame conservation.
-    this.memoryMetrics = { ...EMPTY_MEMORY_METRICS, totalFrames: this.frames.length, freeFrames: this.freeList.length, workingSets: new Map() };
+    if (this.enabled.has('memory') || this.enabled.has('vm')) this.memoryMetrics = this.metricsHooks.memory(this.tick);
     this.syncSchedulerView();
   }
   private phase11_checkInvariants(): void {
@@ -706,9 +683,20 @@ export class KernelImpl implements Kernel {
   private move(pcb: ProcessControlBlock, to: ProcessState, options: TransitionOptions = {}): void {
     transition(pcb, to, { ...options, tick: this.tick, emit: event => this.publish(event),
       parentOf: pid => this.table.parentOf(pid), markCreated: pid => this.table.markCreated(pid),
-      onAdmit: p => this.scheduler.onAdmit(p, this.schedulerContext()),
-      onDispatch: p => { this.running = p.pid; },
-      onReady: p => { if (this.running === p.pid) this.running = null; this.scheduler.onUnblock(p, this.schedulerContext()); },
+      onAdmit: p => {
+        this.readyQueue.push(p.pid);
+        this.scheduler.onAdmit(p, this.schedulerContext());
+      },
+      onDispatch: p => {
+        this.running = p.pid;
+        this.removeReady(p.pid);
+        this.schedulingAccounting.dispatch(p, asTick(this.tick - 1));
+      },
+      onReady: p => {
+        if (this.running === p.pid) this.running = null;
+        this.readyQueue.push(p.pid);
+        this.scheduler.onUnblock(p, this.schedulerContext());
+      },
       onBlock: p => {
         if (this.running === p.pid) this.running = null;
         if (p.blockedOn !== null && !p.threads.some(tid => this.threads.table.get(tid)?.state === 'waiting')) {
@@ -717,8 +705,13 @@ export class KernelImpl implements Kernel {
         }
         this.scheduler.onBlock(p, this.schedulerContext());
       },
-      onUnblock: p => this.scheduler.onUnblock(p, this.schedulerContext()),
+      onUnblock: p => {
+        this.readyQueue.push(p.pid);
+        this.scheduler.onUnblock(p, this.schedulerContext());
+      },
       onExit: p => {
+        this.removeReady(p.pid);
+        this.schedulingAccounting.complete(p, this.tick);
         if (this.running === p.pid) this.running = null;
         this.scheduler.onExit(p, this.schedulerContext()); this.lifecycle.cleanupExit(p);
       },
@@ -732,17 +725,24 @@ export class KernelImpl implements Kernel {
     return tid === undefined ? 0 : this.threads.table.get(tid)?.programCounter ?? 0;
   }
   private makeScheduler(id: SchedulerId, params: SchedulerParams = this.schedulerParams): SchedulerPolicy {
-    // TODO(astra): WP-04 provides RR. The reference configuration temporarily runs bootstrap FCFS.
-    return id === 'fcfs' || id === 'rr' ? new BootstrapFcfs() : createScheduler(id, params);
+    const policy = createScheduler(id, params);
+    configureSchedulerWorkload(policy, pid => this.burstSizes.get(pid));
+    return policy;
   }
   private syncSchedulerView(): void {
     if (isRunningAware(this.scheduler)) this.scheduler.setRunning(this.running);
     if (isMetricsAware(this.scheduler)) this.scheduler.acceptMetrics(this.schedulingMetrics);
   }
+  private removeReady(pid: Pid): void {
+    const index = this.readyQueue.indexOf(pid);
+    if (index >= 0) this.readyQueue.splice(index, 1);
+  }
   private schedulerContext(): SchedulerContext {
-    return { tick: this.tick, rng: this.rng.streams.get('scheduler') ?? this.rng.root,
+    const rng = this.rng.streams.get('scheduler');
+    if (rng === undefined) throw new Error('scheduler RNG stream missing');
+    return { tick: this.tick, rng,
       params: this.schedulerParams, running: this.running, sliceElapsed: this.sliceElapsed,
-      process: pid => this.table.get(pid), readyQueue: this.table.filterAscending(p => p.pid > 1 && p.state === 'ready').map(p => p.pid),
+      process: pid => this.table.get(pid), readyQueue: this.readyQueue,
       emit: event => this.publish(event) };
   }
   private basePcb(pid: Pid, parent: Pid | null, name: string): ProcessControlBlock {

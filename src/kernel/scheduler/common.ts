@@ -16,17 +16,7 @@ import type {
   SchedulingMetrics,
 } from '../types';
 
-/**
- * The universal tie-break. Sim spec 5.1: wherever a policy's primary key ties,
- * order by lower `arrivalTick` first, then lower `pid`. Both are total orders
- * over live processes, so the combined key never ties. Every comparator in
- * every policy must fall through to this, and sorting must always be done with
- * an explicit comparator (sim spec 1.3 forbids a bare `Array.prototype.sort`).
- */
-export function tieBreak(a: ProcessControlBlock, b: ProcessControlBlock): number {
-  if (a.arrivalTick !== b.arrivalTick) return a.arrivalTick - b.arrivalTick;
-  return a.pid - b.pid;
-}
+export { tieBreak } from './tieBreak';
 
 /**
  * Metrics before the kernel has computed any. Sim spec 5.10 recomputes
@@ -65,7 +55,7 @@ export interface MetricsAwarePolicy extends SchedulerPolicy {
 }
 
 export function isMetricsAware(policy: SchedulerPolicy): policy is MetricsAwarePolicy {
-  return typeof (policy as Partial<MetricsAwarePolicy>).acceptMetrics === 'function';
+  return 'acceptMetrics' in policy && typeof policy.acceptMetrics === 'function';
 }
 
 /**
@@ -77,5 +67,5 @@ export interface RunningAwarePolicy extends SchedulerPolicy {
 }
 
 export function isRunningAware(policy: SchedulerPolicy): policy is RunningAwarePolicy {
-  return typeof (policy as Partial<RunningAwarePolicy>).setRunning === 'function';
+  return 'setRunning' in policy && typeof policy.setRunning === 'function';
 }

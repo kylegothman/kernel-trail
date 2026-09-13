@@ -25,7 +25,7 @@ import { stripComments } from './sourceScan';
 /** The exact reference configuration from sim spec 16.1. */
 const CONFIG: KernelConfig = {
   seed: 0x4b54524c,
-  scheduler: 'rr',
+  scheduler: 'fcfs',
   schedulerParams: {
     quantum: 4,
     levelQuanta: [4, 8, 16],

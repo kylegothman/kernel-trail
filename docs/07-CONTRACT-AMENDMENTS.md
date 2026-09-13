@@ -178,6 +178,64 @@ replaced:
 
 ---
 
+## Amendment 3, 2026-09-13: the slots amendment 1 forgot
+
+**Raised by:** the implementing agent, at the close of WP-03.
+**Approved by:** Kyle.
+**Status:** applied. `contracts.lock.json` amendment 3.
+
+### What was wrong
+
+`SubsystemId` has ten values. Amendment 1 gave `SubsystemSnapshots` six slots. The
+four missing were `scheduler`, `vm`, `deadlock` and `io`.
+
+WP-03 built the scheduler, went to persist its queues, quantum, aging and
+starvation timers and metrics accumulators, and found no slot. It stubbed and
+escalated, correctly.
+
+This is worth being blunt about. Amendment 1 existed specifically to fix a missing
+state channel, and it shipped one day before this, and it under-populated the
+channel it was created to add. Four defects of the same shape have now been found
+by escalation: the WP-01 scanner policy, the WP-02 snapshot channel, the WP-03
+phase 10 scope, and this. Every one was a case of specifying an outcome in one
+place and the means in another, then not reconciling them.
+
+`SchedulerSnapshot` already exists and is not the answer. It is a read-only view
+for the HUD and the world, deliberately cheap to produce every tick. It carries
+computed averages rather than the accumulators behind them, and it has no aging or
+starvation state at all. Restoring from it would silently reset a run's history.
+
+### What changed
+
+Four slots added, each an envelope, plus the thing that matters more:
+
+```ts
+type _EverySubsystemHasASlot = SubsystemId extends keyof SubsystemSnapshots ? true : never;
+const _subsystemSlotCheck: _EverySubsystemHasASlot = true;
+```
+
+A missing slot is now a compile error rather than an escalation four weeks later.
+That check is the actual deliverable of this amendment. The slots are the symptom.
+
+### Why the scheduler slot is an envelope and not typed
+
+WP-04 still has to add priority aging, round robin and three-level MLFQ, and MLFQ
+per-level state does not exist yet. Typing the scheduler contribution now would
+mean guessing at it and amending a fourth time. WP-04 promotes it to a typed
+interface when the scheduler is complete, and records that here.
+
+### Consequences
+
+- **WP-03** gets a follow-up: fill the `scheduler` envelope and remove the
+  persistence stub. Its four gates already pass, so this is additive.
+- **WP-04** promotes the scheduler envelope to a typed interface when it lands.
+- **WP-05, WP-07, WP-09** each now have a slot that exists, so the obligation in
+  their kickoff card is satisfiable. WP-05 owns both `memory` and `vm`.
+- **WP-11** reconstructs all ten, and its restore completeness check now has ten
+  slots to validate rather than six.
+
+---
+
 # Package scope corrections
 
 Not contract changes, so no hash moves and no amendment number. Recorded here
