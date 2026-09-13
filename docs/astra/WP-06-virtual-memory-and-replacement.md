@@ -152,6 +152,124 @@ Events this package emits, from the frozen union:
 | (EventBase & { type: 'security.access_denied'; domain: DomainId; object: string; right: AccessRight })
 ```
 
+## Inherited from WP-05
+
+Everything below comes from WP-05's completion report or from the source it left in
+`src/kernel/memory/`. Signatures are quoted, not paraphrased.
+
+### The demand paging hook
+
+The exact hook exported by `MemorySubsystem.ts` is:
+
+```ts
+export interface DemandPagingHooks {
+  /** Pending major faults return false; synchronous minor faults return true. */
+  fault(pid: Pid, page: PageId, write: boolean): { readonly hit: boolean };
+  expireTimers?(tick: Tick): void;
+}
+```
+
+Install with `memorySubsystem.setDemandPaging(hooks)`. The default `fault` throws
+`not implemented: page fault` and names WP-06 in its TODO. `expireTimers` is
+reached through the existing memory phase dispatch. A successful fault callback must
+leave a valid resident PTE.
+
+### Loading, reclaiming and choosing candidates
+
+- `loadPage(space, page, pinned?)` installs the mapping and refreshes shared
+  mappings. Load through it rather than writing a PTE by hand.
+- `reclaim(space, page)` retrieves an exact retained page from the free pool.
+- `shootdown(frame)` on the TLB invalidates every entry naming that frame. Use it
+  alongside the PTE transition on every replacement.
+- `unpinnedFrames()` excludes free, retained and pinned entries.
+- `context(rng, futureReferences, space?)` supplies the live tables and the
+  replacement candidates under the selected scope. The default scope is local.
+  **Supply the faulting address space to enforce local replacement; omitting
+  `space` exposes all eligible frames.** That argument is the whole local/global
+  switch, so a global-replacement leg omits it and a local one does not.
+
+Use the live `frameTable`, `pageTables` and `tlb`. The page tables adapt the
+kernel's existing `Map<AddressSpaceId, PageTableEntry[]>`, so lifecycle and IPC
+direct edits stay visible through held views. Lifecycle owns `cowRefCount`; no
+field was added to the PCB or to `Frame`. `copyFrame` copies a deterministic content
+tag. Shared frames remain pinned, and `loadPage` invokes the supplied IPC refresh
+callback.
+
+### Retained free-pool semantics
+
+`FrameTable.free(frame, true)` retains evicted contents in the free pool, which is
+what makes reclaim-from-pool a minor fault. The lifecycle-facing
+`MemoryHooks.freeFrame` discards during teardown instead. Allocation consumes the
+ascending free list before it touches retained frames. Retained mappings are ordered
+by eviction, default capacity four. Newer retained copies supersede obsolete copies
+of the same logical page, and active COW frames sharing owner and page remain valid.
+Coordinate PTE invalidation and TLB shootdown around retained eviction and reclaim.
+
+### The ordering trap
+
+The kernel publishes the major-fault event **after** the fault callback returns.
+Defer the associated eviction and load events to later service so that
+fault-before-eviction and fault-before-load ordering is preserved, or integrate that
+ordering explicitly when you implement demand paging. Emitting an eviction from
+inside `fault` puts it in front of the fault that caused it.
+
+### Fault ownership, in full
+
+- The `MemoryHooks.access` result answers whether the page is available. It does
+  not report whether the TLB lookup hit. The access event's `hit` field records the
+  TLB result, and `MemorySubsystem` owns both `tlb.miss` and `memory.access`.
+- A resident TLB miss therefore returns `{ hit: true }` and never becomes a page
+  fault. It costs `tlbMissTicks` and nothing else.
+- The kernel remains the sole emitter of a pending major fault when `access`
+  returns `{ hit: false }`, and it blocks the process.
+- The existing COW lifecycle remains the sole emitter of its minor fault and its
+  load. It runs before memory access and does not route through
+  `DemandPagingHooks`.
+- A future synchronous minor-fault service returns `{ hit: true }` and owns its own
+  minor and load events. A pending major service returns false and leaves the major
+  event to the kernel.
+
+That is the existing return-value boundary and it exists to stop two layers
+reporting the same fault. Two tests enforce it: `emits one major fault while a page
+is pending and gates the successful resident retry`, and `COW with the real frame
+table emits exactly one minor fault and one load before the write retires`.
+
+I-9 is satisfied by construction because install and lookup require the cached
+owner and page to agree with the live frame, and the subsystem removes entries
+inconsistent with the live PTE. A COW or shared alias whose frame has a different
+owner or page remains a valid PTE access but is not cached. Context switches do not
+flush.
+
+### What `metrics()` leaves for you
+
+`metrics()` computes resident paging fragmentation, frame use and TLB hit rate.
+These `MemoryMetrics` fields are zero or empty with a WP-06 TODO and are yours to
+populate: `pageFaults`, `majorFaults`, `evictions`, `writeBacks`, `faultRate`, and
+`workingSets`, which is an empty map. `contiguousMetrics()` exposes the parallel
+contiguous model and is not yours. `setRequestedBytes(space, bytes)` supports
+byte-granular internal fragmentation; default admission uses declared pages.
+
+### Frame policy without replacement
+
+`setFramePolicy` carries the rations setting, the equal or proportional allocation
+scheme, and the local or global replacement scope, without implementing replacement
+policy. WP-05 recorded the selected allocation parameters and stopped there, so
+`replacementScope` and `allocationScheme` are pre-declared territory that you
+implement. Suggested quotas clamp to the three-frame minimum when capacity allows;
+explicit budget validation throws in development and clamps in production; for
+physical capacity below three the quota is capped at actual capacity.
+
+### Persistence you extend
+
+`subsystems.memory` and `subsystems.vm` are now typed as `MemorySnapshotState` and
+`VmSnapshotState`, both version 1, per amendment 4. The vm payload holds the
+ASID-tagged TLB slots in replacement order, the lookup counters, the TLB timing and
+the pending instruction access costs. Extend it with demand-fault service state,
+replacement ordering, fault counters and working-set state, and version the shape
+when you change it. The mapped types over `Frame` and `PageTableEntry` couple that
+save format to frozen interfaces, so review the persisted shape whenever either
+moves.
+
 ## Specification
 
 ### 1. `src/kernel/memory/demandPaging.ts`

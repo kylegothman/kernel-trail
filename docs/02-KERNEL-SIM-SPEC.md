@@ -2504,7 +2504,7 @@ reports which one a given scenario violates.
 1. **Mutual exclusion.** If process `P` is executing in its critical section,
    no other process executes in theirs. *Checked by:* a per-primitive counter
    `inCriticalSection` that must never exceed the primitive's capacity.
-   Invariant I-20.
+   Invariant I-21.
 2. **Progress.** If no process is in its critical section and some processes want
    to enter, only those not in their remainder section participate in deciding
    who enters next, and the decision cannot be postponed indefinitely.
@@ -2946,7 +2946,7 @@ consumers each consuming 30 items. Producer service time per item is 3 ticks,
 consumer 2 ticks. Assertions after 10,000 ticks:
 
 - items produced === items consumed === 60
-- buffer occupancy is always in `[0, 4]` (invariant I-21)
+- buffer occupancy is always in `[0, 4]` (invariant I-22)
 - `empty.value + full.value + (processes inside the critical section) === 4`
 - zero `sync.race_detected` events
 
@@ -5651,7 +5651,7 @@ stack-algorithm property.
 | `SYNC-BB-DEADLOCK` | producer takes mutex before empty | `deadlock.detected` with a cycle of exactly 2 pids |
 | `SYNC-RW-STARVE` | reader-preferring, 6 readers, 1 writer | exactly one `process.starving { fatal: true }`, naming the writer |
 | `SYNC-RW-WRITERPREF` | writer-preferring, same workload | the writer completes; a reader is the longest waiter |
-| `SYNC-PHIL-NAIVE` | 5 philosophers, left-then-right, q=1 | `deadlock.detected` by tick 200 with a cycle of exactly 5 pids; `conditions` contains all four Coffman values |
+| `SYNC-PHIL-NAIVE` | 5 philosophers, left-then-right, q=1 | `deadlock.detected` by tick 200 with a cycle of exactly 5 pids; `conditions` contains all four Coffman values. Requires WP-08: only the deadlock subsystem emits that event, so under WP-07 alone this scenario asserts the circular wait and nothing more |
 | `SYNC-PHIL-ASYM` | odd philosophers take right first | zero `deadlock.detected` over 20,000 ticks |
 | `SYNC-PHIL-ROOM` | semaphore `room` capacity 4 | zero `deadlock.detected` over 20,000 ticks |
 | `SYNC-PHIL-MONITOR` | the Ch. 7.1.3 monitor | zero deadlocks; at least one philosopher crosses `starvationThreshold` |

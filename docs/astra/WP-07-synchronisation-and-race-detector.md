@@ -76,6 +76,122 @@ src/kernel/index.ts    (no new export required; leave it alone unless the barrel
 
 Nothing else.
 
+### Scope correction, 2026-09-13
+
+Raised by the audit of this package against its own specification and against the
+current `Kernel.ts`, `config.ts` and syscall dispatch, before the package started.
+The grant above excluded seven things this package itself requires. This is the
+same defect shape that produced the five escalations recorded in
+`docs/07-CONTRACT-AMENDMENTS.md` under "Package scope corrections". Approved as
+follows, shaped for WP-09, which runs at the same time and edits the same four
+shared files.
+
+**The four synchronisation syscall branches.** `sem_wait`, `sem_post`,
+`mutex_lock` and `mutex_unlock` are rows of sim spec 14.3 and this package owns
+their semantics, but `dispatchSyscall` in `Kernel.ts` currently ends at a default
+branch returning `EINVAL` with `not implemented in WP-02`, so none of them is
+reachable. Add exactly those four cases and nothing else. Each one routes into
+`SyncSubsystem` and returns the value sim spec 14.3 states for it. Unknown or
+malformed input returns `EINVAL`. Mark every branch
+`// TODO(astra): WP-11 validates <call> arguments`, because WP-11 owns the full
+table and the arity, type, range and rights checks of sim spec 14.2, and will
+rebase onto these branches.
+
+**`request` and `release` are not yours.** Both are rows of sim spec 14.3, but
+every one of their four `deadlockStrategy` paths operates on the `ResourceType`
+table, and WP-08 owns that table outright (`src/kernel/deadlock/resources.ts`,
+the `Map<ResourceId, ResourceType>` and its sorted id list). Nothing in the tree
+constructs a `ResourceType` today because its owner has not started. Do not add
+either syscall branch, do not create a resource table, and do not route these
+calls into `SyncSubsystem`. Leave the default branch as it is. Your grant is the
+four sync branches above, not six.
+
+**Snapshot save and restore for the `sync` slot.** Required by acceptance
+criterion 21 and by amendment 1. Register through `installHooks({ snapshots })`
+using `saveState` and `restoreState`, exactly as WP-05 left it. `restoreState`
+validates the envelope, captures detached state, and returns a commit closure;
+it mutates nothing during preparation, because the kernel prepares every
+contribution before it changes any state. Add no hard-coded slot key to the
+snapshot object literal. Duplicate slot ownership is rejected, so register the
+`sync` slot once.
+
+**Publishing the primitive table into the shared snapshot tables.** Both
+`snapshot()` and the existing invariant check read the private `syncPrimitives`
+field on `KernelImpl`, which no code writes outside `restore`. Wiring `SyncHooks`
+alone leaves it permanently empty, so `KernelSnapshot.syncPrimitives` stays empty
+and invariants I-10, I-21 and I-23 have nothing to check. Bind the live array in
+the existing initialisation helper, the way WP-05 bound the frame and TLB views
+there, and rebind it after a restore commit. Bind the live array itself rather
+than copying per call, so direct edits stay visible.
+
+**A once-per-tick phase-4 entry point for priority inversion.** Sim spec 8.5
+detects the inversion in phase 4, and `SyncHooks` has no member that phase 4
+calls once per tick: `isSatisfied` is called per waiting thread, only for
+`semaphore`, `mutex` and `condition` reasons, and only while the `process`
+subsystem is enabled. Do not edit the phase 4 body. Run detection from the first
+`isSatisfied` call of a tick, guarded by a last-seen tick held in the subsystem.
+If that cannot produce the ordering sim spec 8.5 requires, escalate for a new
+`SyncHooks` member rather than touching the phase.
+
+**Construction wiring.** Constructing `SyncSubsystem` in the kernel constructor
+is part of wiring `SyncHooks`, and it includes handing the subsystem its emit
+callback and its `root/sync` stream, taken from the stream registry the same way
+`schedulerContext()` takes the `scheduler` stream. `kernel.panic` for a progress
+violation and `process.starving` for a bounded-waiting violation both travel on
+that emit callback.
+
+**`src/kernel/config.ts`, additive only.** This package names or implies six
+tuning knobs that do not exist. Add exactly these keys to `KernelTuning`, with
+defaults, and validate each with the pattern the existing knobs use:
+
+| Key | Default | Source |
+|---|---|---|
+| `progressStallLimit` | 4 | sim spec 8.1, requirement 2 |
+| `boundedWaitLimit` | 0, meaning "the contending process count" | sim spec 8.1, requirement 3 |
+| `spinWaitTicks` | 1 | sim spec 8.3, one tick per spin iteration |
+| `storeBufferDepth` | 2 | sim spec 8.2, `MemoryOrderModel` |
+| `priorityInheritance` | false | sim spec 8.5 |
+| `rwlockPolicy` | `'writer_pref'` | sim spec 8.4 and 8.8 |
+
+The three integer knobs use the existing integer check. `priorityInheritance` is
+a boolean and `rwlockPolicy` is a literal union, so validate them the way
+`threadModel` and `checkInvariants` are validated rather than inventing a new
+helper. `boundedWaitLimit` at 0 means the Ch. 6.2 bound rather than a limit of
+zero, so comment it. Do not reformat anything, and do not touch a key you did not
+add: this file is shared with WP-09, which is adding its own keys at the same
+time.
+
+Spin ticks must count as CPU busy per sim spec 8.3, and neither
+`src/kernel/scheduler/metrics.ts` nor the phase 10 registration site is in this
+grant. Model each spin iteration as an instruction that consumes service, so the
+existing phase 8 accounting charges it without any edit. If that cannot be done,
+escalate. A separate `spin%` column is a terminal concern and stays out.
+
+**Metrics recomputation.** There is no `SyncMetrics` type in the frozen contract
+and `MetricsHooks` carries only `scheduler` and `memory`, so this package
+registers no metrics hook. If one becomes necessary, register at the existing
+phase 10 dispatch site and look for the registration marker. Phase 10 itself is
+not edited.
+
+**What stays out.** The eleven ordered phase bodies are not edited; anything that
+would require it is an escalation. `src/kernel/scheduler/**`,
+`src/kernel/memory/**`, `src/kernel/deadlock/**` and `invariants.ts` stay out.
+WP-09 is in flight and owns `src/kernel/storage/**`, `src/kernel/io/**`, the
+`storage` and `io` snapshot slots, the `ioctl` and `sync` syscall branches, the
+`setDiskPolicy` implementation, phases 2 and 3 wiring, the `DISK_POLICIES` export
+in `index.ts` and its own `config.ts` keys. Do not touch any of those, and do not
+reorder or reformat the lines they will add.
+
+**Two things WP-05 warns about, and they apply here.** First, installing runtime
+hooks still trips WP-02's init-only snapshot guard: `installHooks` sets the
+guard flag for every key except `snapshots`, so a kernel with `sync` hooks
+installed refuses `snapshot()` and `restore()`. The round-trip test for criterion
+21 must therefore register snapshot-only, through `installHooks({ snapshots })`
+with no other key, which is the one case the guard allows. Second, the generic
+snapshot dispatch does not finish WP-11's workload persistence: the process
+contribution, the completeness check and the removal of the guard stay WP-11's,
+and its throwing assertions remain in place.
+
 ## Frozen contracts
 
 From `src/kernel/types.ts`. These may not be edited. If this package cannot be
@@ -133,6 +249,111 @@ Events this package emits, from the frozen union:
 cannot be widened, declare a local interface in `src/kernel/sync/monitor.ts` that
 `extends SyncPrimitive` and adds `conditions` and `signalDiscipline`. Extension
 by a local interface is allowed; editing `types.ts` is not.
+
+## Inherited from WP-05
+
+WP-05 landed before this package and changed four shared files. Everything below
+comes from its completion report or from the source it left behind. Read it before
+you edit `Kernel.ts`.
+
+### Snapshot registration
+
+Snapshot save and restore is a dispatch over installed hooks rather than a growing
+object literal. The installed contract is:
+
+```ts
+interface SnapshotHooks {
+  saveState(): Partial<SubsystemSnapshots>;
+  restoreState(snapshot: KernelSnapshot): () => void;
+}
+```
+
+`restoreState` prepares and returns a commit closure. The kernel prepares every
+contribution before changing state, then calls the returned commits. Register with
+`installHooks({ snapshots })`. No further hard-coded slot keys are needed in the
+snapshot literal. Duplicate slot ownership is rejected. Validate and capture
+detached state before returning the closure, and do not mutate anything during
+preparation.
+
+### The init-only guard trap
+
+Installing runtime hooks still enables WP-02's full-workload snapshot guard;
+snapshot-only registration works without enabling it. So the round-trip test must
+register through `installHooks({ snapshots })` and pass no other key, or
+`snapshot()` and `restore()` will throw before your state is reached. Generic
+contribution dispatch does not finish WP-11's workload persistence, and WP-11's
+existing throwing assertions remain intact.
+
+### Phase 4 is a readiness query, not a queue operation
+
+`isSatisfied(pid, reason)` answers whether the wait is satisfied and nothing more.
+Phase 4 owns waking the thread, recomputing the process and moving it to `ready`,
+and every ready-queue insertion happens in one place inside the kernel. Do not
+insert into the ready queue, do not call `move`, and do not wake a process from
+inside a primitive operation. Mark waiters wakeable and let phase 4 move them.
+
+Phase 4 consults the IPC manager first: when `ipc.matchesWait(pid, reason)` is
+true for a `semaphore`, `mutex` or `condition` reason, the completion comes from
+IPC and `SyncHooks.isSatisfied` is not asked. Mailbox waits therefore reach phase
+4 as synthetic sync resources under those same three block reasons, which is why
+your `isSatisfied` must return false for a resource it does not own rather than
+throwing.
+
+### Blocking applies thread-model semantics for you
+
+`blockProcess(pid, reason, tid?)` is the kernel's entry point. It selects the
+thread, applies the thread model, and moves the whole process to `waiting` only
+when the model says the whole process blocks; otherwise it recomputes the process
+and returns it to `ready`. Call it with the reason you want recorded and let it
+decide. It throws when the target is not running, so never call it for a process
+the scheduler has not dispatched.
+
+### The shared-region value for the race detector
+
+Only `SharedRegion.value` and inode metadata are racy, and the shared regions live
+in the IPC manager the kernel holds as its public `ipc` field. Read the value
+through that manager rather than keeping a second copy, or the detector and the
+kernel will disagree after a restore. `src/kernel/process/ipc.ts` was not part of
+WP-05's surface and the report does not quote its accessor, so report the exact
+accessor you used.
+
+### The merge surface WP-05 left
+
+These are inclusive line ranges in the post-WP-05 files. They are the lines you are
+most likely to collide with, and WP-09 is editing several of them at the same time.
+
+| Kernel.ts lines | Change |
+|---|---|
+| 16 | MemorySubsystem import |
+| 49 | SubsystemSnapshots type import |
+| 56 | Remove now-unused bootstrap frame-ID import |
+| 147-151 | SnapshotHooks interface |
+| 153 | Optional snapshots registration on KernelHooks |
+| 169-170 | Memory subsystem and snapshot registry fields |
+| 197 | Readonly live TLB view type |
+| 210 | Replace bootstrap MemoryHooks initializer with bound field |
+| 235 | Register memory metrics at the existing dispatch registration site |
+| 251-266 | Construct subsystem, bind memory callbacks and register its snapshot hooks |
+| 285 | Existing exec detach callback: IPC detach then memory cleanup/ASID flush |
+| 302 | Existing exit wait-cleanup callback: memory cleanup after IPC detach |
+| 337-338 | Install snapshot hooks; allow snapshot-only registration without opaque-runtime-hook restriction |
+| 435-438 | `ioctl('tlb_flush')`, EINVAL otherwise, exact WP-11 validation marker |
+| 475-477 | Set allocator and update current configuration |
+| 519 | Wrap the existing snapshot in contribution dispatch |
+| 530-539 | Merge installed snapshot contributions and reject duplicate slot ownership |
+| 549 | Prepare every installed restore contribution before state mutation |
+| 576-577 | Commit prepared contributions and rebind live frame/TLB views |
+| 724-726 | Execute helper defers service while a resident translation is incomplete |
+| 834-835 | Bind actual frame/TLB arrays in the existing initialization helper |
+
+| Other shared file | Inclusive changed lines |
+|---|---|
+| `src/kernel/config.ts` | 10-11: tuning types; 24: defaults; 60-61: validation |
+| `src/kernel/index.ts` | 6: allocator export |
+| `src/kernel/process/threads.ts` | 208-211: deferral flag/method; 223-226: capture useful service before consumption; 229-232: restore deferred useful service |
+
+New tuning keys are distinct and additive, and no existing knob was reformatted.
+Keep yours the same way.
 
 ## Specification
 
@@ -254,7 +475,7 @@ without being told it.
 Each spin iteration costs one tick and emits `sync.busy_wait { spunTicks }`.
 Those wasted ticks are counted in `SchedulingMetrics.cpuUtilisation` as **busy**,
 which is exactly why busy waiting is deceptive: utilisation looks perfect while
-nothing is accomplished. Expose `spinTicks(pid)` so WP-16's `top` command can
+nothing is accomplished. Expose `spinTicks(pid)` so WP-15's `top` command can
 show a separate `spin%` column.
 
 Compare-and-swap backs the lock-free counter in the race scenario, so the player
@@ -626,7 +847,7 @@ out.
 
 State:
 
-1. Pass or fail for each of the twenty acceptance criteria, by number.
+1. Pass or fail for each of the twenty-one acceptance criteria, by number.
 2. The three verification command outcomes.
 3. The recorded `SYNC-PHIL-TABLE` values: meals completed and worst individual
    wait for naive, asymmetric, arbitrator and monitor, stated as now frozen.

@@ -95,6 +95,182 @@ src/kernel/index.ts    (add the DISK_POLICIES export)
 
 Nothing else.
 
+### Scope correction, 2026-09-13
+
+Raised by the audit of this package against its own specification and against the
+current `Kernel.ts`, `config.ts` and syscall dispatch, before the package started.
+The grant above excluded eight things this package itself requires. This is the
+same defect shape that produced the five escalations recorded in
+`docs/07-CONTRACT-AMENDMENTS.md` under "Package scope corrections". Approved as
+follows, shaped for WP-07, which runs at the same time and edits the same four
+shared files.
+
+**`src/kernel/config.ts`, additive only.** This package names eleven knobs that do
+not exist in `KernelTuning`. Add exactly these keys, with defaults, validated with
+the pattern the existing knobs use:
+
+| Key | Default | Source |
+|---|---|---|
+| `diskStarvationThreshold` | 400 | sim spec 10.4, SSTF starvation |
+| `interruptServiceTicks` | 2 | sim spec 11.1 and 11.2 |
+| `maxInterruptsPerTick` | 2 | sim spec 11.2, step 3 |
+| `interruptStormThreshold` | 32 | sim spec 11.3 |
+| `interruptStormWindow` | 10 | sim spec 11.3 |
+| `maxPendingInterrupts` | report it | sim spec 11.2 names `maxPending` and gives no default |
+| `dmaCycleStealRatio` | 0.1 | sim spec 11.1, DMA step 2 |
+| `nvmWriteBufferPages` | 8 | sim spec 10.5 |
+| `rebuildBlocksPerTick` | 4 | sim spec 10.6 |
+| `rebuildProgressInterval` | report it | sim spec 10.6 gives no default |
+| `blockCacheEntries` | 64 | sim spec 11.4 |
+
+Every key above except `dmaCycleStealRatio` is a positive integer and uses the
+existing integer check. `dmaCycleStealRatio` is a bounded fraction, so validate it
+the way `defaultSerialFraction` is validated rather than adding a helper. Where the
+sim spec gives no default, choose one, comment the choice, and report it; do not
+invent a number silently.
+
+The disk geometry and cost constants are a separate matter and stay out of
+`KernelTuning`. `seekOverheadMs` 0.5, `seekPerCylinderMs` 0.04, `rpm` 7200,
+`transferMbPerSec` 100, `headsPerCylinder` 4, `sectorsPerTrack` 64,
+`bytesPerSector` 512 and `MS_PER_TICK` 0.5 are fractional or geometric, the only
+validator in `config.ts` is an integer check, and sim spec 10.1 already declares
+them as `DiskGeometry`. Keep them as the defaults of
+`src/kernel/storage/geometry.ts` and `costModel.ts`, reachable through
+`setCostMultiplier`. `wordSize` is per device and belongs in
+`src/kernel/io/modes.ts`.
+
+Do not reformat anything and do not touch a key you did not add: this file is
+shared with WP-07, which is adding its own keys at the same time.
+
+**Snapshot save and restore for the `storage` and `io` slots.** Required by
+acceptance criterion 23 and by amendment 1. Register through
+`installHooks({ snapshots })` using `saveState` and `restoreState`, exactly as
+WP-05 left it. `restoreState` validates the envelope, captures detached state, and
+returns a commit closure; it mutates nothing during preparation, because the kernel
+prepares every contribution before it changes any state. Add no hard-coded slot key
+to the snapshot object literal. Duplicate slot ownership is rejected, so register
+both slots from one hooks object.
+
+Correction to section 12 of this package: `SubsystemSnapshots` does now have an
+`io` slot. Amendment 3 added `scheduler`, `vm`, `deadlock` and `io`, and added a
+compile-time check that every `SubsystemId` has a slot. Put the I/O half in the
+`io` slot rather than smuggling it through the storage payload, and raise no
+amendment for a slot that exists.
+
+**The `ioctl` device subcommands this package owns.** Acceptance criterion 16
+requires a device to drop to polling, the `mode side table` test requires the live
+mode to change, and sim spec 14.3 routes `set_policy`, `reset`, `set_mode`,
+`crash`, `fail_disk`, `trim`, `flush` and `set_loss` through `ioctl`. The branch in
+`dispatchSyscall` accepts only `tlb_flush` today and returns `EINVAL` on anything
+else, so every driver `control` table is unreachable. Add exactly the subcommands
+your four drivers own, route each into that driver's `control`, return `EINVAL` on
+an unknown subcommand, and leave the existing `tlb_flush` case exactly as WP-05
+wrote it. Carry the marker
+`// TODO(astra): WP-11 validates ioctl arguments`, which is already on that branch,
+because WP-11 owns the full table.
+
+Report, do not resolve: sim spec 14.3 declares `ioctl(device, command, ...)` with
+`args[0]` the `DeviceId` and `args[1]` the command, while the branch WP-05 left
+reads `args[0]` as the command because the kernel pseudo-device has no id. Those
+two argument shapes disagree. WP-11 owns the table and the arity check, so state
+the conflict in your report and keep `tlb_flush` working at its current position
+rather than renumbering it.
+
+**The `sync` syscall, the cache-flush half only.** Sim spec 14.3 has `sync` flush
+every dirty block cache entry and block the caller until the writes complete, and
+the `write_back dirty` test in this package asserts that `sync` flushes them. The
+call reaches the default branch today and returns `EINVAL`. Add the branch, drive
+it through `dirtyEntries()` and the block cache, return the flushed count, and mark
+it `// TODO(astra): WP-11 validates sync arguments`. The journal half of `sync` is
+WP-10's, so leave a `// TODO(astra): WP-10 flushes the journal` and do not write
+journal code.
+
+`open`, `close`, `read`, `write`, `seek`, `stat`, `unlink`, `mkdir` and `chmod`
+stay out. Their preconditions in sim spec 14.3 are path resolution, descriptors and
+inode rights, all of which live in WP-10, and WP-11 owns the table. This package
+provides the block device they sit on and nothing above it.
+
+**Publishing the disk and device tables into the shared snapshot tables.**
+`snapshot()` reads the private `diskQueue`, `diskHead` and `devices` fields on
+`KernelImpl`. They are written only by `restore`, and nothing in the tree
+constructs a `Device` or a `DiskRequest`, so wiring `IoHooks` alone leaves
+`KernelSnapshot.diskQueue` and `.devices` permanently empty and invariants I-27,
+I-28 and I-32 with nothing to check. Bind the live arrays in the existing
+initialisation helper, the way WP-05 bound the frame and TLB views there, and
+rebind them after a restore commit. Bind the live arrays themselves rather than
+copying per call.
+
+**`StorageHooks.expireTimers`, which is phase 1 and not phase 2 or 3.** RAID
+rebuild progress and NVM garbage collection are timer work, and the kernel calls
+`StorageHooks.expireTimers` in phase 1, outside the "phases 2 and 3" the grant
+names. Register it. Completions stay in phase 2, interrupt delivery stays in phase
+3, and wait resolution stays in phase 4. Do not move work between phases and do
+not edit a phase body.
+
+**Construction wiring.** Constructing `StorageSubsystem` and `IoSubsystem` in the
+kernel constructor is part of wiring the hooks, and it includes handing each
+subsystem its emit callback and its stream, `root/storage` and `root/io`, taken
+from the stream registry the same way `schedulerContext()` takes the `scheduler`
+stream. `process.starving` for seek starvation, `fs.corruption` for the spooling
+fixture and `kernel.panic` for a storm all travel on that emit callback. `net0`
+draws packet loss from `root/io` and from no other stream.
+
+**Interrupt overhead charged to the kernel: there is an existing channel, so
+this is a one-line accessor rather than an escalation.** Sim spec 11.2 requires
+`interruptServiceTicks` to reduce `cpuUtilisation` without increasing any
+process's `totalCpuUsed`, and acceptance test `utilisation falls` asserts it.
+`Kernel.ts` already carries exactly this mechanism for context switches: a private
+`switchDebt` counter that phase 8 consumes one tick at a time before it executes
+anything (the early return at the top of the execute path), that `snapshot()` and
+`restore()` already persist, and that the WP-05 report confirms is kept out of
+delivered useful service. Interrupt service is the same kind of tick: the CPU is
+busy, no process advances.
+
+Add one public method to `KernelImpl`, outside every phase body:
+
+```ts
+/** Kernel-side CPU ticks charged to no process: context switches, interrupt
+ *  service. Consumed by the existing phase 8 debt check. */
+chargeKernelDebt(ticks: number): void { this.switchDebt += ticks; }
+```
+
+Call it from `deliverInterrupts` with `interruptServiceTicks` per delivered
+interrupt. Do not touch phase 8, `scheduler/metrics.ts`, or the scheduling
+accounting object. The name `switchDebt` is now narrower than what it holds; leave
+the rename to WP-11, which owns the invariant set, and mention it in your report.
+
+Verify with the `utilisation falls` test. If it passes, this item is closed. If
+it fails because `scheduler/metrics.ts` counts debt ticks in a way that does not
+move `cpuUtilisation`, then and only then escalate, and the escalation is for a
+metrics change owned by WP-03 and WP-04, not for a phase edit.
+
+**Metrics recomputation.** There is no `IoMetrics` or `StorageMetrics` type in the
+frozen contract and `MetricsHooks` carries only `scheduler` and `memory`, so this
+package registers no metrics hook. If one becomes necessary, register at the
+existing phase 10 dispatch site and look for the registration marker. Phase 10
+itself is not edited.
+
+**What stays out.** The eleven ordered phase bodies are not edited; anything that
+would require it is an escalation. WP-07 is in flight and owns
+`src/kernel/sync/**`, the `sync` snapshot slot, the `sem_wait`, `sem_post`,
+`mutex_lock`, `mutex_unlock`, `request` and `release` syscall branches, the
+phase 4 readiness and priority-inversion path, and its own `config.ts` keys. The
+`circular` buffering scheme imports WP-07's bounded buffer; import it and do not
+edit it. Do not reorder or reformat the lines WP-07 will add. `src/kernel/fs/**`,
+`src/kernel/security/**`, `src/kernel/memory/**`, `src/kernel/deadlock/**`,
+`src/kernel/syscall/**` beyond the two branches above, and `invariants.ts` stay
+out.
+
+**Two things WP-05 warns about, and they apply here.** First, installing runtime
+hooks still trips WP-02's init-only snapshot guard: `installHooks` sets the guard
+flag for every key except `snapshots`, so a kernel with `io` or `storage` hooks
+installed refuses `snapshot()` and `restore()`. The round-trip test for criterion
+23 must therefore register snapshot-only, through `installHooks({ snapshots })`
+with no other key, which is the one case the guard allows. Second, the generic
+snapshot dispatch does not finish WP-11's workload persistence: the process
+contribution, the completeness check and the removal of the guard stay WP-11's,
+and its throwing assertions remain in place.
+
 ## Frozen contracts
 
 From `src/kernel/types.ts`. These may not be edited. If this package cannot be
@@ -164,6 +340,128 @@ during a storm cannot mutate it. Hold the live mode in a side table
 `Map<DeviceId, IoMode>` seeded from `Device.mode` at construction, make that
 table the authority, and note the reason in a comment. Do not cast away
 `readonly` and do not add a field.
+
+## Inherited from WP-05
+
+WP-05 landed before this package and changed four shared files. Everything below
+comes from its completion report or from the source it left behind. Read it before
+you edit `Kernel.ts`.
+
+### Snapshot registration
+
+Snapshot save and restore is a dispatch over installed hooks rather than a growing
+object literal. The installed contract is:
+
+```ts
+interface SnapshotHooks {
+  saveState(): Partial<SubsystemSnapshots>;
+  restoreState(snapshot: KernelSnapshot): () => void;
+}
+```
+
+`restoreState` prepares and returns a commit closure. The kernel prepares every
+contribution before changing state, then calls the returned commits. Register with
+`installHooks({ snapshots })`. No further hard-coded slot keys are needed in the
+snapshot literal. Duplicate slot ownership is rejected, so return both the
+`storage` and the `io` slot from one `saveState`. Validate and capture detached
+state before returning the closure, and do not mutate anything during preparation.
+
+### The init-only guard trap
+
+Installing runtime hooks still enables WP-02's full-workload snapshot guard;
+snapshot-only registration works without enabling it. So the round-trip test must
+register through `installHooks({ snapshots })` and pass no other key, or
+`snapshot()` and `restore()` will throw before your state is reached. Generic
+contribution dispatch does not finish WP-11's workload persistence, and WP-11's
+existing throwing assertions remain intact.
+
+### Phase discipline
+
+Use the existing subsystem hooks for phase work. Completions run in phase 2,
+interrupt delivery in phase 3, and wait resolution in phase 4; timer work,
+including RAID rebuild progress and NVM garbage collection, runs in phase 1 through
+`StorageHooks.expireTimers`. Neither phase 10 nor the eleven phase bodies changed
+under WP-05 and they do not change here. An I/O completion in phase 2 must be able
+to unblock its waiter on the same tick, which is what putting interrupt delivery in
+phase 3 and wait resolution in phase 4 buys you.
+
+### Disabled hooks are inert
+
+Every phase call is guarded by the enabled-subsystem set, and the defaults are
+no-ops, so a leg that does not enable `io` or `storage` runs with your subsystem
+present and silent. Determinism fixture D3 asserts that a workload with no I/O
+produces the same context-switch sequence whether or not the subsystem is enabled,
+so an inert hook must consume no RNG draws and emit no events.
+
+### Descriptor and device cleanup on exit
+
+The lifecycle calls `IoHooks.removeWaiter(pid)` from its wait-queue cleanup
+callback, alongside the sync and IPC removals, and IPC detachment precedes private
+address-space teardown. An exiting process must come out of every queue you hold:
+the device queue, the disk queue, the spool queue, the buffer waiters and the
+interrupt controller's pending handlers. Invariants I-10 and I-32 read
+`Device.queue` and require every pid in it to be `waiting` with a matching
+`blockedOn`, so a pid left behind by a teardown is an invariant failure rather than
+a leak you can ignore. Descriptor reference counting itself stays with WP-10
+through `FsHooks`.
+
+### Detection timing and copy debt are already excluded from useful service
+
+WP-05 added a service-deferral path so a pending translation consumes CPU time
+without retiring useful instruction service, and copy-on-write copy debt is charged
+as whole ticks before the execute helper runs. Neither counts as completed service.
+Follow the same rule for polling: a poll iteration must consume a tick of CPU
+without retiring useful service, and it must not terminate a process that has one
+instruction left. Pending progress is counted in actual CPU execution attempts per
+thread, not in time spent waiting off CPU.
+
+### The merge surface WP-05 left
+
+These are inclusive line ranges in the post-WP-05 files. They are the lines you are
+most likely to collide with, and WP-07 is editing several of them at the same time.
+
+| Kernel.ts lines | Change |
+|---|---|
+| 16 | MemorySubsystem import |
+| 49 | SubsystemSnapshots type import |
+| 56 | Remove now-unused bootstrap frame-ID import |
+| 147-151 | SnapshotHooks interface |
+| 153 | Optional snapshots registration on KernelHooks |
+| 169-170 | Memory subsystem and snapshot registry fields |
+| 197 | Readonly live TLB view type |
+| 210 | Replace bootstrap MemoryHooks initializer with bound field |
+| 235 | Register memory metrics at the existing dispatch registration site |
+| 251-266 | Construct subsystem, bind memory callbacks and register its snapshot hooks |
+| 285 | Existing exec detach callback: IPC detach then memory cleanup/ASID flush |
+| 302 | Existing exit wait-cleanup callback: memory cleanup after IPC detach |
+| 337-338 | Install snapshot hooks; allow snapshot-only registration without opaque-runtime-hook restriction |
+| 435-438 | `ioctl('tlb_flush')`, EINVAL otherwise, exact WP-11 validation marker |
+| 475-477 | Set allocator and update current configuration |
+| 519 | Wrap the existing snapshot in contribution dispatch |
+| 530-539 | Merge installed snapshot contributions and reject duplicate slot ownership |
+| 549 | Prepare every installed restore contribution before state mutation |
+| 576-577 | Commit prepared contributions and rebind live frame/TLB views |
+| 724-726 | Execute helper defers service while a resident translation is incomplete |
+| 834-835 | Bind actual frame/TLB arrays in the existing initialization helper |
+
+| Other shared file | Inclusive changed lines |
+|---|---|
+| `src/kernel/config.ts` | 10-11: tuning types; 24: defaults; 60-61: validation |
+| `src/kernel/index.ts` | 6: allocator export |
+| `src/kernel/process/threads.ts` | 208-211: deferral flag/method; 223-226: capture useful service before consumption; 229-232: restore deferred useful service |
+
+New tuning keys are distinct and additive, and no existing knob was reformatted.
+Keep yours the same way. Your `ioctl` subcommands rebase onto lines 435-438 and
+your snapshot registration onto lines 337-338.
+
+### One prerequisite in this package is stale
+
+The prerequisite paragraph above says WP-06's major-fault path calls
+`this.storage.enqueue(...)` behind a marker. No such call, marker or method exists:
+`StorageHooks` carries only `expireTimers`, and the fault extension point WP-05
+left is `DemandPagingHooks.fault` on `MemorySubsystem`, installed with
+`setDemandPaging`. Define whatever swap-in method WP-06 turns out to need, name it
+in your report, and do not go looking for a marker that was never written.
 
 ## Specification
 
@@ -800,7 +1098,7 @@ Plus:
 
 State:
 
-1. Pass or fail for each of the twenty-two acceptance criteria, by number.
+1. Pass or fail for each of the twenty-three acceptance criteria, by number.
 2. The three verification command outcomes.
 3. The full ten-row `DISK-ALL-1` table your implementation produced, with paths
    and totals, next to the sim spec values.

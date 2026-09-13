@@ -184,6 +184,111 @@ an unrelated field, and do not add a field.
 See `docs/07-CONTRACT-AMENDMENTS.md` amendment 1 for the decision and its
 reasoning.
 
+## Inherited from WP-05
+
+WP-05 promoted two snapshot slots and settled several things this package has to
+reconcile. Everything below comes from its completion report, from amendment 4, or
+from the source it left behind.
+
+### Ten slots now exist, with a compile-time check
+
+`SubsystemSnapshots` has one slot per `SubsystemId`, all ten. Amendment 3 added
+`scheduler`, `vm`, `deadlock` and `io` to amendment 1's six, and added:
+
+```ts
+type _EverySubsystemHasASlot = SubsystemId extends keyof SubsystemSnapshots ? true : never;
+const _subsystemSlotCheck: _EverySubsystemHasASlot = true;
+```
+
+so a missing slot is now a type error. The quoted `SubsystemSnapshots` in the frozen
+contracts section above predates that and lists six slots; read `types.ts` for the
+current shape. Amendment 4 then promoted `memory` and `vm` from envelopes to
+`MemorySnapshotState` and `VmSnapshotState`, so the completeness check validates
+ten slots of which two are typed, and this package reconstructs both typed
+contributions through the installed snapshot hooks rather than by reading their
+payloads.
+
+### Two invariant exceptions the memory group must allow
+
+The statement connecting every owned frame to a valid PTE needs two exceptions, both
+intentional and both tested in WP-05:
+
+1. **Retained free-pool contents.** A frame freed with retention keeps its old
+   `owner` and `page` while it sits in the free pool, which is what makes
+   reclaim-from-pool a minor fault. Such a frame has a non-null `owner` and is named
+   by no valid PTE.
+2. **COW and shared aliases.** A frame shared by copy-on-write or by a shared region
+   is named by more than one valid PTE, and an alias whose frame carries a different
+   owner or page is still a valid PTE access. I-18 already carves out
+   `cowRefCount > 1`; shared-region aliases and the retained pool need the same
+   treatment, and the free-pool case is the one I-18 does not currently mention.
+
+WP-05 did not widen scope into `invariants.ts`, so writing these exceptions is this
+package's job. Preserve the behaviour; do not tighten the invariant until the
+behaviour changes.
+
+### The stale guard message
+
+WP-02's guard throws:
+
+```
+not implemented: ${name} for process workloads or custom subsystem state; WP-11 needs a KernelSnapshot channel for programs, threads and side tables
+```
+
+That text now misnames the problem. The channel exists: amendment 1 added
+`completeness` and `subsystems`, amendment 3 filled the slots, and WP-05 turned save
+and restore into a dispatch over installed hooks. What is missing is the process
+implementation, not the channel. Correct the message when you remove the guard, so
+the repository does not keep asserting a gap that was closed two amendments ago.
+Removing the guard and its
+`// TODO(astra): blocked on contract change, see report` marker is already this
+package's work.
+
+### The ioctl branch and its marker
+
+`ioctl` currently has exactly one subcommand, `tlb_flush`, and returns `EINVAL` on
+anything else. The branch carries:
+
+```ts
+// TODO(astra): WP-11 validates ioctl arguments
+```
+
+That marker is yours to resolve. Two things to carry forward when you build the full
+table. First, sim spec 14.3 declares `ioctl(device, command, ...)` with `args[0]`
+the `DeviceId` and `args[1]` the command, while the existing branch reads `args[0]`
+as the command, because the kernel pseudo-device has no id. You own the table and
+the arity check, so you settle that shape. Second, WP-09 adds its drivers'
+subcommands to the same branch under the same marker, so expect more than one
+subcommand there by the time you arrive, and expect the `EINVAL` default to be the
+only fallthrough.
+
+### The rations flooring ambiguity is already settled
+
+Sim spec 6.6's prose directs flooring after the multiplications while one displayed
+expression floors the equal share earlier. WP-05 followed the explicit final-floor
+instruction, and every published 64-frame, eight-process fixture value matches:
+generous 12, standard 8, lean 4, starved 3. At 64 frames and 40 processes every
+setting returns at least three. Write the invariant set so it does not contradict
+that choice: an invariant that assumes the earlier floor will fire against correct
+code.
+
+### Snapshot registration, as WP-05 left it
+
+```ts
+interface SnapshotHooks {
+  saveState(): Partial<SubsystemSnapshots>;
+  restoreState(snapshot: KernelSnapshot): () => void;
+}
+```
+
+`restoreState` validates and captures detached state, then returns a commit closure.
+The kernel prepares every installed contribution before mutating state and calls the
+commits afterwards, so one invalid contribution changes nothing. Duplicate slot
+ownership is rejected. Snapshot-only registration through
+`installHooks({ snapshots })` does not trip the init-only guard, which is how the
+subsystem packages test their round trips while the guard still stands. Keep both
+properties when you replace the guard with the completeness check.
+
 ## Specification
 
 ### 1. `src/kernel/syscall/dispatch.ts`
