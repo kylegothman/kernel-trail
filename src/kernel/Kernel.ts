@@ -1,7 +1,8 @@
 /** KERNEL TRAIL: deterministic process engine and eleven-phase orchestrator. */
 import { KernelEventBus, type EmittableEvent } from './EventBus';
 import { createStreams, type StreamRegistry } from './rngStreams';
-import { createScheduler, configureSchedulerWorkload, isMetricsAware, isRunningAware } from './scheduler/SchedulerRegistry';
+import { createScheduler, configureSchedulerWorkload, isMetricsAware, isRunningAware, saveSchedulerEnvelope, prepareSchedulerRestore } from './scheduler/SchedulerRegistry';
+import { saveSchedulerParams } from './scheduler/SchedulerBase';
 import { createSchedulerHooks } from './scheduler/starvation';
 import { SchedulingAccounting } from './scheduler/metrics';
 import { KernelInvariantError } from './errors';
@@ -44,7 +45,7 @@ import type {
   SchedulerParams,
   SchedulerPolicy,
   SchedulingMetrics,
-  SubsystemId,
+  SubsystemId, SubsystemEnvelope,
   SyncPrimitive,
   SyscallRequest,
   SyscallResult,
@@ -464,6 +465,30 @@ export class KernelImpl implements Kernel {
     throw new Error('not implemented: detectDeadlock');
   }
 
+  /** WP-11 restores the process tables before applying this independent contribution. */
+  saveSchedulerState(): SubsystemEnvelope {
+    this.syncSchedulerView();
+    return saveSchedulerEnvelope(this.scheduler, this.schedulingAccounting, {
+      tick: this.tick, readyQueue: [...this.readyQueue], running: this.running,
+      lastCpuOwner: this.lastCpuOwner, sliceElapsed: this.sliceElapsed, switchDebt: this.switchDebt,
+      contextSwitches: this.contextSwitches, params: saveSchedulerParams(this.schedulerParams),
+    });
+  }
+  restoreSchedulerState(envelope: SubsystemEnvelope): void {
+    const saved = prepareSchedulerRestore(envelope, {
+      ...this.schedulerContext(),
+      readyQueue: this.processes.filter(pcb => pcb.pid > 1 && pcb.state === 'ready').map(pcb => pcb.pid),
+      running: this.processes.find(pcb => pcb.pid > 1 && pcb.state === 'running')?.pid ?? null,
+    }, this.schedulingAccounting, pid => this.burstSizes.get(pid));
+    saved.commitAccounting();
+    this.scheduler = saved.policy; this.schedulerParams = saved.params; this.requestedScheduler = saved.policy.id;
+    this.readyQueue.length = 0; this.readyQueue.push(...saved.readyQueue);
+    this.running = saved.running; this.lastCpuOwner = saved.lastCpuOwner;
+    this.sliceElapsed = saved.sliceElapsed; this.switchDebt = saved.switchDebt; this.contextSwitches = saved.contextSwitches;
+    this.schedulingMetrics = this.scheduler.snapshot().metrics;
+    this.syncSchedulerView();
+  }
+
   /** The scaffold's init-only replay remains supported. Workload saves need WP-11's contract channel. */
   snapshot(): KernelSnapshot {
     this.requireSnapshotChannel('snapshot');
@@ -476,6 +501,7 @@ export class KernelImpl implements Kernel {
       diskHead: { ...this.diskHead }, devices: this.devices.map(d => ({ ...d, queue: [...d.queue] })),
       inodes: this.inodes.map(i => ({ ...i, blocks: [...i.blocks] })), journal: this.journal.map(j => ({ ...j, blocks: [...j.blocks] })),
       domains: this.domains.map(d => ({ ...d, rights: new Map([...d.rights].map(([key, rights]) => [key, [...rights]])) })),
+      subsystems: { scheduler: this.saveSchedulerState() },
       metrics: { scheduling: { ...this.schedulingMetrics }, memory: { ...this.memoryMetrics, workingSets: new Map(this.memoryMetrics.workingSets) } },
     };
   }
@@ -483,6 +509,10 @@ export class KernelImpl implements Kernel {
     if (snapshot.version !== 1) throw new Error(`unsupported snapshot version ${String(snapshot.version)}`);
     this.requireSnapshotChannel('restore');
     if (snapshot.processes.some(pcb => pcb.pid !== asPid(1) || pcb.state !== 'ready') || snapshot.processes.length !== 1) this.snapshotBlocked('restore');
+    if (snapshot.subsystems?.scheduler !== undefined) prepareSchedulerRestore(snapshot.subsystems.scheduler, {
+      ...this.schedulerContext(), tick: snapshot.tick, running: null, readyQueue: [],
+      process: pid => snapshot.processes.find(pcb => pcb.pid === pid),
+    }, this.schedulingAccounting, pid => this.burstSizes.get(pid), snapshot.config);
     this.currentConfig = cloneConfig(snapshot.config); this.enabled = new Set(this.config.enabledSubsystems);
     this.schedulerParams = { ...snapshot.config.schedulerParams }; this.requestedScheduler = this.config.scheduler;
     this.currentTick = snapshot.tick; this.events.beginFrame(); this.events.setSeq(snapshot.seq); this.rng.restore(snapshot.rng);
@@ -507,6 +537,8 @@ export class KernelImpl implements Kernel {
     this.contextSwitches = snapshot.metrics.scheduling.contextSwitches;
     this.running = null; this.lastCpuOwner = null; this.sliceElapsed = 0; this.switchDebt = 0;
     this.wakeable.clear(); this.admittedThisTick.clear(); this.scheduler = this.makeScheduler(this.config.scheduler);
+    if (snapshot.subsystems?.scheduler !== undefined) this.restoreSchedulerState(snapshot.subsystems.scheduler);
+    else this.schedulingAccounting.reset();
     this.syncSchedulerView();
   }
   private requireSnapshotChannel(name: string): void {

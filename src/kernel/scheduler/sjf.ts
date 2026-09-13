@@ -1,6 +1,6 @@
-import type { Pid, ProcessControlBlock, SchedulerContext, SchedulerId, SchedulingDecision } from '../types';
+import type { JsonValue, Pid, ProcessControlBlock, SchedulerContext, SchedulerId, SchedulingDecision } from '../types';
 import { KernelInvariantError } from '../errors';
-import { SchedulerBase } from './SchedulerBase';
+import { SchedulerBase, snapshotArray, snapshotBoolean, snapshotInteger, snapshotNumber, snapshotObject, snapshotPid } from './SchedulerBase';
 import { MinHeap } from './MinHeap';
 import { tieBreak } from './tieBreak';
 
@@ -90,6 +90,46 @@ export class SjfScheduler extends SchedulerBase {
     return this.dispatch(ctx, next, next === undefined ? 'no process is ready' : `shortest service, ${this.key(next)} ticks`);
   }
   protected refresh(): void { this.levels[0] = this.heap.toArray(); this.buildSnapshot(this.levels, 0); }
+  protected saveDetails(): JsonValue {
+    return { useEstimatedBurst: this.useEstimatedBurst,
+      estimates: [...this.estimates].sort(([a], [b]) => a - b).map(([pid, value]) => ({ pid, ...value })) };
+  }
+  protected prepareRestoreDetails(detail: JsonValue, queues: readonly (readonly Pid[])[], ctx: SchedulerContext): () => void {
+    const queue = queues[0];
+    if (queues.length !== 1 || queue === undefined) throw new Error('shortest-service policy requires one queue');
+    const record = snapshotObject(detail, 'burst estimator');
+    const useEstimatedBurst = snapshotBoolean(record['useEstimatedBurst'], 'estimated burst flag');
+    const estimates = new Map<Pid, BurstEstimate>();
+    for (const value of snapshotArray(record['estimates'], 'burst estimates')) {
+      const row = snapshotObject(value, 'burst estimate');
+      const pid = snapshotPid(row['pid'], 'estimate pid');
+      const pcb = ctx.process(pid);
+      const estimate = snapshotNumber(row['estimate'], 'estimate');
+      const startCpu = snapshotInteger(row['startCpu'], 'burst start CPU');
+      const lastCpu = snapshotInteger(row['lastCpu'], 'last observed CPU');
+      const lastRemaining = snapshotInteger(row['lastRemaining'], 'last observed burst');
+      if (estimates.has(pid) || pcb === undefined || startCpu > lastCpu || lastCpu > pcb.totalCpuUsed) throw new Error('invalid scheduler burst history');
+      estimates.set(pid, { estimate, startCpu, lastCpu, lastRemaining });
+    }
+    if (queue.some(pid => !estimates.has(pid))) throw new Error('missing queued burst estimate');
+    const key = (pid: Pid): number => {
+      const pcb = ctx.process(pid);
+      if (pcb === undefined) throw new Error('missing scheduler process');
+      return useEstimatedBurst ? estimates.get(pid)?.estimate ?? pcb.cpuBurstRemaining : pcb.serviceRemaining;
+    };
+    for (let i = 1; i < queue.length; i++) {
+      const previous = queue[i - 1]; const next = queue[i];
+      if (previous === undefined || next === undefined) continue;
+      const a = ctx.process(previous); const b = ctx.process(next);
+      if (a === undefined || b === undefined || (key(previous) - key(next) || tieBreak(a, b)) >= 0) throw new Error('unordered shortest-service snapshot');
+    }
+    return () => {
+      this.context = ctx; this.heap.clear(); this.estimates.clear(); this.useEstimatedBurst = useEstimatedBurst;
+      for (const [pid, value] of estimates) this.estimates.set(pid, value);
+      for (const pid of queue) this.heap.push(pid);
+      this.refresh();
+    };
+  }
   private initialiseEstimate(pcb: Readonly<ProcessControlBlock>): void {
     if (!this.estimates.has(pcb.pid)) this.estimates.set(pcb.pid, {
       estimate: this.initialBurst(pcb.pid) ?? pcb.cpuBurstRemaining,

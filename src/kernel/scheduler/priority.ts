@@ -1,4 +1,4 @@
-import type { Pid, ProcessControlBlock, SchedulerContext, SchedulerId, SchedulerParams, SchedulingDecision } from '../types';
+import type { JsonValue, Pid, ProcessControlBlock, SchedulerContext, SchedulerId, SchedulerParams, SchedulingDecision } from '../types';
 import { SchedulerBase } from './SchedulerBase';
 import { MinHeap } from './MinHeap';
 import { tieBreak } from './tieBreak';
@@ -48,6 +48,19 @@ export class PriorityScheduler extends SchedulerBase {
     if (next !== undefined) this.remove(next.pid);
     return this.decision(ctx, next?.pid ?? null, next === undefined ? 'no process is ready'
       : `highest priority, ${next.priority} is the smallest ready priority number`);
+  }
+  protected saveDetails(): JsonValue { return null; }
+  protected prepareRestoreDetails(detail: JsonValue, queues: readonly (readonly Pid[])[], ctx: SchedulerContext): () => void {
+    const queue = queues[0];
+    if (detail !== null || queues.length !== 1 || queue === undefined) throw new Error('invalid priority snapshot');
+    return () => {
+      this.context = ctx; this.heap.clear(); this.priorities.clear(); this.dirty = false;
+      for (const pid of queue) {
+        const pcb = ctx.process(pid);
+        if (pcb !== undefined) { this.heap.push(pid); this.priorities.set(pid, pcb.priority); }
+      }
+      this.refresh();
+    };
   }
   private refresh(): void { this.levels[0] = this.heap.toArray(); this.buildSnapshot(this.levels, 0); }
 }

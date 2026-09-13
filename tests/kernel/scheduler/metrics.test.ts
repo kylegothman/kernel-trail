@@ -5,9 +5,10 @@ import { MinHeap } from '@kernel/scheduler/MinHeap';
 import { SjfScheduler } from '@kernel/scheduler/sjf';
 import { SchedulingAccounting, computeSchedulingMetrics } from '@kernel/scheduler/metrics';
 import type { CompletedRecord, MetricsInput } from '@kernel/scheduler/metrics';
+import { snapshotArray, snapshotObject } from '@kernel/scheduler/SchedulerBase';
 import { tieBreak } from '@kernel/scheduler/tieBreak';
 import { asPid, asTick } from '@kernel/types';
-import type { ProcessControlBlock } from '@kernel/types';
+import type { JsonValue, ProcessControlBlock } from '@kernel/types';
 import { canonical } from '../canonical';
 import { REFERENCE_CONFIG } from '../fixtures/referenceConfig';
 
@@ -231,6 +232,154 @@ describe('scheduling accounting', () => {
     } finally {
       recompute.mockRestore();
     }
+  });
+});
+
+describe('scheduling accounting persistence', () => {
+  function savedFixture() {
+    return {
+      busyTicks: 5,
+      firstRuns: [[2, 3], [9, 0]],
+      completed: [{ pid: 9, arrivalTick: 0, firstRunTick: 0, turnaround: 3, totalService: 3 }],
+    };
+  }
+
+  it('round-trips completed and unfinished work, then continues with exact metrics', () => {
+    const source = new SchedulingAccounting();
+    const done = pcb(9, 1, 3);
+    const unfinished = pcb(2, 2, 5);
+    const waiting = pcb(5, 4);
+    source.dispatch(done, asTick(0));
+    done.totalCpuUsed = 3;
+    done.state = 'zombie';
+    source.complete(done, asTick(3));
+    source.dispatch(unfinished, asTick(3));
+    unfinished.totalCpuUsed = 2;
+    unfinished.state = 'running';
+    for (let tick = 0; tick < 5; tick += 1) source.accountBusyTick();
+    expect(source.saveState()).toEqual(savedFixture());
+    const restored = new SchedulingAccounting();
+    restored.restoreState(source.saveState());
+    const processes = [done, unfinished, waiting];
+    expect(canonical(restored.recompute(asTick(5), processes, 2)))
+      .toBe(canonical(source.recompute(asTick(5), processes, 2)));
+    unfinished.totalCpuUsed = 5;
+    unfinished.state = 'zombie';
+    for (const accounting of [source, restored]) {
+      accounting.dispatch(unfinished, asTick(5));
+      for (let tick = 0; tick < 3; tick += 1) accounting.accountBusyTick();
+      accounting.complete(unfinished, asTick(8));
+    }
+    expect(canonical(restored.saveState())).toBe(canonical(source.saveState()));
+    expect(canonical(restored.recompute(asTick(10), processes, 2)))
+      .toBe(canonical(source.recompute(asTick(10), processes, 2)));
+    expect(restored.recompute(asTick(10), processes, 2)).toEqual({
+      averageWaitingTime: 1, averageTurnaroundTime: 5, averageResponseTime: 1,
+      throughput: 20, cpuUtilisation: 0.8, contextSwitches: 2, worstWait: 6,
+    });
+  });
+
+  it('serializes first dispatches and completion records in ascending pid order', () => {
+    const accounting = new SchedulingAccounting();
+    const first = pcb(9);
+    const second = pcb(2);
+    for (const process of [first, second]) {
+      accounting.dispatch(process, asTick(0));
+      accounting.complete(process, asTick(0));
+    }
+    expect(accounting.saveState()).toEqual({
+      busyTicks: 0,
+      firstRuns: [[2, 0], [9, 0]],
+      completed: [
+        { pid: 2, arrivalTick: 0, firstRunTick: 0, turnaround: 0, totalService: 0 },
+        { pid: 9, arrivalTick: 0, firstRunTick: 0, turnaround: 0, totalService: 0 },
+      ],
+    });
+  });
+
+  it('detaches every saved row and pair from live accounting state', () => {
+    const accounting = new SchedulingAccounting();
+    accounting.restoreState(savedFixture());
+    const before = canonical(accounting.saveState());
+    const saved = snapshotObject(accounting.saveState(), 'saved accounting');
+    Reflect.set(saved, 'busyTicks', 100);
+    const firstRuns = snapshotArray(saved['firstRuns'], 'saved first runs');
+    const pair = snapshotArray(firstRuns[0], 'saved first run');
+    Reflect.set(pair, 1, 99);
+    const rows = snapshotArray(saved['completed'], 'saved completions');
+    const record = snapshotObject(rows[0], 'saved completion');
+    Reflect.set(record, 'totalService', 100);
+    expect(canonical(accounting.saveState())).toBe(before);
+  });
+
+  it('prepares without mutation and detaches parsed data before committing', () => {
+    const accounting = new SchedulingAccounting();
+    const before = canonical(accounting.saveState());
+    const state = savedFixture();
+    const expected = canonical(state);
+    const commit = accounting.prepareRestore(state);
+    expect(canonical(accounting.saveState())).toBe(before);
+    state.busyTicks = 100;
+    state.firstRuns[0] = [2, 100];
+    state.completed[0] = { pid: 9, arrivalTick: 0, firstRunTick: 0, turnaround: 100, totalService: 100 };
+    commit();
+    expect(canonical(accounting.saveState())).toBe(expected);
+  });
+
+  it('rejects malformed counters, identities and records without partial mutation', () => {
+    const accounting = new SchedulingAccounting();
+    const valid = savedFixture();
+    accounting.restoreState(valid);
+    const before = canonical(accounting.saveState());
+    const record = { pid: 9, arrivalTick: 0, firstRunTick: 0, turnaround: 3, totalService: 3 };
+    const malformed: readonly JsonValue[] = [
+      null,
+      {},
+      { ...valid, busyTicks: -1 },
+      { ...valid, busyTicks: 1.5 },
+      { ...valid, busyTicks: Number.NaN },
+      { ...valid, busyTicks: Number.POSITIVE_INFINITY },
+      { ...valid, busyTicks: Number.MAX_SAFE_INTEGER + 1 },
+      { ...valid, firstRuns: [[0, 1]] },
+      { ...valid, firstRuns: [[1, 1]] },
+      { ...valid, firstRuns: [[2.5, 1]] },
+      { ...valid, firstRuns: [[2, -1]] },
+      { ...valid, firstRuns: [[2, 0.5]] },
+      { ...valid, firstRuns: [[2]] },
+      { ...valid, firstRuns: [[2, 1, 2]] },
+      { ...valid, firstRuns: [[2, 3], [2, 4]] },
+      { ...valid, completed: [{ ...record, pid: 1 }] },
+      { ...valid, completed: [record, { ...record }] },
+      { ...valid, completed: [{ ...record, arrivalTick: -1 }] },
+      { ...valid, completed: [{ ...record, firstRunTick: Number.NaN }] },
+      { ...valid, completed: [{ ...record, turnaround: Number.POSITIVE_INFINITY }] },
+      { ...valid, completed: [{ ...record, turnaround: 2 }] },
+      { ...valid, completed: [{ ...record, totalService: -1 }] },
+      { ...valid, completed: [{ ...record, totalService: 0.5 }] },
+      { ...valid, completed: [{ ...record, arrivalTick: 1 }] },
+      { ...valid, completed: [{ ...record, firstRunTick: 1 }] },
+      { ...valid, firstRuns: [[9, 1]] },
+      { ...valid, firstRuns: [] },
+      { ...valid, firstRuns: [[9, Number.MAX_SAFE_INTEGER]], completed: [
+        { ...record, arrivalTick: Number.MAX_SAFE_INTEGER, firstRunTick: Number.MAX_SAFE_INTEGER },
+      ] },
+    ];
+    for (const state of malformed) {
+      expect(() => accounting.prepareRestore(state)).toThrow();
+      expect(canonical(accounting.saveState())).toBe(before);
+      expect(() => accounting.restoreState(state)).toThrow();
+      expect(canonical(accounting.saveState())).toBe(before);
+    }
+  });
+
+  it('round-trips a terminated process that never received a dispatch', () => {
+    const source = new SchedulingAccounting();
+    const neverRan = pcb(2, 1);
+    source.complete(neverRan, asTick(300));
+    const restored = new SchedulingAccounting();
+    restored.restoreState(source.saveState());
+    expect(canonical(restored.recompute(asTick(300), [], 0)))
+      .toBe(canonical(source.recompute(asTick(300), [], 0)));
   });
 });
 

@@ -1,5 +1,6 @@
+import { asPid } from '../types';
 import type {
-  Pid, ProcessControlBlock, SchedulerContext, SchedulerId, SchedulerParams,
+  JsonValue, SubsystemEnvelope, Pid, ProcessControlBlock, SchedulerContext, SchedulerId, SchedulerParams,
   SchedulerPolicy, SchedulerSnapshot, SchedulingDecision, SchedulingMetrics,
 } from '../types';
 import { DEFAULT_SCHEDULER_PARAMS, EMPTY_METRICS } from './common';
@@ -77,12 +78,96 @@ export abstract class SchedulerBase implements SchedulerPolicy {
     return this.view;
   }
 
-  // TODO(astra): blocked on contract change, see report
-  saveState(): never {
-    throw new Error('not implemented: scheduler save state requires a typed SubsystemSnapshots.scheduler slot');
+  protected abstract saveDetails(): JsonValue;
+  protected abstract prepareRestoreDetails(detail: JsonValue, queues: readonly (readonly Pid[])[], ctx: SchedulerContext): () => void;
+
+  /** A detached save contribution. The live snapshot remains allocation-free. */
+  saveState(): SubsystemEnvelope {
+    return { owner: 'scheduler', version: 1, payload: {
+      policy: this.id, params: saveSchedulerParams(this.params),
+      queues: this.queues.map(queue => [...queue]), running: this.running,
+      quantumRemaining: this.quantumRemaining, metrics: { ...this.metrics }, detail: this.saveDetails(),
+    } };
   }
-  // TODO(astra): blocked on contract change, see report
-  restoreState(): never {
-    throw new Error('not implemented: scheduler restore requires a typed SubsystemSnapshots.scheduler slot');
+
+  restoreState(envelope: SubsystemEnvelope, ctx: SchedulerContext): void {
+    if (envelope.owner !== 'scheduler' || envelope.version !== 1) throw new Error('invalid scheduler envelope owner or version');
+    const payload = snapshotObject(envelope.payload, 'policy payload');
+    if (payload['policy'] !== this.id) throw new Error('scheduler snapshot policy mismatch');
+    const params = restoreSchedulerParams(payload['params']);
+    const queues = snapshotArray(payload['queues'], 'queues').map(value =>
+      snapshotArray(value, 'queue').map(pid => snapshotPid(pid, 'queued pid')));
+    const ready = queues.flat();
+    if (new Set(ready).size !== ready.length || ready.length !== ctx.readyQueue.length
+      || ready.some(pid => ctx.process(pid)?.state !== 'ready' || !ctx.readyQueue.includes(pid))) {
+      throw new Error('scheduler snapshot ready membership mismatch');
+    }
+    const running = payload['running'] === null ? null : snapshotPid(payload['running'], 'running');
+    if (running !== ctx.running || (running !== null && ctx.process(running)?.state !== 'running')) {
+      throw new Error('scheduler snapshot running process mismatch');
+    }
+    const quantum = snapshotInteger(payload['quantumRemaining'], 'quantum remaining');
+    const metrics = restoreSchedulingMetrics(payload['metrics']);
+    const detail = payload['detail'];
+    if (detail === undefined) throw new Error('missing scheduler detail');
+    const commit = this.prepareRestoreDetails(detail, queues, ctx);
+    this.configure(params);
+    commit();
+    this.running = running;
+    this.buildSnapshot(queues, quantum, metrics);
   }
+}
+
+function isSnapshotObject(value: JsonValue | undefined): value is { readonly [key: string]: JsonValue } {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+export function snapshotObject(value: JsonValue | undefined, label: string): { readonly [key: string]: JsonValue } {
+  if (!isSnapshotObject(value)) throw new Error(`invalid scheduler ${label}`);
+  return value;
+}
+export function snapshotArray(value: JsonValue | undefined, label: string): readonly JsonValue[] {
+  if (!Array.isArray(value)) throw new Error(`invalid scheduler ${label}`);
+  return value;
+}
+export function snapshotInteger(value: JsonValue | undefined, label: string, min = 0): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < min) throw new Error(`invalid scheduler ${label}`);
+  return value;
+}
+export function snapshotNumber(value: JsonValue | undefined, label: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) throw new Error(`invalid scheduler ${label}`);
+  return value;
+}
+export function snapshotBoolean(value: JsonValue | undefined, label: string): boolean {
+  if (typeof value !== 'boolean') throw new Error(`invalid scheduler ${label}`);
+  return value;
+}
+export function snapshotPid(value: JsonValue | undefined, label: string): Pid { return asPid(snapshotInteger(value, label, 2)); }
+export function saveSchedulerParams(params: Readonly<SchedulerParams>): JsonValue {
+  return { ...params, ...(params.levelQuanta === undefined ? {} : { levelQuanta: [...params.levelQuanta] }) };
+}
+export function restoreSchedulerParams(value: JsonValue | undefined): SchedulerParams {
+  const params = snapshotObject(value, 'params');
+  return {
+    quantum: snapshotInteger(params['quantum'], 'quantum', 1),
+    agingInterval: snapshotInteger(params['agingInterval'], 'aging interval'),
+    starvationThreshold: snapshotInteger(params['starvationThreshold'], 'starvation threshold'),
+    starvationFatalThreshold: snapshotInteger(params['starvationFatalThreshold'], 'fatal threshold'),
+    preemptive: snapshotBoolean(params['preemptive'], 'preemptive'),
+    ...(params['levelQuanta'] === undefined ? {} : {
+      levelQuanta: snapshotArray(params['levelQuanta'], 'level quanta').map(item => snapshotInteger(item, 'level quantum', 1)),
+    }),
+  };
+}
+function restoreSchedulingMetrics(value: JsonValue | undefined): SchedulingMetrics {
+  const metrics = snapshotObject(value, 'metrics');
+  const cpuUtilisation = snapshotNumber(metrics['cpuUtilisation'], 'CPU utilisation');
+  if (cpuUtilisation > 1) throw new Error('invalid scheduler CPU utilisation');
+  return {
+    averageWaitingTime: snapshotNumber(metrics['averageWaitingTime'], 'average waiting'),
+    averageTurnaroundTime: snapshotNumber(metrics['averageTurnaroundTime'], 'average turnaround'),
+    averageResponseTime: snapshotNumber(metrics['averageResponseTime'], 'average response'),
+    throughput: snapshotNumber(metrics['throughput'], 'throughput'), cpuUtilisation,
+    contextSwitches: snapshotInteger(metrics['contextSwitches'], 'context switches'),
+    worstWait: snapshotInteger(metrics['worstWait'], 'worst wait'),
+  };
 }

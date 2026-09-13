@@ -1,5 +1,6 @@
-import type { Pid, ProcessControlBlock, SchedulerContext, SchedulingDecision, Tick } from '../types';
-import { SchedulerBase } from './SchedulerBase';
+import type { JsonValue, Pid, ProcessControlBlock, SchedulerContext, SchedulingDecision, Tick } from '../types';
+import { SchedulerBase, snapshotArray, snapshotInteger, snapshotObject } from './SchedulerBase';
+import { asTick } from '../types';
 import { tieBreak } from './tieBreak';
 
 /** FIFO admission order, preserving the phase-4 unblock before phase-5 admit. */
@@ -49,6 +50,30 @@ export class FcfsScheduler extends SchedulerBase {
     }
     this.compact(); this.refresh();
     return this.decision(ctx, null, 'no process is ready');
+  }
+  protected saveDetails(): JsonValue {
+    return this.entered.slice(this.head).map(entry => ({ tick: entry.tick, source: entry.source }));
+  }
+  protected prepareRestoreDetails(detail: JsonValue, queues: readonly (readonly Pid[])[], ctx: SchedulerContext): () => void {
+    const queue = queues[0];
+    if (queues.length !== 1 || queue === undefined) throw new Error('FCFS requires one queue');
+    const entries = snapshotArray(detail, 'FCFS entries').map((value): { tick: Tick; source: 'admit' | 'unblock' } => {
+      const entry = snapshotObject(value, 'FCFS entry');
+      const tick = asTick(snapshotInteger(entry['tick'], 'FCFS insertion tick'));
+      const source = entry['source'];
+      if (tick > ctx.tick || (source !== 'admit' && source !== 'unblock')) throw new Error('invalid FCFS insertion metadata');
+      return { tick, source };
+    });
+    if (entries.length !== queue.length) throw new Error('FCFS insertion metadata length mismatch');
+    for (let i = 1; i < entries.length; i++) {
+      if ((entries[i]?.tick ?? 0) < (entries[i - 1]?.tick ?? 0)) throw new Error('FCFS insertion ticks out of order');
+    }
+    return () => {
+      this.queue.length = 0; this.entered.length = 0; this.head = 0;
+      for (const pid of queue) this.queue.push(pid);
+      for (const entry of entries) this.entered.push(entry);
+      this.refresh();
+    };
   }
   private compact(): void {
     if (this.head > this.queue.length / 2) {

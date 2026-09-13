@@ -13,6 +13,10 @@ export class MinHeap {
     private readonly comparator: (a: ProcessControlBlock, b: ProcessControlBlock) => number,
   ) {}
 
+  clear(): void {
+    this.heap.length = 0; this.positions.clear(); this.sorted.length = 0; this.sortedDirty = false;
+  }
+
   get size(): number { return this.heap.length; }
 
   /** Queue membership is a set, so repeated notifications cannot duplicate it. */
