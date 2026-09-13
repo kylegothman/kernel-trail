@@ -521,3 +521,33 @@ State:
    `priority` to `basePriority` on dispatch. If it does not, report it; do not
    patch it.
 6. Every `// TODO(astra):` left in the tree, with file and line.
+
+---
+
+## Added scope, 2026-09-13: the scheduler snapshot contribution
+
+Amendment 3 added a `scheduler` slot to `SubsystemSnapshots`. WP-03 left a
+persistence stub there because half the state worth persisting did not exist yet:
+aging timers, round robin position and MLFQ per-level state all arrive with this
+package.
+
+You own the whole thing:
+
+1. Fill the `scheduler` envelope with everything needed to resume a scheduler
+   mid-run. That means the queues at every level, quantum remaining, the aging
+   clock, the starvation timers, and the metrics accumulators. Not the computed
+   averages: the accumulators behind them.
+2. Remove WP-03's persistence stub.
+3. Promote the envelope to a typed interface in the same commit, and record the
+   promotion in `docs/07-CONTRACT-AMENDMENTS.md`.
+
+`SchedulerSnapshot` is not the answer and must not be reused for this. It is a
+per-tick read-only view for the HUD and the world, it carries computed averages
+rather than accumulators, and it holds no aging or starvation state at all.
+Restoring from it would silently reset a run's history.
+
+Acceptance, mechanically verifiable: a kernel running a mixed workload under MLFQ,
+snapshotted mid-run with processes spread across all three levels and at least one
+aged process, restored into a fresh kernel and stepped forward, produces a
+byte-identical continuation event log. A snapshot missing the accumulators is
+rejected rather than accepted.

@@ -226,9 +226,16 @@ interface when the scheduler is complete, and records that here.
 
 ### Consequences
 
-- **WP-03** gets a follow-up: fill the `scheduler` envelope and remove the
-  persistence stub. Its four gates already pass, so this is additive.
-- **WP-04** promotes the scheduler envelope to a typed interface when it lands.
+- **WP-04** owns the scheduler snapshot contribution end to end: fill the
+  `scheduler` envelope, remove WP-03's persistence stub, and promote the envelope
+  to a typed interface, all in one package.
+
+  This was initially split, with WP-03 filling the envelope and WP-04 promoting it.
+  That was the wrong seam. Filling and promoting are the same piece of thinking
+  about the same state, and WP-04 is adding priority aging, round robin and
+  three-level MLFQ, so half the state to persist does not exist until it lands.
+  Splitting the work would mean deriving the shape twice and amending twice.
+  WP-03's stub stays in place until then, which is correct and harmless.
 - **WP-05, WP-07, WP-09** each now have a slot that exists, so the obligation in
   their kickoff card is satisfiable. WP-05 owns both `memory` and `vm`.
 - **WP-11** reconstructs all ten, and its restore completeness check now has ten
