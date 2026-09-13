@@ -205,6 +205,10 @@ export class ThreadManager {
     this.distribute(pcb);
   }
 
+  private deferService = false;
+  /** Translation costs CPU time while the instruction's useful service remains pending. */
+  deferServiceCharge(): void { this.deferService = true; }
+
   /** A process tick is already accelerated, so precisely one thread consumes it. */
   deliver(pcb: ProcessControlBlock, execute: (thread: ThreadControlBlock) => boolean): Tid | null {
     const runnable = this.runnable(pcb);
@@ -216,8 +220,16 @@ export class ThreadManager {
     if (next === undefined) return null;
     this.lastDelivered.set(pcb.pid, next.tid);
     next.state = 'running';
+    const work = this.work(pcb);
+    const burst = pcb.cpuBurstRemaining; const service = pcb.serviceRemaining;
+    const threadService = next.serviceRemaining; const rawBurst = work.rawBurst; const rawService = work.rawService;
+    this.deferService = false;
     this.consume(pcb, next);
     const advance = execute(next);
+    if (this.deferService) {
+      pcb.cpuBurstRemaining = burst; pcb.serviceRemaining = service; next.serviceRemaining = threadService;
+      work.rawBurst = rawBurst; work.rawService = rawService;
+    }
     // Exec and exit may have removed the selected TCB during the callback.
     if (this.table.get(next.tid) === next) {
       if (advance) next.programCounter += 1;

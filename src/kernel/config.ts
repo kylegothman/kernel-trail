@@ -7,6 +7,8 @@ export interface KernelTuning {
   readonly maxThreadsPerProcess: number;
   readonly threadCreateTicks: number;
   readonly cowCopyTicks: number;
+  readonly tlbHitTicks: number;
+  readonly tlbMissTicks: number;
   readonly contextSwitchTicks: number;
   readonly deadlockDetectionInterval: number;
   readonly threadModel: ThreadModel;
@@ -19,6 +21,7 @@ export interface KernelTuning {
 
 export const DEFAULT_TUNING: KernelTuning = Object.freeze({
   maxProcesses: 64, maxThreadsPerProcess: 16, threadCreateTicks: 2, cowCopyTicks: 1,
+  tlbHitTicks: 1, tlbMissTicks: 2,
   contextSwitchTicks: 0, deadlockDetectionInterval: 20, threadModel: 'one_to_one',
   coreCount: 4, lwpPoolSize: 4, defaultSerialFraction: 0.25,
   degreeOfMultiprogramming: 8, checkInvariants: true,
@@ -54,6 +57,8 @@ export function resolveTuning(overrides: Partial<KernelTuning> = {}): KernelTuni
   integer('maxThreadsPerProcess', tuning.maxThreadsPerProcess, 1);
   integer('threadCreateTicks', tuning.threadCreateTicks, 0);
   integer('cowCopyTicks', tuning.cowCopyTicks, 0);
+  integer('tlbHitTicks', tuning.tlbHitTicks, 1);
+  integer('tlbMissTicks', tuning.tlbMissTicks, 1);
   integer('contextSwitchTicks', tuning.contextSwitchTicks, 0);
   if (tuning.contextSwitchTicks > 2) throw new KernelConfigError('contextSwitchTicks must be <= 2');
   integer('deadlockDetectionInterval', tuning.deadlockDetectionInterval, 1);
