@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from 'vitest';
 import { createKernel, type KernelImpl } from '@kernel/Kernel';
 import { KernelConfigError, KernelInvariantError } from '@kernel/errors';
 import { transition } from '@kernel/process/transitions';
+import { IpcManager, type SharedMapping } from '@kernel/process/ipc';
+import type { CowCapacity } from '@kernel/process/lifecycle';
 import { instructionProgram, generatedProgram, scriptedProgram, type ProgramSpec } from '@kernel/process/Program';
 import { createRng } from '@kernel/rng';
 import { asFrameId, asPageId, asPid, asResourceId, asTick } from '@kernel/types';
@@ -9,6 +11,8 @@ import type { AddressSpaceId, FileDescriptor, KernelEvent, Pid, ProcessControlBl
 import type { EmittableEvent } from '@kernel/EventBus';
 import { REFERENCE_CONFIG } from './fixtures/referenceConfig';
 import { canonical } from './canonical';
+
+const RESIDENT_CONFIG = { ...REFERENCE_CONFIG, enabledSubsystems: REFERENCE_CONFIG.enabledSubsystems.filter(id => id !== 'vm') };
 
 const WORK: ProgramSpec = { name: 'worker', priority: 20, burst: 100, service: 100, arrival: 0, pages: 3 };
 function live(kernel: KernelImpl, pid: Pid): ProcessControlBlock {
@@ -21,7 +25,7 @@ function value(result: SyscallResult): number {
   return result.value;
 }
 function family(maxProcesses = 64) {
-  const kernel = createKernel(REFERENCE_CONFIG, { maxProcesses });
+  const kernel = createKernel(RESIDENT_CONFIG, { maxProcesses });
   const parent = kernel.spawn(WORK); kernel.step();
   const call = (name: 'fork' | 'exit' | 'wait' | 'exec' | 'kill', pid = parent, args: (number | string)[] = []) => kernel.syscall({ name, pid, args });
   const fork = () => asPid(value(call('fork')));
@@ -30,7 +34,7 @@ function family(maxProcesses = 64) {
 
 describe('process construction and transitions', () => {
   it('init exists; idle is hidden; process views are finite, frozen and live', () => {
-    const kernel = createKernel(REFERENCE_CONFIG);
+    const kernel = createKernel(RESIDENT_CONFIG);
     expect(kernel.process(asPid(1))?.name).toBe('init');
     expect(kernel.process(asPid(0))?.serviceRemaining).toBe(Infinity);
     expect(kernel.processes.every(p => p.pid !== asPid(0))).toBe(true);
@@ -65,7 +69,7 @@ describe('process construction and transitions', () => {
   });
   it('every illegal edge, including waiting -> running and zombie -> ready, throws I-11', () => {
     const states: ProcessState[] = ['new', 'ready', 'running', 'waiting', 'zombie', 'terminated'];
-    const allowed = new Set(['new/ready', 'ready/running', 'running/ready', 'running/waiting', 'waiting/ready', 'running/zombie', 'ready/zombie', 'waiting/zombie', 'zombie/terminated', 'new/terminated']);
+    const allowed = new Set(['new/ready', 'ready/running', 'running/ready', 'running/waiting', 'ready/waiting', 'waiting/ready', 'running/zombie', 'ready/zombie', 'waiting/zombie', 'zombie/terminated', 'new/terminated']);
     const kernel = createKernel(REFERENCE_CONFIG); const pcb = live(kernel, kernel.spawn(WORK));
     for (const from of states) for (const to of states) {
       if (allowed.has(`${from}/${to}`)) continue;
@@ -73,6 +77,21 @@ describe('process construction and transitions', () => {
       try { transition(pcb, to, { tick: kernel.tick, emit: () => {} }); throw new Error('illegal edge accepted'); }
       catch (error) { expect(error).toBeInstanceOf(KernelInvariantError); expect(error).toMatchObject({ invariant: 11 }); }
     }
+  });
+  it('ready -> waiting requires memory suspension; every other reason still throws I-11', () => {
+    const kernel = createKernel(REFERENCE_CONFIG); const pcb = live(kernel, kernel.spawn(WORK));
+    const blockReason = { kind: 'sleep' as const, untilTick: asTick(9) };
+    for (const reason of [undefined, 'reparent'] as const) {
+      pcb.state = 'ready'; pcb.readySince = asTick(0);
+      expect(() => transition(pcb, 'waiting', { tick: asTick(4), emit: () => {}, blockReason, ...(reason === undefined ? {} : { reason }) }))
+        .toThrowError(expect.objectContaining({ invariant: 11 }));
+      expect(pcb.state).toBe('ready'); expect(pcb.readySince).toBe(0);
+    }
+    const events: EmittableEvent[] = []; const blocked = vi.fn();
+    transition(pcb, 'waiting', { tick: asTick(4), emit: event => events.push(event), reason: 'memory_suspension', blockReason, onBlock: blocked });
+    expect(pcb).toMatchObject({ state: 'waiting', readySince: null, blockedOn: blockReason });
+    expect(blocked).toHaveBeenCalledExactlyOnceWith(pcb);
+    expect(events).toEqual([{ type: 'process.state_changed', pid: pcb.pid, from: 'ready', to: 'waiting' }]);
   });
   it('dispatch resets aged priority and admission emits process.created exactly once', () => {
     const { kernel, parent, fork } = family(); const child = fork(); live(kernel, child).priority = 0;
@@ -131,6 +150,57 @@ describe('fork, exit, wait and exec', () => {
     expect(events.filter(e => e.type === 'memory.page_evicted')).toHaveLength(0);
     expect(kernel.lifecycle.cowRefCount.get(asFrameId(0))).toBe(1); expect(pages[0]?.writable).toBe(true);
     expect(childPages?.[0]?.writable).toBe(true); expect(childPages?.[0]?.frame).toBe(3);
+  });
+  it('pending COW capacity emits one minor and preserves copying and refcounts until the reserved frame is ready', () => {
+    const { kernel, parent, fork } = family(); const child = live(kernel, fork());
+    const page = asPageId(0); const source = kernel.pageTables.get(child.addressSpaceId)?.find(entry => entry.page === page)?.frame;
+    if (source === undefined || source === null) throw new Error('missing COW source');
+    let reported = false; let capacity: CowCapacity = { state: 'pending', reported: false };
+    const prepare = vi.fn(() => capacity.state === 'pending' ? { ...capacity, reported } : capacity);
+    const copy = vi.fn((from: typeof source, to: typeof source) => kernel.memorySubsystem.copyFrame(from, to));
+    kernel.installHooks({ memory: { prepareCow: prepare, copyFrame: copy } });
+    const events: KernelEvent[] = [];
+    kernel.events.onAny(event => { events.push(event); if (event.type === 'memory.page_fault') reported = true; });
+    const before = kernel.process(parent)?.serviceRemaining;
+    expect(kernel.lifecycle.resolveCow(child, page)).toEqual({ pending: true });
+    expect(kernel.lifecycle.resolveCow(child, page)).toEqual({ pending: true });
+    expect(copy).not.toHaveBeenCalled(); expect(kernel.lifecycle.cowRefCount.get(source)).toBe(2);
+    expect(kernel.pageTables.get(child.addressSpaceId)?.find(entry => entry.page === page)).toMatchObject({ frame: source, writable: false });
+    expect(kernel.process(parent)?.serviceRemaining).toBe(before);
+    const frame = kernel.memorySubsystem.allocateFrame(child.addressSpaceId, page);
+    if (frame === null) throw new Error('missing reserved COW capacity');
+    capacity = { state: 'ready', frame, reported };
+    expect(kernel.lifecycle.resolveCow(child, page)).toEqual({ ok: true, value: frame });
+    expect(copy).toHaveBeenCalledExactlyOnceWith(source, frame);
+    expect(prepare).toHaveBeenCalledWith(child.pid, page, source);
+    expect(kernel.lifecycle.cowRefCount.get(source)).toBe(1); expect(kernel.lifecycle.cowRefCount.get(frame)).toBe(1);
+    expect(events.filter(event => event.type === 'memory.page_fault')).toMatchObject([{ pid: child.pid, page, major: false }]);
+    expect(events.filter(event => event.type === 'memory.page_loaded')).toMatchObject([{ pid: child.pid, page, frame }]);
+  });
+  it('shared mapping resolution and notifications preserve backing identity across nonresident aliases and unmap', () => {
+    const { kernel, parent, fork } = family(); const owner = live(kernel, parent); const child = live(kernel, fork());
+    const backingPage = asPageId(0); const source = kernel.pageTables.get(owner.addressSpaceId)?.find(entry => entry.page === backingPage);
+    if (source?.frame === null || source === undefined) throw new Error('missing shared backing');
+    const frame = kernel.frame(source.frame); if (frame === undefined) throw new Error('missing shared frame');
+    const notifications: { kind: string; mapping: SharedMapping; resolved: SharedMapping | undefined; pinned: boolean }[] = [];
+    const ipc = new IpcManager({
+      process: pid => kernel.table.get(pid), pageTable: space => kernel.pageTables.get(space) ?? [], frame: id => kernel.frame(id),
+      rights: () => ['read'], block: () => {},
+      onSharedMap: (pid, mapping) => notifications.push({ kind: 'map', mapping, resolved: ipc.sharedMapping(pid, mapping.page), pinned: frame.pinned }),
+      onSharedUnmap: (pid, mapping) => notifications.push({ kind: 'unmap', mapping, resolved: ipc.sharedMapping(pid, mapping.page), pinned: frame.pinned }),
+    });
+    const region = asResourceId('read-only-shared'); ipc.createSharedRegion({ id: region, pages: [backingPage], space: owner.addressSpaceId, attached: [], value: 0 });
+    expect(ipc.mmap(child.pid, region, true)).toMatchObject({ ok: false, errno: 'EACCES' }); expect(notifications).toEqual([]);
+    const mappedPage = asPageId(value(ipc.mmap(child.pid, region, false)));
+    const mapping = { region, space: child.addressSpaceId, page: mappedPage, backingSpace: owner.addressSpaceId, backingPage };
+    expect(ipc.sharedMapping(child.pid, mappedPage)).toEqual(mapping); expect(Object.isFrozen(ipc.sharedMapping(child.pid, mappedPage))).toBe(true);
+    expect(notifications).toEqual([{ kind: 'map', mapping, resolved: mapping, pinned: true }]);
+    source.valid = false; source.frame = null; source.swapped = true; ipc.refreshSharedMappings();
+    expect(kernel.pageTables.get(child.addressSpaceId)?.find(entry => entry.page === mappedPage)).toMatchObject({ valid: false, frame: null, writable: false });
+    expect(ipc.sharedMapping(child.pid, mappedPage)).toEqual(mapping);
+    expect(ipc.munmap(child.pid, region).ok).toBe(true);
+    expect(notifications[1]).toEqual({ kind: 'unmap', mapping, resolved: undefined, pinned: false });
+    expect(ipc.sharedMapping(child.pid, mappedPage)).toBeUndefined();
   });
   it('exit releases resources, queues, descriptors and threads while preserving the zombie identity', () => {
     const { kernel, parent, call, fork } = family(); const child = fork(); kernel.step();
@@ -276,7 +346,7 @@ describe('lifecycle cleanup regressions', () => {
 });
 
 it('allProgramsScripted considers every runnable user process and excludes init', () => {
-  const kernel = createKernel(REFERENCE_CONFIG); expect(kernel.allProgramsScripted()).toBe(true);
+  const kernel = createKernel(RESIDENT_CONFIG); expect(kernel.allProgramsScripted()).toBe(true);
   kernel.spawn({ ...WORK, referenceString: [0, 1, 2] }); kernel.step(); expect(kernel.allProgramsScripted()).toBe(true);
   const generated = kernel.spawn(WORK); kernel.step(); expect(kernel.allProgramsScripted()).toBe(false);
   kernel.syscall({ name: 'exit', pid: generated, args: [0] }); expect(kernel.allProgramsScripted()).toBe(true);

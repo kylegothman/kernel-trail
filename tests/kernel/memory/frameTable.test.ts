@@ -254,7 +254,7 @@ describe('live page table adapter', () => {
 
 describe('aggregate memory and VM persistence', () => {
   function fixture(populate = false) {
-    const config = { ...REFERENCE_CONFIG, totalFrames: 16, pageSize: 64, tlbEntries: 4 };
+    const config = { ...REFERENCE_CONFIG, enabledSubsystems: REFERENCE_CONFIG.enabledSubsystems.filter(id => id !== 'vm'), totalFrames: 16, pageSize: 64, tlbEntries: 4 };
     const kernel = createKernel(config, { threadCreateTicks: 0 });
     const pid = kernel.spawn({ name: 'snapshot fixture', priority: 5, burst: 20, service: 20, arrival: 0, pages: 3 });
     const process = kernel.table.get(pid);
@@ -337,7 +337,7 @@ describe('aggregate memory and VM persistence', () => {
     const virtual = saved.vm.payload;
     const malformed: readonly (readonly [SubsystemEnvelope, SubsystemEnvelope])[] = [
       [{ ...saved.memory, version: 2 }, saved.vm],
-      [saved.memory, { ...saved.vm, version: 2 }],
+      [saved.memory, { ...saved.vm, version: 1 }],
       [{ ...saved.memory, payload: { ...payload, nextContent: 0 } }, saved.vm],
       [{ ...saved.memory, payload: { ...payload, contents: [...payload.contents, ...payload.contents] } }, saved.vm],
       [{ ...saved.memory, payload: { ...payload, requestedBytes: [...payload.requestedBytes, ...payload.requestedBytes] } }, saved.vm],

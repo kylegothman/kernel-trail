@@ -11,7 +11,7 @@ const LEGAL_EDGES: ReadonlySet<string> = Object.freeze(new Set([
 ]));
 
 export interface TransitionOptions {
-  readonly reason?: 'reparent';
+  readonly reason?: 'reparent' | 'memory_suspension';
   readonly blockReason?: BlockReason;
   readonly quantumExpired?: boolean;
   readonly reapedBy?: Pid;
@@ -46,7 +46,8 @@ export function transition(
     ctx.emit({ type: 'process.state_changed', pid: pcb.pid, from, to });
     return;
   }
-  if (!LEGAL_EDGES.has(`${from}->${to}`) || ctx.reason === 'reparent') {
+  const memorySuspension = from === 'ready' && to === 'waiting' && ctx.reason === 'memory_suspension';
+  if ((!LEGAL_EDGES.has(`${from}->${to}`) && !memorySuspension) || ctx.reason === 'reparent') {
     throw new KernelInvariantError(11, `illegal transition ${from}->${to}`);
   }
   if (to === 'waiting' && ctx.blockReason === undefined) {

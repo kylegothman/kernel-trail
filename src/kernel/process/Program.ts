@@ -1,5 +1,6 @@
 import type { DeviceId, PageId, ResourceId, Rng, SyscallRequest, Tid } from '../types';
 import { asPageId } from '../types';
+import { LocalityGenerator, type LocalityOptions } from '../memory/locality';
 
 export type Instruction =
   | { kind: 'compute' }
@@ -61,29 +62,15 @@ export function scriptedProgram(referenceString: readonly number[], serviceTicks
   return instructionProgram(instructions, refs);
 }
 
-// TODO(astra): replace with the sim spec 7.7 locality model in WP-06
-export function generatedProgram(rng: Rng, spec: Pick<ProgramSpec, 'pages' | 'service'>): Program {
+export function generatedProgram(rng: Rng, spec: Pick<ProgramSpec, 'pages' | 'service'>, options: LocalityOptions = {}): Program {
   if (!Number.isSafeInteger(spec.pages) || spec.pages < 0 || !Number.isSafeInteger(spec.service) || spec.service < 0) {
     throw new RangeError('invalid generated program dimensions');
   }
   const instructions: Instruction[] = [];
-  const pages = Array.from({ length: spec.pages }, (_, i) => asPageId(i));
-  let inside: PageId[] = [];
-  let outside: PageId[] = [];
+  const locality = new LocalityGenerator(rng, spec.pages, options);
   for (let i = 0; i < spec.service; i++) {
-    if (pages.length === 0) {
-      instructions.push(COMPUTE);
-      continue;
-    }
-    if (i % 40 === 0) {
-      const shuffled = rng.shuffle([...pages]);
-      const size = Math.ceil(spec.pages * 0.4);
-      inside = shuffled.slice(0, size);
-      outside = shuffled.slice(size);
-    }
-    const local = rng.chance(0.85);
-    const choices = local || outside.length === 0 ? inside : outside;
-    instructions.push({ kind: 'access', page: rng.pick(choices), write: false });
+    const reference = locality.next();
+    instructions.push(reference === null ? COMPUTE : { kind: 'access', ...reference });
   }
   return instructionProgram(instructions);
 }

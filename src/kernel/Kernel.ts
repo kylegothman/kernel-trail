@@ -9,11 +9,12 @@ import { KernelInvariantError } from './errors';
 import { DEFAULT_TUNING, resolveTuning, validateConfig, type KernelTuning } from './config';
 import { ProcessTable } from './process/ProcessTable';
 import { transition, type TransitionOptions } from './process/transitions';
-import { ProcessLifecycle } from './process/lifecycle';
+import { ProcessLifecycle, type CowCapacity } from './process/lifecycle';
 import { ThreadManager, type ThreadControlBlock } from './process/threads';
 import { generatedProgram, scriptedProgram, instructionProgram, type Program, type ProgramSpec } from './process/Program';
 import { IpcManager } from './process/ipc';
 import { MemorySubsystem } from './memory/MemorySubsystem';
+import type { SuspendedProcess } from './memory/demandPaging';
 import type {
   AddressSpaceId,
   AllocationStrategy,
@@ -112,6 +113,7 @@ export interface MemoryHooks {
   allocateFrame(space: AddressSpaceId, page: PageId): FrameId | null;
   freeFrame(frame: FrameId): void;
   copyFrame(from: FrameId, to: FrameId): void;
+  prepareCow(pid: Pid, page: PageId, source: FrameId): CowCapacity;
 }
 export interface SyncHooks {
   expireTimers(tick: Tick): void;
@@ -206,6 +208,7 @@ export class KernelImpl implements Kernel {
   private schedulingMetrics: SchedulingMetrics = EMPTY_SCHEDULING_METRICS;
   private memoryMetrics: MemoryMetrics = EMPTY_MEMORY_METRICS;
   private readonly invariantSlowInterval: number;
+  private readonly devBuild: boolean;
 
   private memory: MemoryHooks;
   // TODO(astra): WP-07 supplies ordered synchronization waits and condition timers.
@@ -243,15 +246,38 @@ export class KernelImpl implements Kernel {
     this.requestedScheduler = config.scheduler;
     this.tuning = resolveTuning({ ...options, checkInvariants: options.checkInvariants ?? options.devBuild ?? true });
     this.invariantSlowInterval = options.invariantSlowInterval ?? 50;
+    this.devBuild = options.devBuild ?? options.checkInvariants ?? true;
     this.enabled = new Set(config.enabledSubsystems);
     this.rng = createStreams(config.seed);
     this.schedulerParams = { ...config.schedulerParams };
     this.scheduler = this.makeScheduler(config.scheduler);
     this.diskHead = { cylinder: 0, direction: 'up', totalCylinders: config.totalCylinders };
+    const vmRng = this.rng.streams.get('vm');
+    if (vmRng === undefined) throw new Error('vm RNG stream missing');
     this.memorySubsystem = new MemorySubsystem(this.config, {
+      rng: vmRng,
       tick: () => this.tick, process: pid => this.process(pid), processes: () => this.processes,
       pageTables: this.pageTables, emit: event => this.publish(event),
       refreshSharedMappings: () => this.ipc.refreshSharedMappings(),
+      sharedMapping: (pid, page) => this.ipc.sharedMapping(pid, page),
+      onEvicted: frame => this.lifecycle.forgetEvictedFrame(frame),
+      refuseOptimal: () => {
+        this.setReplacementPolicy('fifo');
+        if (this.devBuild) this.publish({ type: 'kernel.panic', message: 'OPT requires a scripted workload; using FIFO' });
+      },
+      terminate: (pid, reason) => { const pcb = this.table.get(pid); if (pcb !== undefined) this.exitProcess(pcb, 1, reason); },
+      suspend: (pid, tick, until) => this.suspendMemoryProcess(pid, tick, until),
+      resume: record => this.resumeMemoryProcess(record),
+      futureReferences: pid => {
+        if (!this.allProgramsScripted()) return null;
+        const pcb = this.table.get(pid); const program = this.programs.get(pid);
+        if (pcb === undefined || program === undefined || program.referenceString === null) return null;
+        const result: PageId[] = [];
+        for (let pc = this.threadPc(pcb) + 1; pc < program.length; pc++) {
+          const instruction = program.at(pc); if (instruction.kind === 'access') result.push(instruction.page);
+        }
+        return result;
+      },
       accessKey: pid => this.executingThread === undefined ? undefined : `${pid}:${this.executingThread}`,
       releaseAddressSpace: space => {
         const pcb = this.table.filterAscending(process => process.addressSpaceId === space)[0];
@@ -259,10 +285,12 @@ export class KernelImpl implements Kernel {
       },
     }, { tuning: this.tuning });
     const memory = this.memorySubsystem;
+    this.events.onAny(event => memory.observeEvent(event));
     this.memory = { expireTimers: tick => memory.expireTimers(tick), admit: pcb => memory.admit(pcb),
       access: (pid, page, write) => memory.access(pid, page, write), isSatisfied: (pid, reason) => memory.isSatisfied(pid, reason),
       allocateFrame: (space, page) => memory.allocateFrame(space, page), freeFrame: frame => memory.freeFrame(frame),
-      copyFrame: (from, to) => memory.copyFrame(from, to) };
+      copyFrame: (from, to) => memory.copyFrame(from, to),
+      prepareCow: (pid, page, source) => memory.prepareCow(pid, page, source) };
     this.snapshotHooks.push({ saveState: () => memory.saveState(), restoreState: snapshot => memory.prepareKernelRestore(snapshot) });
     this.threads = new ThreadManager({ model: this.tuning.threadModel,
       coreCount: this.tuning.coreCount, lwpPoolSize: this.tuning.lwpPoolSize,
@@ -303,6 +331,7 @@ export class KernelImpl implements Kernel {
       wakeParent: pid => { this.wakeable.add(pid); },
       chargeCowCopy: (pcb, ticks) => { this.copyDebt.set(pcb.pid, (this.copyDebt.get(pcb.pid) ?? 0) + ticks); },
       memory: { pageTables: this.pageTables,
+        prepareCow: (pid, page, source) => this.memory.prepareCow(pid, page, source),
         allocateFrame: (space, page) => this.memory.allocateFrame(space, page),
         freeFrame: frame => this.memory.freeFrame(frame), copyFrame: (from, to) => this.memory.copyFrame(from, to) },
     });
@@ -310,6 +339,8 @@ export class KernelImpl implements Kernel {
       pageTable: space => { let table = this.pageTables.get(space); if (table === undefined) { table = []; this.pageTables.set(space, table); } return table; },
       frame: id => this.frames[id], rights: (pid, id) => this.security.rights(pid, id),
       block: (pid, reason) => this.blockProcess(pid, reason),
+      onSharedMap: (pid, mapping) => memory.sharedMapped(pid, mapping),
+      onSharedUnmap: (pid, mapping) => memory.sharedUnmapped(pid, mapping),
     });
     this.initialiseFrameTable();
     this.initialiseSystemProcesses();
@@ -364,10 +395,10 @@ export class KernelImpl implements Kernel {
     { rawBurst: spec.burst, rawService: spec.service, serialFraction: serial });
     for (let i = 0; i < count; i++) pcb.threads.push(this.threads.newTid());
     this.threads.attach(pcb);
-    const stream = this.rng.streams.get('process');
-    if (stream === undefined) throw new Error('process RNG stream missing');
+    const stream = this.rng.streams.get('vm');
+    if (stream === undefined) throw new Error('vm RNG stream missing');
     const program = options.program ?? (spec.referenceString === undefined
-      ? generatedProgram(stream.fork(String(pid)), spec) : scriptedProgram(spec.referenceString, spec.service));
+      ? generatedProgram(stream, spec, this.tuning) : scriptedProgram(spec.referenceString, spec.service));
     this.programs.set(pid, program); this.namedPrograms.set(spec.name, program); this.burstSizes.set(pid, spec.burst);
     this.pageTables.set(pcb.addressSpaceId, Array.from({ length: spec.pages }, (_, i) => ({ page: asPageId(i),
       frame: null, valid: false, dirty: false, referenced: false, readable: true, writable: true,
@@ -383,7 +414,7 @@ export class KernelImpl implements Kernel {
     this.phase02_serviceDeviceCompletions();
     this.phase03_deliverInterrupts();
     this.phase04_resolveBlockedProcesses();
-    this.phase05_admitNewProcesses();
+    if (this.memorySubsystem.admissionAllowed()) this.phase05_admitNewProcesses(); else this.probe(5);
     this.phase06_ageAndDetectStarvation();
     this.phase07_scheduleDecision();
     this.phase08_executeOneTick();
@@ -461,6 +492,38 @@ export class KernelImpl implements Kernel {
     if (wholeProcess) this.move(pcb, 'waiting', { blockReason: reason });
     else { this.threads.recompute(pcb); this.move(pcb, 'ready'); }
   }
+  private blockMemoryAccess(pcb: ProcessControlBlock, page: PageId, tid: Tid): void {
+    const service = pcb.threads.map(id => this.threads.table.get(id)).filter((item): item is ThreadControlBlock => item !== undefined)
+      .map(item => ({ thread: item, remaining: item.serviceRemaining }));
+    this.blockProcess(pcb.pid, { kind: 'page_fault', page }, tid);
+    // Deferred delivery restores the caller's charge; blocking must not redistribute its siblings' service.
+    for (const item of service) item.thread.serviceRemaining = item.remaining;
+  }
+  private suspendMemoryProcess(pid: Pid, tick: Tick, untilTick: Tick): SuspendedProcess {
+    const pcb = this.table.get(pid);
+    if (pcb === undefined || (pcb.state !== 'ready' && pcb.state !== 'running' && pcb.state !== 'waiting')) throw new RangeError('only an admitted process can be suspended');
+    const threads = pcb.threads.map(tid => this.threads.table.get(tid)).filter((thread): thread is ThreadControlBlock => thread !== undefined).sort((a, b) => a.tid - b.tid);
+    const saved: SuspendedProcess = { pid, suspendedAt: tick, untilTick, previousState: pcb.state,
+      previousBlockedOn: pcb.blockedOn === null ? null : { ...pcb.blockedOn },
+      threads: threads.map(thread => ({ tid: thread.tid, state: thread.state, blockedOn: thread.blockedOn === null ? null : { ...thread.blockedOn } })) };
+    const reason: BlockReason = { kind: 'sleep', untilTick };
+    for (const thread of threads) if (thread.state !== 'terminated') { thread.state = 'waiting'; thread.blockedOn = reason; }
+    if (pcb.state === 'waiting') pcb.blockedOn = reason;
+    else this.move(pcb, 'waiting', { reason: 'memory_suspension', blockReason: reason });
+    return saved;
+  }
+  private resumeMemoryProcess(saved: SuspendedProcess): void {
+    const pcb = this.table.get(saved.pid);
+    if (pcb === undefined || pcb.state !== 'waiting') return;
+    for (const prior of saved.threads) {
+      const thread = this.threads.table.get(prior.tid);
+      if (thread === undefined || thread.pid !== saved.pid) throw new Error('suspended thread is missing');
+      thread.state = prior.state === 'running' ? 'ready' : prior.state;
+      thread.blockedOn = prior.blockedOn === null ? null : { ...prior.blockedOn };
+    }
+    pcb.blockedOn = saved.previousBlockedOn === null ? null : { ...saved.previousBlockedOn };
+    if (this.threads.runnable(pcb).length > 0) { this.threads.recompute(pcb); this.move(pcb, 'ready'); }
+  }
   setScheduler(id: SchedulerId, params?: Partial<SchedulerParams>): void {
     const nextParams = { ...this.schedulerParams, ...params };
     const next = this.makeScheduler(id, nextParams);
@@ -468,10 +531,34 @@ export class KernelImpl implements Kernel {
     for (const pcb of this.table.filterAscending(p => p.pid > 1 && p.state === 'ready')) this.scheduler.onAdmit(pcb, this.schedulerContext());
     this.syncSchedulerView();
   }
-  setReplacementPolicy(_id: PageReplacementId): void {
-    // TODO(astra): WP-06 implements this.
-    throw new Error('not implemented: setReplacementPolicy');
+  setReplacementPolicy(id: PageReplacementId): void {
+    if (id === 'optimal' && !this.allProgramsScripted()) {
+      if (this.devBuild) this.publish({ type: 'kernel.panic', message: 'OPT requires a scripted workload' });
+      return;
+    }
+    this.memorySubsystem.setReplacementPolicy(id);
+    this.currentConfig = cloneConfig({ ...this.config, replacementPolicy: id });
   }
+  halveRemainingBurst(pid: Pid): void {
+    const pcb = this.table.get(pid); const raw = this.table.raw.get(pid);
+    if (pcb === undefined || raw === undefined || ['zombie', 'terminated'].includes(pcb.state)) throw new RangeError('process has no remaining work');
+    raw.rawBurst = Math.ceil(raw.rawBurst / 2); raw.rawService = Math.ceil(raw.rawService / 2);
+    if (this.threads.runnable(pcb, true).length > 0) this.threads.recompute(pcb);
+    else {
+      const priorService = pcb.serviceRemaining;
+      pcb.cpuBurstRemaining = Math.ceil(pcb.cpuBurstRemaining / 2); pcb.serviceRemaining = Math.ceil(priorService / 2);
+      const threads = pcb.threads.map(tid => this.threads.table.get(tid)).filter((thread): thread is ThreadControlBlock => thread !== undefined);
+      const shares = threads.map(thread => ({ thread, exact: priorService === 0 ? 0 : pcb.serviceRemaining * thread.serviceRemaining / priorService }));
+      for (const share of shares) share.thread.serviceRemaining = Math.floor(share.exact);
+      shares.sort((a, b) => (b.exact % 1) - (a.exact % 1) || a.thread.tid - b.thread.tid);
+      const remainder = pcb.serviceRemaining - shares.reduce((sum, share) => sum + share.thread.serviceRemaining, 0);
+      for (const share of shares.slice(0, remainder)) share.thread.serviceRemaining += 1;
+    }
+  }
+  prefetchNextFaults(pid: Pid, count: number): void { this.memorySubsystem.prefetchNextFaults(pid, count); }
+  remapOptimalLocality(pid: Pid): void { this.memorySubsystem.remapOptimalLocality(pid); }
+  setDegreeOfMultiprogramming(target: number): void { this.memorySubsystem.setDegreeOfMultiprogramming(target); }
+
   setAllocationStrategy(strategy: AllocationStrategy): void {
     this.memorySubsystem.setAllocationStrategy(strategy);
     this.currentConfig = cloneConfig({ ...this.config, allocationStrategy: strategy });
@@ -634,6 +721,7 @@ export class KernelImpl implements Kernel {
     }
   }
   private isSatisfied(pcb: ProcessControlBlock, reason: BlockReason): boolean {
+    if (this.memorySubsystem.isSuspended(pcb.pid)) return false;
     switch (reason.kind) {
       case 'sleep': return reason.untilTick <= this.tick;
       case 'child_wait': return this.lifecycle.hasExitedChild(pcb.pid, reason.child);
@@ -711,15 +799,20 @@ export class KernelImpl implements Kernel {
       case 'compute': return true;
       case 'access': {
         if (!this.enabled.has('memory') && !this.enabled.has('vm')) return true;
-        const cow = instruction.write ? this.lifecycle.resolveCow(pcb, instruction.page) : null;
+        const page = this.memorySubsystem.resolvePage(pcb.pid, instruction.page);
+        const cow = instruction.write ? this.lifecycle.resolveCow(pcb, page) : null;
         if (cow !== null) {
-          if (!cow.ok) this.lifecycle.exit(pcb, 1, 'out_of_memory');
+          this.threads.deferServiceCharge();
+          if ('pending' in cow) this.blockMemoryAccess(pcb, page, thread.tid);
+          else if (!cow.ok) this.exitProcess(pcb, 1, 'out_of_memory');
           return false;
         }
-        const result = this.memory.access(pcb.pid, instruction.page, instruction.write);
+        const result = this.memory.access(pcb.pid, page, instruction.write);
+        if (['zombie', 'terminated'].includes(pcb.state)) { this.threads.deferServiceCharge(); return false; }
         if (!result.hit) {
-          this.publish({ type: 'memory.page_fault', pid: pcb.pid, page: instruction.page, major: true });
-          this.blockProcess(pcb.pid, { kind: 'page_fault', page: instruction.page }, thread.tid);
+          this.threads.deferServiceCharge();
+          this.publish({ type: 'memory.page_fault', pid: pcb.pid, page, major: true });
+          this.blockMemoryAccess(pcb, page, thread.tid);
         }
         if (result.hit && !this.memorySubsystem.accessComplete(pcb.pid)) {
           this.threads.deferServiceCharge(); return false;
@@ -769,6 +862,7 @@ export class KernelImpl implements Kernel {
         this.scheduler.onUnblock(p, this.schedulerContext());
       },
       onBlock: p => {
+        this.removeReady(p.pid);
         if (this.running === p.pid) this.running = null;
         if (p.blockedOn !== null && !p.threads.some(tid => this.threads.table.get(tid)?.state === 'waiting')) {
           const tid = this.executingThread ?? p.threads[0];

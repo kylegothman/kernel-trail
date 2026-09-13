@@ -98,7 +98,8 @@ describe('eleven-phase execution', () => {
   });
   it('unimplemented methods throw, while init-only snapshots preserve the user-requested replay regression', () => {
     const kernel = createKernel(REFERENCE_CONFIG); const snap = kernel.snapshot();
-    for (const action of [() => kernel.setReplacementPolicy('fifo'), () => kernel.setDiskPolicy('sstf'), () => kernel.evaluateBankers(asPid(2), asResourceId('r'), 1), () => kernel.detectDeadlock()]) expect(action).toThrow(/^not implemented:/);
+    for (const action of [() => kernel.setDiskPolicy('sstf'), () => kernel.evaluateBankers(asPid(2), asResourceId('r'), 1), () => kernel.detectDeadlock()]) expect(action).toThrow(/^not implemented:/);
+    kernel.setReplacementPolicy('fifo'); expect(kernel.activeReplacementPolicy).toBe('fifo');
     kernel.setAllocationStrategy('buddy'); expect(kernel.activeAllocationStrategy).toBe('buddy');
     kernel.restore(snap); kernel.spawn(WORK);
     expect(() => kernel.snapshot()).toThrow(/^not implemented: snapshot.*KernelSnapshot channel/);
@@ -137,8 +138,11 @@ describe('thread progress at blocking and completion boundaries', () => {
   });
   it('a final-unit fault completes after wake instead of holding the CPU forever', () => {
     const kernel = createKernel(REFERENCE_CONFIG); const pid = kernel.spawn({ ...WORK, service: 1, burst: 1 }, { program: instructionProgram([{ kind: 'access', page: asPageId(0), write: false }]) });
-    kernel.installHooks({ memory: { access: () => ({ hit: false }), isSatisfied: () => true } });
-    kernel.step(); expect(kernel.process(pid)?.state).toBe('waiting'); kernel.step(); expect(kernel.process(pid)?.state).toBe('zombie');
+    let resident = false; const access = vi.fn(() => ({ hit: resident }));
+    kernel.installHooks({ memory: { access, isSatisfied: () => { resident = true; return true; } } });
+    kernel.step(); expect(kernel.process(pid)).toMatchObject({ state: 'waiting', serviceRemaining: 1 });
+    kernel.step(); expect(kernel.process(pid)).toMatchObject({ state: 'zombie', serviceRemaining: 0, totalCpuUsed: 2 });
+    expect(access.mock.results.map(result => result.value)).toEqual([{ hit: false }, { hit: true }]);
   });
   it('one-to-one wait blocks the calling thread while its sibling continues', () => {
     const kernel = createKernel(REFERENCE_CONFIG); const pid = kernel.spawn(WORK, { threadCount: 2 }); kernel.step();

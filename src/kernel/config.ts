@@ -9,6 +9,22 @@ export interface KernelTuning {
   readonly cowCopyTicks: number;
   readonly tlbHitTicks: number;
   readonly tlbMissTicks: number;
+  readonly minorFaultTicks: number;
+  readonly majorFaultTicks: number;
+  readonly workingSetWindow: number;
+  readonly faultRateWindow: number;
+  readonly lfuAging: number;
+  readonly localitySize: number;
+  readonly localityShiftChance: number;
+  readonly writeRatio: number;
+  readonly thrashingCriticalFaultMultiplier: number;
+  readonly thrashingCriticalDemandRatio: number;
+  readonly thrashingSuspendInterval: number;
+  readonly thrashingSuspendDuration: number;
+  readonly thrashingRecoveryTicks: number;
+  readonly thrashingControl: 'working_set' | 'pff';
+  readonly pffUpperBound: number;
+  readonly pffLowerBound: number;
   readonly contextSwitchTicks: number;
   readonly deadlockDetectionInterval: number;
   readonly threadModel: ThreadModel;
@@ -22,6 +38,13 @@ export interface KernelTuning {
 export const DEFAULT_TUNING: KernelTuning = Object.freeze({
   maxProcesses: 64, maxThreadsPerProcess: 16, threadCreateTicks: 2, cowCopyTicks: 1,
   tlbHitTicks: 1, tlbMissTicks: 2,
+  minorFaultTicks: 1, majorFaultTicks: 20, workingSetWindow: 10,
+  // PFF has a 1000-tick sliding window; the global rate remains the shift EWMA.
+  faultRateWindow: 1000, lfuAging: 0, localitySize: 4, localityShiftChance: 0.02, writeRatio: 0.3,
+  thrashingCriticalFaultMultiplier: 2, thrashingCriticalDemandRatio: 1.5,
+  // The minimum suspension matches the default recovery observation period.
+  thrashingSuspendInterval: 50, thrashingSuspendDuration: 100, thrashingRecoveryTicks: 100,
+  thrashingControl: 'working_set', pffUpperBound: 300, pffLowerBound: 50,
   contextSwitchTicks: 0, deadlockDetectionInterval: 20, threadModel: 'one_to_one',
   coreCount: 4, lwpPoolSize: 4, defaultSerialFraction: 0.25,
   degreeOfMultiprogramming: 8, checkInvariants: true,
@@ -37,6 +60,7 @@ function integer(name: string, value: number, minimum: number): void {
 export function validateConfig(config: KernelConfig): void {
   integer('seed', config.seed, -Number.MAX_SAFE_INTEGER);
   integer('totalFrames', config.totalFrames, 1);
+  if (!Number.isFinite(config.thrashingThreshold) || config.thrashingThreshold <= 0) throw new KernelConfigError('thrashingThreshold must be positive and finite');
   integer('pageSize', config.pageSize, 1);
   if (!Number.isInteger(Math.log2(config.pageSize))) throw new KernelConfigError('pageSize must be a power of two');
   integer('tlbEntries', config.tlbEntries, 0);
@@ -59,6 +83,24 @@ export function resolveTuning(overrides: Partial<KernelTuning> = {}): KernelTuni
   integer('cowCopyTicks', tuning.cowCopyTicks, 0);
   integer('tlbHitTicks', tuning.tlbHitTicks, 1);
   integer('tlbMissTicks', tuning.tlbMissTicks, 1);
+  integer('minorFaultTicks', tuning.minorFaultTicks, 1);
+  integer('majorFaultTicks', tuning.majorFaultTicks, 1);
+  integer('workingSetWindow', tuning.workingSetWindow, 1);
+  integer('faultRateWindow', tuning.faultRateWindow, 1);
+  integer('lfuAging', tuning.lfuAging, 0);
+  integer('localitySize', tuning.localitySize, 1);
+  integer('thrashingSuspendInterval', tuning.thrashingSuspendInterval, 1);
+  integer('thrashingSuspendDuration', tuning.thrashingSuspendDuration, 1);
+  integer('thrashingRecoveryTicks', tuning.thrashingRecoveryTicks, 1);
+  for (const key of ['localityShiftChance', 'writeRatio'] as const) {
+    if (!Number.isFinite(tuning[key]) || tuning[key] < 0 || tuning[key] > 1) throw new KernelConfigError(`${key} must be in [0, 1]`);
+  }
+  for (const key of ['thrashingCriticalFaultMultiplier', 'thrashingCriticalDemandRatio'] as const) {
+    if (!Number.isFinite(tuning[key]) || tuning[key] <= 1) throw new KernelConfigError(`${key} must be finite and > 1`);
+  }
+  if (!['working_set', 'pff'].includes(tuning.thrashingControl)) throw new KernelConfigError('invalid thrashing control');
+  if (!Number.isFinite(tuning.pffLowerBound) || !Number.isFinite(tuning.pffUpperBound)
+    || tuning.pffLowerBound < 0 || tuning.pffUpperBound <= tuning.pffLowerBound) throw new KernelConfigError('invalid PFF bounds');
   integer('contextSwitchTicks', tuning.contextSwitchTicks, 0);
   if (tuning.contextSwitchTicks > 2) throw new KernelConfigError('contextSwitchTicks must be <= 2');
   integer('deadlockDetectionInterval', tuning.deadlockDetectionInterval, 1);

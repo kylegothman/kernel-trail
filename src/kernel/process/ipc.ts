@@ -38,12 +38,22 @@ export interface Message {
   readonly payload: number;
 }
 
+export interface SharedMapping {
+  readonly region: ResourceId;
+  readonly space: AddressSpaceId;
+  readonly page: PageId;
+  readonly backingSpace: AddressSpaceId;
+  readonly backingPage: PageId;
+}
+
 export interface IpcHooks {
   readonly process: (pid: Pid) => ProcessControlBlock | undefined;
   readonly pageTable: (space: AddressSpaceId) => PageTableEntry[];
   readonly frame: (id: FrameId) => Frame | undefined;
   readonly rights: (pid: Pid, region: ResourceId) => readonly AccessRight[];
   readonly block: (pid: Pid, reason: BlockReason) => void;
+  readonly onSharedMap?: (pid: Pid, mapping: SharedMapping) => void;
+  readonly onSharedUnmap?: (pid: Pid, mapping: SharedMapping) => void;
 }
 
 interface RegionMapping {
@@ -92,6 +102,20 @@ export class IpcManager {
 
   sharedRegion(id: ResourceId): SharedRegion | undefined {
     return this.regions.get(id);
+  }
+
+  /** Resolve the attachment independently of whether its backing page is resident. */
+  sharedMapping(pid: Pid, page: PageId): Readonly<SharedMapping> | undefined {
+    for (const id of this.regionOrder) {
+      const mapping = this.mappings.get(id)?.get(pid);
+      const offset = mapping?.pages.indexOf(page) ?? -1;
+      const region = this.regions.get(id);
+      const backingPage = region?.pages[offset];
+      if (mapping !== undefined && region !== undefined && backingPage !== undefined) {
+        return Object.freeze({ region: id, space: mapping.space, page, backingSpace: region.space, backingPage });
+      }
+    }
+    return undefined;
   }
 
   createMailbox(id: ResourceId, capacity: number): Mailbox {
@@ -149,6 +173,10 @@ export class IpcManager {
     mappings.set(pid, { space: pcb.addressSpaceId, pages: mappedPages });
     insertPid(region.attached, pid);
     this.refreshSharedMappings();
+    for (const page of mappedPages) {
+      const mapping = this.sharedMapping(pid, page);
+      if (mapping !== undefined) this.hooks.onSharedMap?.(pid, mapping);
+    }
     return { ok: true, value: firstPage };
   }
 
@@ -158,6 +186,7 @@ export class IpcManager {
     if (region === undefined || mappings === undefined) return noRegion();
     const mapping = mappings.get(pid);
     if (mapping === undefined) return { ok: false, errno: 'EINVAL', message: 'shared region is not attached' };
+    const detached = mapping.pages.map(page => this.sharedMapping(pid, page));
     const table = this.hooks.pageTable(mapping.space);
     for (let index = table.length - 1; index >= 0; index -= 1) {
       const entry = table[index];
@@ -166,6 +195,9 @@ export class IpcManager {
     mappings.delete(pid);
     removePid(region.attached, pid);
     this.refreshSharedMappings();
+    for (const page of detached) {
+      if (page !== undefined) this.hooks.onSharedUnmap?.(pid, page);
+    }
     return completed;
   }
 

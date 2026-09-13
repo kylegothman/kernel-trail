@@ -226,7 +226,7 @@ describe('TLB persistence', () => {
 
 describe('memory access event ownership and hit metrics', () => {
   function memoryFixture() {
-    const config = { ...REFERENCE_CONFIG, scheduler: 'fcfs' as const };
+    const config = { ...REFERENCE_CONFIG, enabledSubsystems: REFERENCE_CONFIG.enabledSubsystems.filter(id => id !== 'vm'), scheduler: 'fcfs' as const };
     const kernel = createKernel({ ...config, enabledSubsystems: ['process', 'scheduler'] });
     const first = kernel.spawn({ name: 'first', priority: 10, arrival: 0, burst: 10, service: 10, pages: 0 });
     const second = kernel.spawn({ name: 'second', priority: 10, arrival: 0, burst: 10, service: 10, pages: 0 });
@@ -435,7 +435,7 @@ describe('kernel TLB integration', () => {
 
 describe('final instruction access timing', () => {
   it.each([{ tlbHitTicks: 1, tlbMissTicks: 2 }, { tlbHitTicks: 3, tlbMissTicks: 5 }])('keeps a service-one process alive through its $tlbMissTicks-tick resident miss', tuning => {
-    const kernel = createKernel(REFERENCE_CONFIG, { ...tuning, threadCreateTicks: 0 });
+    const kernel = createKernel({ ...REFERENCE_CONFIG, enabledSubsystems: REFERENCE_CONFIG.enabledSubsystems.filter(id => id !== 'vm') }, { ...tuning, threadCreateTicks: 0 });
     const pid = kernel.spawn({ name: 'one access', priority: 5, arrival: 0, burst: 1, service: 1, pages: 1 },
       { program: instructionProgram([{ kind: 'access', page: asPageId(0), write: false }]) });
     const events: KernelEvent[] = [];

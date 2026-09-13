@@ -1,10 +1,14 @@
+import { DemandPager, type VmHost } from './demandPaging';
+import { createRng } from '../rng';
+import type { CowCapacity } from '../process/lifecycle';
+import type { SharedMapping } from '../process/ipc';
 import { DEFAULT_TUNING, type KernelTuning } from '../config';
 import type { MemoryHooks } from '../Kernel';
 import type { EmittableEvent } from '../EventBus';
 import type {
   AddressSpaceId, AllocationStrategy, BlockReason, FrameId, JsonValue, KernelConfig, KernelSnapshot,
   MemoryContext, MemoryMetrics, PageId, PageTableEntry, Pid, ProcessControlBlock, Rng,
-  SubsystemEnvelope, Tick, MemorySnapshotState, VmSnapshotState,
+  SubsystemEnvelope, Tick, MemorySnapshotState, VmSnapshotState, VmSettingsSnapshot, Frame,
 } from '../types';
 import { asFrameId, asPageId, asPid, asTick } from '../types';
 import { FrameTable, memoryArray, memoryBoolean, memoryInteger, memoryObject, memorySpace } from './FrameTable';
@@ -15,7 +19,8 @@ import type { AllocationScheme, ReplacementScope, Rations } from './rations';
 import { framesPerProcess } from './rations';
 import { pagingFragmentation, contiguousFragmentation } from './fragmentation';
 
-export interface MemoryHost {
+export interface MemoryHost extends VmHost {
+  readonly rng?: Rng;
   tick(): Tick;
   process(pid: Pid): Readonly<ProcessControlBlock> | undefined;
   processes(): readonly Readonly<ProcessControlBlock>[];
@@ -30,7 +35,7 @@ export interface MemoryOptions {
   readonly contiguousBytes?: number;
   readonly minBlock?: number;
   readonly freePoolRetain?: number;
-  readonly tuning?: Pick<KernelTuning, 'tlbHitTicks' | 'tlbMissTicks'>;
+  readonly tuning?: Partial<KernelTuning>;
   readonly rations?: Rations;
   readonly allocationScheme?: AllocationScheme;
   readonly replacementScope?: ReplacementScope;
@@ -50,6 +55,11 @@ export class MemorySubsystem implements MemoryHooks {
   readonly pageTables: PageTable;
   readonly tlb: Tlb;
   readonly holes: HoleList;
+  readonly pager: DemandPager;
+  readonly vmEnabled: boolean;
+  private readonly candidates: Frame[] = [];
+  private readonly localitySize: number;
+  private readonly tuning: KernelTuning;
   private tlbHits = 0;
   private tlbMisses = 0;
   private nextContent = 0;
@@ -60,16 +70,14 @@ export class MemorySubsystem implements MemoryHooks {
   private rations: Rations;
   private allocationScheme: AllocationScheme;
   private replacementScope: ReplacementScope;
-  private demandPaging: DemandPagingHooks = {
-    fault: () => {
-      // TODO(astra): WP-06 implements the fault service path
-      throw new Error('not implemented: page fault');
-    },
-  };
+  private demandPaging: DemandPagingHooks;
 
   constructor(readonly config: Readonly<KernelConfig>, private readonly host: MemoryHost, options: MemoryOptions = {}) {
     this.config = Object.freeze({ ...config });
-    const tuning = options.tuning ?? DEFAULT_TUNING;
+    const tuning = { ...DEFAULT_TUNING, ...options.tuning };
+    this.tuning = tuning;
+    this.localitySize = tuning.localitySize;
+    this.vmEnabled = config.enabledSubsystems.includes('vm');
     this.timing = Object.freeze({ tlbHitTicks: tuning.tlbHitTicks, tlbMissTicks: tuning.tlbMissTicks });
     memoryInteger(this.timing.tlbHitTicks, 'TLB hit ticks', 1);
     memoryInteger(this.timing.tlbMissTicks, 'TLB miss ticks', 1);
@@ -81,6 +89,17 @@ export class MemorySubsystem implements MemoryHooks {
     this.rations = options.rations ?? 'standard';
     this.allocationScheme = options.allocationScheme ?? 'equal';
     this.replacementScope = options.replacementScope ?? 'local';
+    const settings: VmSettingsSnapshot = {
+      minorFaultTicks: tuning.minorFaultTicks, majorFaultTicks: tuning.majorFaultTicks,
+      workingSetWindow: tuning.workingSetWindow, faultRateWindow: tuning.faultRateWindow, lfuAging: tuning.lfuAging,
+      thrashingThreshold: config.thrashingThreshold, thrashingCriticalFaultMultiplier: tuning.thrashingCriticalFaultMultiplier,
+      thrashingCriticalDemandRatio: tuning.thrashingCriticalDemandRatio, thrashingSuspendInterval: tuning.thrashingSuspendInterval,
+      thrashingSuspendDuration: tuning.thrashingSuspendDuration, thrashingRecoveryTicks: tuning.thrashingRecoveryTicks,
+      thrashingControl: tuning.thrashingControl, pffUpperBound: tuning.pffUpperBound, pffLowerBound: tuning.pffLowerBound,
+    };
+    this.pager = new DemandPager(this, host, host.rng ?? createRng(config.seed).fork('vm'), settings, this.vmEnabled, tuning.degreeOfMultiprogramming);
+    this.demandPaging = this.vmEnabled ? this.pager : { fault: () => { throw new Error('virtual memory is disabled'); } };
+
   }
 
   setDemandPaging(hooks: DemandPagingHooks): void { this.demandPaging = hooks; }
@@ -89,6 +108,7 @@ export class MemorySubsystem implements MemoryHooks {
   setFramePolicy(rations: Rations, scheme: AllocationScheme = 'equal', scope: ReplacementScope = 'local'): void {
     validatePolicy(rations, scheme, scope);
     this.rations = rations; this.allocationScheme = scheme; this.replacementScope = scope;
+    if (this.vmEnabled) this.pager.rebudget(true);
   }
   get framePolicy() { return { rations: this.rations, allocationScheme: this.allocationScheme, replacementScope: this.replacementScope }; }
 
@@ -99,6 +119,7 @@ export class MemorySubsystem implements MemoryHooks {
   admit(pcb: ProcessControlBlock): void {
     if (pcb.pid <= 1) return;
     const entries = this.pageTables.pageTable(pcb.addressSpaceId);
+    if (this.vmEnabled) { this.requestedBytes.set(pcb.addressSpaceId, entries.size * this.config.pageSize); this.pager.admit(pcb); return; }
     const count = entries.size;
     if (count === 0) return;
     this.requestedBytes.set(pcb.addressSpaceId, count * this.config.pageSize);
@@ -124,13 +145,21 @@ export class MemorySubsystem implements MemoryHooks {
   access(pid: Pid, page: PageId, write: boolean): { readonly hit: boolean } {
     const pcb = this.host.process(pid);
     if (pcb === undefined || pcb.pid <= 1) throw new Error('memory access requires a user process');
+    page = this.resolvePage(pid, page);
     const tick = this.host.tick();
     const key = this.host.accessKey?.(pid);
-    const pending = key === undefined ? undefined : this.pending.get(key);
+    let pending = key === undefined ? undefined : this.pending.get(key);
+    if (pending !== undefined && this.vmEnabled && !this.pageTables.get(pcb.addressSpaceId, page)?.valid) {
+      if (key !== undefined) this.pending.delete(key); pending = undefined;
+    }
     if (pending !== undefined && pending.pid === pid && pending.page === page && pending.write === write) {
       if (tick > pending.lastAttemptTick) { pending.remaining -= 1; pending.lastAttemptTick = tick; }
-      if (pending.remaining === 0 && key !== undefined) this.pending.delete(key);
+      if (pending.remaining === 0 && key !== undefined) { this.pending.delete(key); if (this.vmEnabled) this.pager.finish(pid); }
       return { hit: true };
+    }
+    if (this.vmEnabled) {
+      if (!this.pager.checkProtection(pid, page, write)) return { hit: false };
+      this.pager.begin(pid, page, write);
     }
     const pte = this.pageTables.ensure(pcb.addressSpaceId, page);
     this.pruneTlb();
@@ -141,6 +170,7 @@ export class MemorySubsystem implements MemoryHooks {
       this.tlbMisses += 1;
       this.host.emit({ type: 'tlb.miss', pid, page });
     }
+    const sharedMinor = this.vmEnabled && this.pager.sharedFirstTouch(pid, page);
     if (!pte.valid || pte.frame === null) {
       const result = this.demandPaging.fault(pid, page, write);
       if (!result.hit) return result;
@@ -149,22 +179,31 @@ export class MemorySubsystem implements MemoryHooks {
     if (entry === undefined || !entry.valid || entry.frame === null) throw new Error('fault service returned success without a resident page');
     const frame = this.frameTable.frames[entry.frame];
     if (frame === undefined || frame.owner === null) throw new Error('resident page has no frame');
-    entry.referenced = true; entry.dirty ||= write; entry.lastAccessTick = tick; entry.accessCount += 1;
+    entry.referenced = true; entry.dirty ||= write; entry.lastAccessTick = tick;
+    if (this.vmEnabled) this.pager.accessed(pid, page, entry.frame); else entry.accessCount += 1;
     frame.referenceBit = true; frame.lastAccessTick = tick;
     if (!tlbHit) this.tlb.install(pcb.addressSpaceId, page, entry.frame, tick);
     this.host.emit({ type: 'memory.access', pid, page, write, hit: tlbHit });
-    const cost = tlbHit ? this.timing.tlbHitTicks : this.timing.tlbMissTicks;
+    const fault = this.vmEnabled ? this.pager.reference(pid)?.fault : undefined;
+    const cost = sharedMinor || fault === 'minor' ? this.pager.settings.minorFaultTicks : tlbHit ? this.timing.tlbHitTicks : this.timing.tlbMissTicks;
     if (cost > 1 && key !== undefined) this.pending.set(key, { pid, page, write, remaining: cost - 1, lastAttemptTick: tick });
+    else if (this.vmEnabled) this.pager.finish(pid);
     return { hit: true };
   }
 
   /** The kernel gates instruction retirement separately from page availability. */
+  invalidatePendingAccess(space: AddressSpaceId, page: PageId): void {
+    for (const [key, pending] of this.pending) {
+      if (pending.page === page && this.host.process(pending.pid)?.addressSpaceId === space) this.pending.delete(key);
+    }
+  }
   accessComplete(pid: Pid): boolean {
     const key = this.host.accessKey?.(pid);
     return key === undefined || !this.pending.has(key);
   }
   isSatisfied(pid: Pid, reason: BlockReason): boolean {
     const pcb = this.host.process(pid);
+    if (reason.kind === 'page_fault' && this.vmEnabled) { const ready = this.pager.cowReady(pid, reason.page); if (ready !== undefined) return ready; }
     return reason.kind === 'page_fault' && pcb !== undefined
       && this.pageTables.get(pcb.addressSpaceId, reason.page)?.valid === true;
   }
@@ -186,6 +225,34 @@ export class MemorySubsystem implements MemoryHooks {
     this.host.refreshSharedMappings?.();
     return frame;
   }
+  installFrame(space: AddressSpaceId, page: PageId, frame: FrameId, pinned = false): void {
+    const entry = this.pageTables.ensure(space, page); const live = this.frameTable.frames[frame];
+    if (live === undefined || live.owner === null) throw new Error('page-in requires a reserved frame');
+    entry.frame = frame; entry.valid = true; entry.dirty = false; entry.swapped = false;
+    entry.referenced = true; entry.lastAccessTick = this.host.tick(); entry.accessCount = 0;
+    live.owner = space; live.page = page; live.pinned ||= pinned; live.loadedAtTick = this.host.tick();
+    live.lastAccessTick = this.host.tick(); live.referenceBit = true;
+    this.host.refreshSharedMappings?.();
+  }
+  prepareCow(pid: Pid, page: PageId, source: FrameId): CowCapacity {
+    if (this.vmEnabled) return this.pager.prepareCow(pid, page, source);
+    const pcb = this.host.process(pid); const frame = pcb === undefined ? null : this.allocateFrame(pcb.addressSpaceId, page);
+    return frame === null ? { state: 'failed' } : { state: 'ready', frame, reported: false };
+  }
+  observeEvent(event: EmittableEvent): void { this.pager.observe(event); }
+  resolvePage(pid: Pid, page: PageId): PageId { return this.vmEnabled ? this.pager.resolvePage(pid, page) : page; }
+  sharedMapped(pid: Pid, mapping: SharedMapping): void { this.pager.sharedMapped(pid, mapping); }
+  sharedUnmapped(pid: Pid, mapping: SharedMapping): void { this.pager.sharedUnmapped(pid, mapping); }
+  setReplacementPolicy(id: import('../types').PageReplacementId): void { this.pager.setPolicy(id); }
+  admissionAllowed(): boolean {
+    return !this.vmEnabled || this.pager.control.admissionAllowed(this.host.processes().filter(p => p.pid > 1
+      && !['new', 'zombie', 'terminated'].includes(p.state) && !this.pager.control.isSuspended(p.pid)).length);
+  }
+  isSuspended(pid: Pid): boolean { return this.vmEnabled && this.pager.control.isSuspended(pid); }
+  prefetchNextFaults(pid: Pid, count: number): void { this.pager.prefetch(pid, count); }
+  remapOptimalLocality(pid: Pid): void { this.pager.remap(pid, this.localitySize); }
+  setDegreeOfMultiprogramming(target: number): void { this.pager.setDegree(target); }
+  setWorkingSetPrecision(precise: boolean): void { this.pager.workingSets.setPrecision(precise); }
   freeFrame(frame: FrameId): void {
     this.tlb.shootdown(frame);
     this.contents.delete(frame);
@@ -203,6 +270,7 @@ export class MemorySubsystem implements MemoryHooks {
   flush(space?: AddressSpaceId): void { this.tlb.flush(space); }
   detachAddressSpace(space: AddressSpaceId): void {
     this.flush(space); this.requestedBytes.delete(space);
+    for (const pcb of this.host.processes()) if (pcb.addressSpaceId === space) this.pager.remove(pcb.pid);
     for (const pcb of this.host.processes()) if (pcb.addressSpaceId === space) this.holes.free(pcb.pid);
     this.discardUnusedFrames(space);
     for (const [key, value] of this.pending) {
@@ -233,6 +301,7 @@ export class MemorySubsystem implements MemoryHooks {
     this.requestedBytes.set(space, bytes);
   }
   metrics(): MemoryMetrics {
+    const virtual = this.pager.metrics();
     const allocations = this.pageTables.spaces().map(space => {
       const resident = [...this.pageTables.pageTable(space).values()].filter(entry => entry.valid);
       const requested = this.requestedBytes.get(space);
@@ -245,15 +314,16 @@ export class MemorySubsystem implements MemoryHooks {
       totalFrames: this.config.totalFrames, freeFrames: this.frameTable.available,
       externalFragmentation: fragmentation.externalFragmentation, internalFragmentation: fragmentation.internalFragmentation,
       tlbHitRate: this.tlbHits + this.tlbMisses === 0 ? 0 : this.tlbHits / (this.tlbHits + this.tlbMisses),
-      // TODO(astra): WP-06 fills these fault, eviction and working-set metrics.
-      pageFaults: 0, majorFaults: 0, evictions: 0, writeBacks: 0, faultRate: 0, workingSets: new Map(),
+      ...virtual,
     };
   }
-  context(rng: Rng, futureReferences: readonly PageId[] | null = null, space?: AddressSpaceId): MemoryContext {
-    const frames = this.frameTable.unpinnedFrames().flatMap(id => {
-      const frame = this.frameTable.frames[id];
-      return frame !== undefined && (this.replacementScope === 'global' || space === undefined || frame.owner === space) ? [frame] : [];
-    });
+  context(rng: Rng, futureReferences: readonly PageId[] | null = null, space?: AddressSpaceId, forceLocal = false): MemoryContext {
+    this.candidates.length = 0;
+    for (const frame of this.frameTable.frames) {
+      if (frame.owner !== null && !frame.pinned && !this.frameTable.freePool.includes(frame.id) && !this.pager?.isReserved(frame.id)
+        && ((!forceLocal && this.replacementScope === 'global') || space === undefined || frame.owner === space)) this.candidates.push(frame);
+    }
+    const frames = this.candidates;
     return { tick: this.host.tick(), rng, futureReferences, frames,
       pageTable: address => this.pageTables.pageTable(address), emit: event => this.host.emit(event) };
   }
@@ -267,7 +337,8 @@ export class MemorySubsystem implements MemoryHooks {
         contents: [...this.contents].sort(([a], [b]) => a - b), nextContent: this.nextContent,
         requestedBytes: [...this.requestedBytes].sort(([a], [b]) => a - b), ...this.framePolicy,
       } },
-      vm: { owner: 'vm', version: 1, payload: {
+      vm: { owner: 'vm', version: 2, payload: {
+        ...this.pager.saveState(),
         tick: this.host.tick(), ...this.timing, tlb: this.tlb.saveState(), tlbHits: this.tlbHits, tlbMisses: this.tlbMisses,
         pending: [...this.pending].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([key, value]) => ({ key, ...value })),
       } },
@@ -276,7 +347,7 @@ export class MemorySubsystem implements MemoryHooks {
 
   /** All parsers complete before any current table, counter or live view changes. */
   prepareRestore(memory: SubsystemEnvelope, vm: SubsystemEnvelope, tick: Tick = this.host.tick()): () => void {
-    if (memory.owner !== 'memory' || memory.version !== 1 || vm.owner !== 'vm' || vm.version !== 1) throw new Error('unsupported memory or vm snapshot');
+    if (memory.owner !== 'memory' || memory.version !== 1 || vm.owner !== 'vm' || vm.version !== 2) throw new Error('unsupported memory or vm snapshot');
     const saved = memoryObject(memory.payload, 'contribution');
     const virtual = memoryObject(vm.payload, 'vm contribution');
     if (saved['pageSize'] !== this.config.pageSize || virtual['tick'] !== tick
@@ -332,18 +403,29 @@ export class MemorySubsystem implements MemoryHooks {
       const remaining = memoryInteger(row['remaining'], 'remaining access ticks', 1);
       const lastAttemptTick = asTick(memoryInteger(row['lastAttemptTick'], 'last access attempt'));
       const pcb = this.host.process(pid);
-      if (typeof key !== 'string' || pending.has(key) || pcb === undefined || lastAttemptTick > tick || remaining >= Math.max(this.timing.tlbHitTicks, this.timing.tlbMissTicks)
+      if (typeof key !== 'string' || pending.has(key) || pcb === undefined || lastAttemptTick > tick || remaining >= Math.max(this.timing.tlbHitTicks, this.timing.tlbMissTicks, this.pager.settings.minorFaultTicks)
         || nextPages.get(pcb.addressSpaceId, page)?.valid !== true) throw new Error('invalid saved pending access');
       pending.set(key, { pid, page, write: memoryBoolean(row['write'], 'access write flag'), remaining, lastAttemptTick });
     }
     const hits = memoryInteger(virtual['tlbHits'], 'TLB hits'); const misses = memoryInteger(virtual['tlbMisses'], 'TLB misses');
+    const demand = memoryObject(virtual['demand'], 'demand state');
+    for (const value of memoryArray(demand['requests'], 'demand requests')) {
+      const request = memoryObject(value, 'demand request');
+      if (request['frame'] !== null && nextFrames.freePool.includes(asFrameId(memoryInteger(request['frame'], 'reserved frame')))) {
+        throw new Error('reserved page-in frame is retained in the free pool');
+      }
+    }
+    const nextContext: MemoryContext = { tick, rng: this.pager.rng, futureReferences: null, frames: nextFrames.frames,
+      pageTable: space => nextPages.pageTable(space), emit: event => this.host.emit(event) };
+    const commitVm = this.pager.prepareRestore(virtual, tick, nextFrames.frames, nextContext);
+
     return () => {
       commitFrames(); commitPages(); this.holes.restoreState(holes); commitTlb();
       this.contents.clear(); for (const [frame, tag] of contents) this.contents.set(frame, tag);
       this.requestedBytes.clear(); for (const [space, bytes] of requested) this.requestedBytes.set(space, bytes);
       this.pending.clear(); for (const [key, value] of pending) this.pending.set(key, value);
       this.nextContent = nextContent; this.tlbHits = hits; this.tlbMisses = misses;
-      this.rations = rations; this.allocationScheme = scheme; this.replacementScope = scope;
+      this.rations = rations; this.allocationScheme = scheme; this.replacementScope = scope; commitVm();
     };
   }
   restoreState(memory: SubsystemEnvelope, vm: SubsystemEnvelope): void { this.prepareRestore(memory, vm)(); }
@@ -352,7 +434,7 @@ export class MemorySubsystem implements MemoryHooks {
     if (memory !== undefined && vm !== undefined) {
       const commit = this.prepareRestore(memory, vm, snapshot.tick);
       if (snapshot.config.totalFrames !== memory.payload.frames.totalFrames || snapshot.config.pageSize !== memory.payload.pageSize
-        || snapshot.config.tlbEntries !== vm.payload.tlb.entries.length || snapshot.config.allocationStrategy !== memory.payload.holes.strategy) {
+        || snapshot.config.tlbEntries !== vm.payload.tlb.entries.length || snapshot.config.replacementPolicy !== vm.payload.replacement.policy || snapshot.config.allocationStrategy !== memory.payload.holes.strategy) {
         throw new Error('memory contribution disagrees with snapshot configuration');
       }
       const pages = new PageTable(new Map(snapshot.pageTables.map(([space, entries]) => [space, entries.map(entry => ({ ...entry }))])));
@@ -362,7 +444,12 @@ export class MemorySubsystem implements MemoryHooks {
       return commit;
     }
     if (memory !== undefined || vm !== undefined) throw new Error('memory and vm contributions must be restored together');
-    const empty = new MemorySubsystem(snapshot.config, { ...this.host, tick: () => snapshot.tick, pageTables: new Map() }, { tuning: this.timing });
+    let replayTick = asTick(0);
+    const empty = new MemorySubsystem(snapshot.config, { ...this.host, tick: () => replayTick, pageTables: new Map(),
+      processes: () => snapshot.processes, process: pid => snapshot.processes.find(pcb => pcb.pid === pid), emit: () => {},
+    }, { tuning: this.tuning });
+    // The supported legacy channel has no workload; reconstruct its deterministic metric clocks.
+    for (let value = 1; value <= snapshot.tick; value++) { replayTick = asTick(value); empty.expireTimers(replayTick); empty.metrics(); }
     empty.frameTable.restoreState({ totalFrames: snapshot.frames.length, freePoolRetain: 4,
       frames: snapshot.frames, freePool: [], freeList: snapshot.frames.filter(frame => frame.owner === null).map(frame => frame.id) });
     for (const [space, entries] of snapshot.pageTables) for (const entry of entries) empty.pageTables.set(space, { ...entry });
