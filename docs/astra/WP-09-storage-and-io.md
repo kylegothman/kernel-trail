@@ -1128,3 +1128,22 @@ guards the phase 5 call inside `step()` and is the one place the eleven-phase
 orchestrator changed. None of the eleven phase bodies changed. Rebase onto
 8c1e91d before you touch Kernel.ts or config.ts, and keep your own additions to
 distinct config keys and to your named regions.
+
+## Inherited from WP-04: the merge surface
+
+WP-04 landed on main as merge f6307e8 after the WP-06 table above was written.
+Its shared-file footprint at f6307e8:
+
+| File | Every touched range |
+|---|---|
+| `src/kernel/Kernel.ts` | 50, 445, 447-450, 548, 572, 580, 585-587, 593, 629-631, 889-891 |
+| `src/kernel/config.ts` | 28, 49, 106 (one key, `mlfqAccounting`) |
+| `src/kernel/index.ts` | none |
+| `src/kernel/process/threads.ts` | 63-69, 80-314 in scattered hunks (creation debt) |
+
+The step-entry admission veto is still line 417. None of the eleven phase bodies
+changed. Because WP-04 inserted and removed lines in Kernel.ts after line 445,
+the WP-06 ranges above that lie beyond 445 have moved by a few lines; treat the
+WP-06 table as the pre-WP-04 numbering and use `git blame` at f6307e8 if you
+need the current position. Your worktree is already at f6307e8. Keep your own
+additions to distinct config keys and to your named regions.
