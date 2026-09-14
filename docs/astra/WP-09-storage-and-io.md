@@ -1109,3 +1109,22 @@ State:
 6. Whether WP-06 had landed, and if so the exact signature of the
    `storage.enqueue` method you implemented for it.
 7. Every `// TODO(astra):` left in the tree, with file and line.
+
+## Inherited from WP-06: the merge surface
+
+WP-06 landed on main as merge 8c1e91d before this package started. Its shared-file
+footprint, new-file ranges at 3e3b1c6:
+
+| File | Every touched range |
+|---|---|
+| `src/kernel/Kernel.ts` | 12, 17, 116, 211, 249, 255-256, 258, 262-280, 288, 292-293, 334, 342-343, 398-399, 401, 417, 495-526, 534-556, 558-561, 724, 802-803, 805-807, 810-811, 813-815, 865 |
+| `src/kernel/config.ts` | 12-27, 41-47, 63, 86-103 |
+| `src/kernel/index.ts` | 7-8 |
+
+Twenty-four zero-context hunks in Kernel.ts. The contiguous regions are the VM
+integration helpers at 495-526, replacement and ability controls at 534-561, and
+the execute changes at 802-815. Line 417 is the step-entry admission veto: it
+guards the phase 5 call inside `step()` and is the one place the eleven-phase
+orchestrator changed. None of the eleven phase bodies changed. Rebase onto
+8c1e91d before you touch Kernel.ts or config.ts, and keep your own additions to
+distinct config keys and to your named regions.

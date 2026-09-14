@@ -6,6 +6,9 @@ const r = (p: string) => fileURLToPath(new URL(p, import.meta.url));
 export default defineConfig({
   test: {
     environment: 'node',
+    // Headroom over the slowest ordinary test (~1.2s) on a slow runner. Anything
+    // heavier declares its own budget on the test, as DET-D4 does.
+    testTimeout: 20_000,
     include: ['tests/**/*.test.ts'],
     coverage: { provider: 'v8', include: ['src/kernel/**', 'src/game/**'] },
   },

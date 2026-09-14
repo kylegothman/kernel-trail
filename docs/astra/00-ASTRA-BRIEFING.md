@@ -264,7 +264,13 @@ resolve @typescript/typescript-<platform>", that is a platform mismatch in
 `node_modules`, not a defect in your package. Delete `node_modules`, reinstall,
 and carry on. `docs/06-AGENT-TOOLCHAIN.md` section 1 explains why it happens.
 
-A package is not done until all three exit zero. "It works but the type checker
+A package is not done until all three exit zero, and the time budget is the CI
+runner's, not your laptop's. WP-06 reported a green suite from an Apple silicon
+machine; the same suite timed out on a slower Linux container because one
+determinism test runs 128,000 simulated ticks. Run the gates in the devcontainer,
+or assume the runner is at least twice as slow as you are. A test that needs more
+than the 20 second global ceiling declares its own budget on the test, with a
+comment saying why, the way DET-D4 does. "It works but the type checker
 complains" is not done. "The new tests pass but two old ones broke" is not done:
 you own the regression.
 

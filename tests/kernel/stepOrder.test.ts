@@ -126,7 +126,8 @@ describe('populated process replay evidence', () => {
       const a = workload(seed); const b = workload(seed); const logA = a.run(1000); const logB = b.run(1000);
       expect(hash(canonical([logA, a.processes]))).toBe(hash(canonical([logB, b.processes])));
     }
-  });
+  }, 120_000); // 128,000 simulated ticks with demand paging on: ~9s on a slow Linux runner and
+                // growing with each subsystem. The budget is CI's, not the author's laptop.
 });
 
 describe('thread progress at blocking and completion boundaries', () => {
