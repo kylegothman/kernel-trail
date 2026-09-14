@@ -401,6 +401,75 @@ from implementation.
 ---
 
 
+
+## Amendment 7, 2026-09-14: typed synchronisation continuation
+
+**Status:** applied on wp-07 after explicit human review of the exact
+wp07-contract-promotion.patch and approval of hash regeneration on 2026-09-14.
+Number provisional against WP-09's merge order. The WP-07 pre-flight decisions
+are recorded in commit 352552e; this exact-patch approval followed that review.
+
+### What was an envelope
+
+Amendment 1 introduced `SubsystemSnapshots.sync` as `SubsystemEnvelope`.
+The envelope could carry JSON but did not describe the primitive, execution,
+race-detector or scenario state required to resume synchronisation.
+
+### What changed
+
+The slot is now `SyncSnapshotState`, version 1. Its explicit records describe
+all five primitive kinds, actor ownership, ordered wait generations and reserved
+grants, counting-semaphore debit provenance, requirement checks and priority
+inheritance. They also retain memory-order buffers, atomic lock protocols,
+partial instruction work, bounded race evidence and seven scenario families.
+The reviewed patch changes no process, scheduler, memory, VM, storage, I/O or
+game contract. The two approved cosmetic adjustments add the slot comment and
+retain one blank line before the scheduler types.
+
+### Why this shape
+
+The payload contains explicit readonly plain-data records, not callbacks, Map,
+Set, a generic JSON escape or mapped copies of runtime interfaces. Ordered
+queues retain hand-off order. Actors carry both PID and TID, while the shared
+primitive view and events still project PIDs. Anonymous semaphore debits survive
+exit, exec and join without returning permits that can represent occupied
+buffer slots. Completed grants remain distinct from ungranted waits, so pure
+readiness queries need not consume state.
+
+Memory buffers retain issue order and issuer-attempt drain position. Race state
+retains a 32-record history plus bounded witnesses, per-actor RMW provenance and
+the serial shadow needed to explain lost updates. Scenario progress includes
+partially completed work and already drawn think/eat intervals. It does not
+copy the TCB program counter, immutable programs, root/sync RNG state or an
+IPC-owned value. External cells carry binding identifiers; control cells own
+their values in this contribution. The shared primitive fields are derived from
+the detailed records, rather than saved as a second authority in this payload.
+
+### Consequences
+
+WP-07 validates detached records before committing a restored contribution,
+including cross-references, queue order, bounds, actor ownership and settings.
+A BB reservation may retain a historical permit ID already retired by a legal
+non-owner post. Buffered stores may retain a joined TID while its PID is live;
+current execution and unqueued RMW operations require valid staged TCBs.
+Donations apply only to mutex owners, monitor-lock owners and RW writers, never
+counting-semaphore provenance. The requirement observation mode preserves an
+intentionally broken teaching scenario without waiving unrelated invariants.
+
+The contribution is for restoration against equivalent staged process, TCB,
+IPC, RNG and event state. Fresh-kernel workload reconstruction, program decoding,
+distinct per-TCB block-reason restoration and removal of the inherited guard
+remain WP-11's. The new serializable sync Instruction variant is documented in
+the WP-11 handoff; it does not change the frozen process slot here.
+
+The exact frozen-file patch and its two cosmetic adjustments were reviewed
+before application. Hash regeneration was explicitly human-approved on
+2026-09-14 for this patch only. This amendment and regenerated lock are committed
+alone, before implementation.
+
+---
+
+
 # Package scope corrections
 
 Not contract changes, so no hash moves and no amendment number. Recorded here
