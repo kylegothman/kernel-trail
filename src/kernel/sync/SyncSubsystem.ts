@@ -156,6 +156,10 @@ export class SyncSubsystem implements ScenarioContext, RequirementContext {
   private lastTimerTick: Tick | null = null;
   private lastInversionTick: Tick | null = null;
   private attempting = false;
+  private deadlockHooks: {
+    onDeclare(resource: ResourceId): void;
+    beforeAcquire(actor: Actor, resource: ResourceId, operation: 'mutex_lock' | 'sem_wait'): Extract<SyscallResult, { ok: false }> | undefined;
+  } | undefined;
 
   constructor(private readonly host: SyncHost, readonly rng: Rng) {
     this.raceDetector = new RaceDetector(host);
@@ -164,6 +168,11 @@ export class SyncSubsystem implements ScenarioContext, RequirementContext {
     this.requirements = new Requirements(this);
     this.priorities = new PriorityInversion(host, this);
   }
+  installDeadlockHooks(hooks: {
+    onDeclare(resource: ResourceId): void;
+    beforeAcquire(actor: Actor, resource: ResourceId, operation: 'mutex_lock' | 'sem_wait'): Extract<SyscallResult, { ok: false }> | undefined;
+  }): void { this.deadlockHooks = hooks; }
+  allScenarios(): readonly SyncSnapshotScenario[] { return [...this.scenarios.values()].sort((a, b) => compareStrings(a.id, b.id)); }
   tick(): Tick { return this.host.tick(); }
   settings(): SyncSettings { return this.host.settings(); }
   process(pid: Pid): ProcessControlBlock | undefined { return this.host.process(pid); }
@@ -274,7 +283,7 @@ export class SyncSubsystem implements ScenarioContext, RequirementContext {
     }
   }
   private add(state: PrimitiveState): SyncPrimitive {
-    check(!this.states.has(state.id), 'duplicate primitive'); this.set(state);
+    check(!this.states.has(state.id), 'duplicate primitive'); this.deadlockHooks?.onDeclare(state.id); this.set(state);
     this.configureRequirement(state.id, state.capacity);
     const view = this.primitives.find(item => item.id === state.id); check(view !== undefined, 'missing primitive view'); return view;
   }
@@ -344,6 +353,10 @@ export class SyncSubsystem implements ScenarioContext, RequirementContext {
   }
   call(actor: Actor, instruction: SyncInstruction): SyscallResult {
     const state = 'resource' in instruction ? this.get(instruction.resource) : 'monitor' in instruction ? this.get(instruction.monitor) : undefined;
+    if ((instruction.op === 'mutex_lock' && state?.kind === 'mutex') || (instruction.op === 'sem_wait' && state?.kind === 'semaphore')) {
+      const rejected = this.deadlockHooks?.beforeAcquire(actor, state.id, instruction.op);
+      if (rejected !== undefined) return rejected;
+    }
     switch (instruction.op) {
       case 'mutex_lock': case 'mutex_unlock': return state?.kind === 'mutex' ? mutexOperation(this, state, actor, instruction.op) : invalid('unknown mutex');
       case 'sem_wait': case 'sem_post': return state?.kind === 'semaphore' ? semaphoreOperation(this, state, actor, instruction.op) : invalid('unknown semaphore');
