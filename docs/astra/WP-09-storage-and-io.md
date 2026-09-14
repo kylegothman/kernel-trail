@@ -1147,3 +1147,48 @@ the WP-06 ranges above that lie beyond 445 have moved by a few lines; treat the
 WP-06 table as the pre-WP-04 numbering and use `git blame` at f6307e8 if you
 need the current position. Your worktree is already at f6307e8. Keep your own
 additions to distinct config keys and to your named regions.
+
+## Inherited from WP-07 and WP-08: the merge surface at 83e1d26
+
+WP-07 (merge df6dcaa) and WP-08 (merge 83e1d26) landed after the WP-04 table
+above. Their combined shared-file footprint, at main 83e1d26:
+
+| File | Every touched range since a318f7b |
+|---|---|
+| `src/kernel/Kernel.ts` | 14; 17-19; 123; 175-176; 232; 316; 332-333; 348-416; 545-566; 588; 656-660; 662-664; 666; 701-702; 826-832; 898-904; 906-912; 1044-1045 (two stale TODO lines deleted near 218 and 229) |
+| `src/kernel/config.ts` | 29-35; 38-41; 61-64; 122-127; 131-134 (ten keys: six sync, four deadlock) |
+| `src/kernel/index.ts` | 9-18 |
+| `src/kernel/process/Program.ts` | 4; 8; 42-44 (one `sync` Instruction variant) |
+
+What moved that you will bump into:
+
+- The step-entry admission veto is now line 489, not 417. The eleven phase
+  bodies are still byte-identical to WP-02.
+- `execute` (893) now does per-attempt sync bookkeeping and delegates to
+  `executeInstruction` (904), which holds the instruction switch. Your
+  `case 'io'` is at 940 inside `executeInstruction`. Phase 8 still calls
+  `execute`.
+- `SyncHooks.isSatisfied` gained an optional `tid`; the private readiness
+  helper (around 819-832) checks IPC, then deadlock resource ownership, then
+  sync for the semaphore, mutex and condition kinds. Your `io` kind at 822 is
+  untouched and stays yours.
+- `tests/kernel/stepOrder.test.ts:101` now reads
+  `expect(() => kernel.setDiskPolicy('sstf')).toThrow(/^not implemented:/);`
+  on its own line, with the deadlock halves migrated on 102-104. When
+  `setDiskPolicy` stops being a stub, quote that line and propose its exact
+  replacement before editing; the other three lines stay.
+- `chargeKernelDebt(ticks)` does not exist yet; you add it as the accessor
+  your scope correction describes, adding to `switchDebt`, which phase 8
+  consumes. Do not touch phase 8.
+- The typed snapshot slots now cover process, scheduler, memory, vm, sync and
+  deadlock. `storage` and `io` are still `SubsystemEnvelope` and are yours;
+  provisional amendment numbers 9 and 10, or one amendment promoting both if
+  you settle them together. One trap found in amendment 8: a payload that
+  embeds a frozen `interface` (rather than a type literal) does not satisfy
+  `JsonValue`, because interfaces carry no implicit index signature. Use
+  structurally identical type literals for any frozen shape you embed, and
+  prove `payload extends JsonValue` with a standalone strict check before
+  you send the patch.
+- Verification is four gates. Baseline at 83e1d26 is 1011 passed, 0 skipped,
+  42 files.
+

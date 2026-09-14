@@ -545,7 +545,11 @@ docs/07-CONTRACT-AMENDMENTS.md, before the implementation commit that uses it.
 Never before approval. Shipping with an opaque envelope means your package is
 not finished. Your subsystem state must survive a snapshot and restore round
 trip against equivalent staged process state, and that is an acceptance item.
-Fresh-kernel restore is WP-11's.
+Fresh-kernel restore is WP-11's. One trap: a payload that embeds a frozen
+`interface` does not satisfy `JsonValue`, because interfaces carry no implicit
+index signature; embed structurally identical type literals instead, and prove
+`payload extends JsonValue` with a standalone strict check before sending the
+patch.
 
 PRE-FLIGHT GRANT CHECK, BEFORE ANY CODE. Six packages in a row have found that
 their grant was narrower than their spec: an acceptance item that needed a
