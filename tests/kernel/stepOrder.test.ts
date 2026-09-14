@@ -98,7 +98,10 @@ describe('eleven-phase execution', () => {
   });
   it('unimplemented methods throw, while init-only snapshots preserve the user-requested replay regression', () => {
     const kernel = createKernel(REFERENCE_CONFIG); const snap = kernel.snapshot();
-    for (const action of [() => kernel.setDiskPolicy('sstf'), () => kernel.evaluateBankers(asPid(2), asResourceId('r'), 1), () => kernel.detectDeadlock()]) expect(action).toThrow(/^not implemented:/);
+    expect(() => kernel.setDiskPolicy('sstf')).toThrow(/^not implemented:/);
+    expect(kernel.evaluateBankers(asPid(2), asResourceId('r'), 1))
+      .toMatchObject({ safe: false, sequence: null });
+    expect(kernel.detectDeadlock()).toBeNull();
     kernel.setReplacementPolicy('fifo'); expect(kernel.activeReplacementPolicy).toBe('fifo');
     kernel.setAllocationStrategy('buddy'); expect(kernel.activeAllocationStrategy).toBe('buddy');
     kernel.restore(snap); kernel.spawn(WORK);

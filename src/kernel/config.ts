@@ -35,6 +35,10 @@ export interface KernelTuning {
   readonly rwlockPolicy: 'reader_pref' | 'writer_pref' | 'fair';
   readonly contextSwitchTicks: number;
   readonly deadlockDetectionInterval: number;
+  readonly rollbackCheckpointInterval: number;
+  readonly maxPreemptionsPerProcess: number;
+  readonly preventionMode: 'ordering' | 'all_or_nothing';
+  readonly deadlockRecovery: 'none' | 'abort_one' | 'abort_all' | 'preempt';
   readonly threadModel: ThreadModel;
   readonly coreCount: number;
   readonly lwpPoolSize: number;
@@ -56,6 +60,8 @@ export const DEFAULT_TUNING: KernelTuning = Object.freeze({
   mlfqAccounting: 'per_slice',
   progressStallLimit: 4, boundedWaitLimit: 0, spinWaitTicks: 1, storeBufferDepth: 2,
   priorityInheritance: false, rwlockPolicy: 'writer_pref',
+  rollbackCheckpointInterval: 25, maxPreemptionsPerProcess: 3,
+  preventionMode: 'ordering', deadlockRecovery: 'abort_one',
   contextSwitchTicks: 0, deadlockDetectionInterval: 20, threadModel: 'one_to_one',
   coreCount: 4, lwpPoolSize: 4, defaultSerialFraction: 0.25,
   degreeOfMultiprogramming: 8, checkInvariants: true,
@@ -122,6 +128,10 @@ export function resolveTuning(overrides: Partial<KernelTuning> = {}): KernelTuni
   integer('contextSwitchTicks', tuning.contextSwitchTicks, 0);
   if (tuning.contextSwitchTicks > 2) throw new KernelConfigError('contextSwitchTicks must be <= 2');
   integer('deadlockDetectionInterval', tuning.deadlockDetectionInterval, 1);
+  integer('rollbackCheckpointInterval', tuning.rollbackCheckpointInterval, 1);
+  integer('maxPreemptionsPerProcess', tuning.maxPreemptionsPerProcess, 1);
+  if (!['ordering', 'all_or_nothing'].includes(tuning.preventionMode)) throw new KernelConfigError('invalid prevention mode');
+  if (!['none', 'abort_one', 'abort_all', 'preempt'].includes(tuning.deadlockRecovery)) throw new KernelConfigError('invalid deadlock recovery');
   integer('coreCount', tuning.coreCount, 1);
   integer('lwpPoolSize', tuning.lwpPoolSize, 1);
   integer('degreeOfMultiprogramming', tuning.degreeOfMultiprogramming, 1);

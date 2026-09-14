@@ -15,6 +15,8 @@ import { generatedProgram, scriptedProgram, instructionProgram, type Program, ty
 import { IpcManager } from './process/ipc';
 import { MemorySubsystem } from './memory/MemorySubsystem';
 import { SyncSubsystem } from './sync/SyncSubsystem';
+import { DeadlockSubsystem, deadlockSettings, decodeResourceVector, type DeadlockStrategy } from './deadlock/DeadlockSubsystem';
+import type { ResourceDeclaration, ResourceVector } from './deadlock/resources';
 import type { SuspendedProcess } from './memory/demandPaging';
 import type {
   AddressSpaceId,
@@ -171,6 +173,7 @@ export class KernelImpl implements Kernel {
   readonly ipc: IpcManager;
   readonly memorySubsystem: MemorySubsystem;
   readonly syncSubsystem: SyncSubsystem;
+  readonly deadlockSubsystem: DeadlockSubsystem;
   private readonly snapshotHooks: SnapshotHooks[] = [];
   readonly pageTables = new Map<AddressSpaceId, PageTableEntry[]>();
   private currentTick = asTick(0);
@@ -224,7 +227,6 @@ export class KernelImpl implements Kernel {
   private fs: FsHooks = { expireTimers: noop, retainDescriptor: noop, closeDescriptor: noop, closeOnExec: () => false };
   // TODO(astra): WP-10 supplies shared-region access rights from protection domains.
   private security: SecurityHooks = { rights: () => [] };
-  // TODO(astra): WP-08 supplies periodic wait-for graph detection.
   private deadlock: DeadlockHooks = { maybeDetect: noop };
   private schedulerHooks: SchedulerHooks = createSchedulerHooks(() => this.scheduler, {
     emit: event => this.syncSubsystem.withEffectivePriorities(() => this.publish(event)),
@@ -311,7 +313,7 @@ export class KernelImpl implements Kernel {
       },
       clearThreads: pcb => this.threads.clear(pcb),
       programNamed: name => this.namedPrograms.get(name),
-      detachIpc: pcb => { this.syncSubsystem.exec(pcb.pid); this.ipc.removeProcess(pcb.pid); this.memorySubsystem.detachAddressSpace(pcb.addressSpaceId); },
+      detachIpc: pcb => { this.deadlockSubsystem.exec(pcb, this.enabled.has('deadlock')); this.syncSubsystem.exec(pcb.pid); this.ipc.removeProcess(pcb.pid); this.memorySubsystem.detachAddressSpace(pcb.addressSpaceId); },
       replaceProgram: (pcb, program) => {
         this.programs.set(pcb.pid, program);
         this.burstSizes.set(pcb.pid, program.length);
@@ -327,8 +329,8 @@ export class KernelImpl implements Kernel {
       retainDescriptor: fd => this.fs.retainDescriptor(fd),
       closeDescriptor: (pcb, fd) => this.fs.closeDescriptor(pcb, fd),
       closeOnExec: (pcb, fd) => this.fs.closeOnExec(pcb, fd),
-      releaseResources: pcb => this.sync.releaseAll(pcb),
-      removeFromWaitQueues: pcb => { this.sync.removeWaiter(pcb.pid); this.io.removeWaiter(pcb.pid); this.ipc.removeProcess(pcb.pid); this.memorySubsystem.detachAddressSpace(pcb.addressSpaceId); },
+      releaseResources: pcb => { this.deadlockSubsystem.releaseResources(pcb, this.enabled.has('deadlock')); this.sync.releaseAll(pcb); },
+      removeFromWaitQueues: pcb => { this.deadlockSubsystem.removeWaiter(pcb.pid); this.sync.removeWaiter(pcb.pid); this.io.removeWaiter(pcb.pid); this.ipc.removeProcess(pcb.pid); this.memorySubsystem.detachAddressSpace(pcb.addressSpaceId); },
       wakeParent: pid => { this.wakeable.add(pid); },
       chargeCowCopy: (pcb, ticks) => { this.copyDebt.set(pcb.pid, (this.copyDebt.get(pcb.pid) ?? 0) + ticks); },
       memory: { pageTables: this.pageTables,
@@ -384,6 +386,34 @@ export class KernelImpl implements Kernel {
     this.schedulerHooks = { ageAndDetectStarvation: ctx => {
       sync.beforeAging(); try { schedulerHooks.ageAndDetectStarvation(ctx); } finally { sync.afterAging(); }
     } };
+    this.deadlockSubsystem = new DeadlockSubsystem({
+      tick: () => this.tick, strategy: () => this.config.deadlockStrategy, settings: () => deadlockSettings(this.tuning),
+      processes: () => this.table.processes.filter(pcb => pcb.pid > 1), process: pid => this.table.get(pid),
+      threads: () => [...this.threads.table.values()], actor: pid => {
+        const pcb = this.table.get(pid); const tid = pcb === undefined ? undefined
+          : this.executingThread !== undefined && pcb.threads.includes(this.executingThread) ? this.executingThread : pcb.threads[0];
+        return tid === undefined ? undefined : { pid, tid };
+      },
+      program: pid => this.programs.get(pid), sync, ipc: this.ipc,
+      block: (actor, resource) => this.blockProcess(actor.pid, { kind: 'semaphore', resource }, actor.tid),
+      complete: pid => { this.syscallResults.set(pid, { ok: true, value: null }); },
+      terminate: (pid, reason) => { const pcb = this.table.get(pid); if (pcb !== undefined) this.exitProcess(pcb, -1, reason); },
+      rollback: checkpoint => {
+        const pcb = this.table.get(checkpoint.pid); const thread = this.threads.table.get(checkpoint.tid);
+        if (pcb === undefined || thread?.pid !== checkpoint.pid) throw new KernelInvariantError(26, 'rollback actor is missing');
+        thread.programCounter = checkpoint.programCounter; this.threads.wake(pcb, thread.tid);
+        if (pcb.state === 'waiting') this.move(pcb, 'ready');
+      },
+      emit: event => this.publish(event),
+    });
+    const deadlock = this.deadlockSubsystem;
+    this.deadlock = { maybeDetect: tick => deadlock.maybeDetect(tick) };
+    sync.installDeadlockHooks({ onDeclare: resource => deadlock.onSyncDeclare(resource),
+      beforeAcquire: (actor, resource, operation) => deadlock.beforeAcquire(actor, resource, operation) });
+    this.snapshotHooks.push({ saveState: () => deadlock.saveState(), restoreState: snapshot => deadlock.prepareKernelRestore(snapshot) });
+    this.onPhase((phase, tick) => { if (this.enabled.has('deadlock')) deadlock.onPhase(phase, tick); });
+    const invariants = this.invariants;
+    this.invariants = { check: kernel => { invariants.check(kernel); deadlock.assertInvariants(); } };
     this.initialiseFrameTable();
     this.initialiseSystemProcesses();
   }
@@ -524,6 +554,16 @@ export class KernelImpl implements Kernel {
       case 'mutex_unlock':
         // TODO(astra): WP-11 validates mutex_unlock arguments.
         return typeof arg === 'string' && request.args.length === 1 ? this.syncSubsystem.syscall(pcb.pid, 'mutex_unlock', arg as ResourceId) : failure('EINVAL', 'expected a synchronization resource');
+      case 'request': {
+        // TODO(astra): WP-11 validates request arguments.
+        const vector = decodeResourceVector(request.args);
+        return vector === undefined ? failure('EINVAL', 'expected resource/count pairs') : this.deadlockSubsystem.requestVector(pcb.pid, vector);
+      }
+      case 'release': {
+        // TODO(astra): WP-11 validates release arguments.
+        const vector = decodeResourceVector(request.args);
+        return vector === undefined ? failure('EINVAL', 'expected resource/count pairs') : this.deadlockSubsystem.releaseVector(pcb.pid, vector);
+      }
       case 'nice':
         if (typeof arg !== 'number' || !Number.isSafeInteger(arg) || arg < 0 || arg > 39) return failure('EINVAL', 'priority must be in [0, 39]');
         pcb.priority = arg; return { ok: true, value: arg };
@@ -613,14 +653,17 @@ export class KernelImpl implements Kernel {
     // TODO(astra): WP-09 implements this.
     throw new Error('not implemented: setDiskPolicy');
   }
-  evaluateBankers(_pid: Pid, _resource: ResourceId, _instances: number): SafetyCheckResult {
-    // TODO(astra): WP-08 implements this.
-    throw new Error('not implemented: evaluateBankers');
+  declareResource(resource: ResourceDeclaration): void { this.deadlockSubsystem.declare(resource); }
+  declareClaims(pid: Pid, claims: ResourceVector): void { this.deadlockSubsystem.declareClaims(pid, claims); }
+  setDeadlockStrategy(strategy: DeadlockStrategy): void {
+    this.deadlockSubsystem.assertStrategy(strategy);
+    this.currentConfig = cloneConfig({ ...this.config, deadlockStrategy: strategy });
   }
-  detectDeadlock(): DeadlockReport | null {
-    // TODO(astra): WP-08 implements this.
-    throw new Error('not implemented: detectDeadlock');
+  setPreemptible(resource: ResourceId, value: boolean, untilTick: Tick): void { this.deadlockSubsystem.setPreemptible(resource, value, untilTick); }
+  evaluateBankers(pid: Pid, resource: ResourceId, instances: number): SafetyCheckResult {
+    return this.deadlockSubsystem.evaluateBankers(pid, resource, instances);
   }
+  detectDeadlock(): DeadlockReport | null { return this.deadlockSubsystem.detectDeadlock(); }
 
   /** WP-11 restores the process tables before applying this independent contribution. */
   saveSchedulerState(): SchedulerSnapshotState {
@@ -782,6 +825,9 @@ export class KernelImpl implements Kernel {
         if (this.ipc.matchesWait(pcb.pid, reason)) return this.ipc.hasCompletion(pcb.pid);
         {
           const matches = pcb.threads.map(tid => this.threads.table.get(tid)).filter(thread => thread?.state === 'waiting' && thread.blockedOn === reason);
+          if (reason.kind === 'semaphore' && this.deadlockSubsystem.owns(reason.resource)) {
+            return matches.length === 1 && this.enabled.has('deadlock') && this.deadlockSubsystem.isSatisfied(pcb.pid, reason, matches[0]?.tid);
+          }
           return matches.length === 1 && this.enabled.has('sync') && this.sync.isSatisfied(pcb.pid, reason, matches[0]?.tid);
         }
     }
@@ -996,6 +1042,7 @@ export class KernelImpl implements Kernel {
   }
   private initialiseFrameTable(): void {
     this.syncPrimitives = this.syncSubsystem.primitives;
+    this.resources = this.deadlockSubsystem.resources.resources;
     this.frames = this.memorySubsystem.frameTable.frames;
     this.tlb = this.memorySubsystem.tlb.entries;
     this.rebuildFreeList();
