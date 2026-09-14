@@ -598,7 +598,7 @@ Expose the per-strategy comparison the Leg 6 debrief card needs:
 State:
 
 1. Pass or fail for each of the twenty-two acceptance criteria, by number.
-2. The three verification command outcomes.
+2. The four verification command outcomes, including the contract guard.
 3. The safe sequence your implementation produced for `DL-BANKERS-1`, and
    confirmation that you did **not** change the algorithm to match the
    textbook's `<P1, P3, P4, P0, P2>`.
@@ -609,3 +609,93 @@ State:
 6. Confirmation that no file in this package cites 8.6.2 or 8.3.2, and that
    `types.ts` was left untouched.
 7. Every `// TODO(astra):` left in the tree, with file and line.
+
+## Scope correction 2026-09-14
+
+Written before WP-08 starts, after WP-07 merged. The package above predates
+six merged packages, so several of its statements are stale. Where this
+section disagrees with the text above, this section wins.
+
+- **Verification is four gates, not three.** `npm run check:contracts`
+  precedes typecheck, test and build. The guard fails on any frozen-file edit,
+  a second scanner, a skipped test, or an em dash anywhere in the tree.
+- **Snapshot obligation.** `KernelSnapshot.subsystems.deadlock` is your slot,
+  currently a `SubsystemEnvelope`. Fill it through
+  `installHooks({ snapshots })` with `saveState` and `restoreState` (restore
+  returns a commit closure). Promote it to a typed `DeadlockSnapshotState`
+  through the amendment procedure in the kickoff prompt: exact patch, written
+  approval, contract-only commit, then implementation. Provisional number 8.
+- **Syscall branches are yours.** `request` and `release` are two branches in
+  the dispatcher in `Kernel.ts`, in the same style as WP-07's four sync
+  branches (argument shape check, delegate to your subsystem, WP-11 validates
+  fully). The package's "expose as plain functions for WP-11 to wire" sentence
+  is superseded. The existing `acquire` and `release` instruction kinds route
+  to `SyncHooks.acquire` and `release`; the resource-table request path is a
+  syscall, not those instructions.
+- **Granted Kernel.ts regions**, beyond the phase 9 hook wiring and the two
+  method bodies: the two dispatcher branches; constructor wiring for your
+  subsystem (host callbacks for tick, process lookup, emit, terminate, and
+  the sync ownership view); binding your live resource array into
+  `this.resources` in `initialiseFrameTable`, the way WP-07 bound
+  `syncPrimitives`; and `setDeadlockStrategy`-adjacent state if the package
+  needs it. `evaluateBankers` and `detectDeadlock` are throw-stubs today and
+  become yours. Report exact line ranges.
+- **Prevention ordering reaches into sync.** Under `deadlockStrategy:
+  'prevent'`, a `mutex_lock` or `sem_wait` that violates the rank order must
+  return `EDEADLK` without blocking. Do this by giving `SyncSubsystem` a
+  pre-acquire check callback that your subsystem installs, not by editing
+  sync's own logic: list the exact sync-side hook you need in the pre-flight
+  and wait. `src/kernel/sync/**` stays WP-07's.
+- **WP-07's tests are protected.** Acceptance 16 to 18 are asserted in your
+  own `tests/kernel/deadlock/` files by building the WP-07 scenarios through
+  their public constructors, never by editing `tests/kernel/sync/**`.
+- **Rollback recovery.** Full fresh-kernel restore is WP-11's and has not
+  landed, so "preemption with rollback" cannot restore a whole kernel. Scope
+  rollback to what the process and resource tables can express today: return
+  the preempted instances, put the victim back at its last resource-free
+  program counter recorded by your subsystem, and emit
+  `deadlock.resolved { method: 'rollback' }`. State in the pre-flight exactly
+  what your rollback restores and what it does not.
+- **Naming.** The kernel's setting is `deadlockStrategy` with four values as
+  frozen in `KernelConfig`; the interval is `deadlockDetectionInterval` in
+  tuning. Do not add config keys without listing them in the pre-flight.
+
+## Inherited from WP-07: what sync exposes, and the merge surface
+
+WP-07 landed on main after a318f7b. Its shared-file footprint at that merge:
+
+| File | Every touched range |
+|---|---|
+| `src/kernel/Kernel.ts` | 14; 17; 121; 173; 230; 314; 346-386; 515-526; 548; 658-659; 783-786; 852-858; 860-866; 998 |
+| `src/kernel/config.ts` | 29-35; 57-58; 116-121 (six keys) |
+| `src/kernel/process/Program.ts` | 4; 8; 42-44 (one `sync` Instruction variant) |
+| `src/kernel/index.ts` | none |
+
+None of the eleven phase bodies changed. `execute` was split into `execute`
+(attempt bookkeeping) and `executeInstruction` (the switch); phase 8 still
+calls `execute`. `SyncHooks.isSatisfied` gained an optional `tid`.
+
+What sync exposes to you, from the WP-07 report:
+
+- `SyncSubsystem` (constructed in the Kernel constructor as
+  `this.syncSubsystem`) holds detailed actor ownership `(pid, tid)`, wait
+  generations and ordered queues. Read its public surface before designing
+  the wait-for graph; ask in the pre-flight for any accessor it lacks.
+- Counting-semaphore permit provenance is **not** an exclusive-owner edge.
+  Only mutex owners, monitor-lock owners and rwlock writers are exclusive
+  owners. Build wait-for edges from exclusive ownership plus the
+  signalling dependencies the scenarios declare; do not treat a permit
+  holder as the process a waiter waits for.
+- Monitor conditions are a live Map separate from the entry queue; the
+  shared `syncPrimitives` projection copies only the eight frozen base
+  fields.
+- `SYNC-BB-DEADLOCK` and `SYNC-PHIL-NAIVE` already reach reproducible
+  blocked states (naive philosophers: five-way circular wait at tick 61 at
+  the reference seed). Your detector turns those states into
+  `deadlock.detected`; their `deadlock.detected` assertions were left out of
+  WP-07's tests on purpose and are yours to add in your own files.
+- Mailbox waits use synthetic semaphore resource ids owned by
+  `process/ipc.ts`; the wait-for graph must see them.
+- Every WP-07 module keeps state in side tables keyed by actor; there is no
+  new PCB or TCB field, and there must be none from you either.
+
