@@ -733,7 +733,7 @@ export interface SubsystemSnapshots {
   /** Amendment 3. Queues, quantum remaining, aging and starvation timers, and the
    *  metrics accumulators, none of which SchedulerSnapshot carries: that type is a
    *  read-only view for the HUD and the world, not a restore format. */
-  readonly scheduler?: SubsystemEnvelope;
+  readonly scheduler?: SchedulerSnapshotState;
   readonly memory?: MemorySnapshotState;
   /** Amendment 3. Demand paging state distinct from the frame table: the working
    *  set window, the replacement policy's own ordering, and the fault counters. */
@@ -748,6 +748,113 @@ export interface SubsystemSnapshots {
   readonly fs?: SubsystemEnvelope;
   readonly security?: SubsystemEnvelope;
 }
+
+/** Persistent scheduler state. Distinct from the per-tick SchedulerSnapshot view. */
+export interface SchedulerSnapshotState {
+  readonly owner: 'scheduler';
+  readonly version: 2;
+  readonly payload: {
+    readonly policy: SchedulerPolicySnapshotState;
+    readonly accounting: {
+      readonly busyTicks: number;
+      readonly firstRuns: readonly (readonly [Pid, Tick])[];
+      readonly completed: readonly {
+        readonly pid: Pid;
+        readonly arrivalTick: Tick;
+        readonly firstRunTick: Tick;
+        readonly turnaround: number;
+        readonly totalService: number;
+      }[];
+    };
+    readonly runtime: {
+      readonly tick: Tick;
+      readonly readyQueue: readonly Pid[];
+      readonly running: Pid | null;
+      readonly lastCpuOwner: Pid | null;
+      readonly sliceElapsed: number;
+      readonly switchDebt: number;
+      readonly contextSwitches: number;
+      readonly params: SchedulerSnapshotParameters;
+    };
+  };
+}
+
+/** Explicit versioned values, rather than a mapped copy of a future contract. */
+export type SchedulerSnapshotParameters = {
+  readonly quantum: number;
+  readonly levelQuanta?: readonly number[];
+  readonly agingInterval: number;
+  readonly starvationThreshold: number;
+  readonly starvationFatalThreshold: number;
+  readonly preemptive: boolean;
+};
+
+export type SchedulerPolicySnapshotBase = {
+  readonly params: SchedulerSnapshotParameters;
+  /** Head-to-tail order. Outer index is the MLFQ level. */
+  readonly queues: readonly (readonly Pid[])[];
+  readonly running: Pid | null;
+  readonly quantumRemaining: number;
+};
+
+/** CPU count when the current logical slice began. Null means no active slice. */
+export type SchedulerCpuSliceSnapshot = {
+  readonly pid: Pid;
+  readonly startCpu: number;
+};
+
+export type SchedulerPolicySnapshotState = SchedulerPolicySnapshotBase & (
+  | {
+      readonly policy: 'fcfs';
+      readonly detail: readonly {
+        readonly tick: Tick;
+        readonly source: 'admit' | 'unblock';
+      }[];
+    }
+  | {
+      readonly policy: 'sjf' | 'srtf';
+      readonly detail: {
+        readonly useEstimatedBurst: boolean;
+        readonly estimates: readonly {
+          readonly pid: Pid;
+          readonly estimate: number;
+          readonly startCpu: number;
+          readonly lastCpu: number;
+          readonly lastRemaining: number;
+        }[];
+      };
+    }
+  | {
+      readonly policy: 'priority';
+      readonly detail: null;
+    }
+  | {
+      readonly policy: 'priority_aging';
+      readonly detail: {
+        readonly lastAgingTick: Tick | null;
+      };
+    }
+  | {
+      readonly policy: 'rr';
+      readonly detail: {
+        readonly slice: SchedulerCpuSliceSnapshot | null;
+      };
+    }
+  | {
+      readonly policy: 'mlfq';
+      readonly detail: {
+        readonly accountingMode: 'per_slice' | 'cumulative';
+        readonly lastAgingTick: Tick | null;
+        readonly slice: SchedulerCpuSliceSnapshot | null;
+        readonly processes: readonly {
+          readonly pid: Pid;
+          readonly level: number;
+          readonly levelStartCpu: number;
+          readonly demotions: number;
+        }[];
+      };
+    }
+);
 
 /** WP-05 placement, frame, page-table and content metadata. Plain JSON only. */
 export interface MemorySnapshotState {
