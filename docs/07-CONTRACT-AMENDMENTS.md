@@ -151,10 +151,13 @@ With `s = 0.25, R = 100, O = 2` this produces a real optimum and a real penalty:
 | 16 | 3.3684 | 39.19 | 61.69 |
 | 32 | 3.6571 | 44.84 | 91.34 |
 
-The optimum is 6 threads. Thirty-two threads is 1.85x worse than the optimum and
+On the integer curve the fixture asserts, the optimum is 50 ticks at five, six or
+seven threads (unrounded, 49.50 at six). Thirty-two threads is 92, 1.84x the
+integer optimum, and
 slower than 4. A player who keeps spawning now feels it.
 
-`ceil` is specified rather than `round` because `R / S` at N = 2 is exactly 66.5,
+`ceil` is specified rather than `round` because `R / S` at N = 2 is exactly 62.5
+(66.5 once the four overhead ticks are added),
 and a half-way tie rounds differently across implementations: JavaScript's
 `Math.round` gives 67, Python's `round` gives 66. A fixture that depends on which
 language ran it is not a fixture. `ceil` also never under-charges service, which

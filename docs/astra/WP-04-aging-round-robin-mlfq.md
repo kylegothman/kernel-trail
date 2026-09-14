@@ -33,7 +33,7 @@ WP-03 complete and green.
 
 Files that must already exist:
 
-- `src/kernel/scheduler/registry.ts` with the three throwing stubs you replace
+- `src/kernel/scheduler/SchedulerRegistry.ts` (the scaffold's name; there is no lowercase registry.ts) with the three throwing stubs you replace
 - `src/kernel/scheduler/SchedulerBase.ts` with the `onAge` hook
 - `src/kernel/scheduler/tieBreak.ts`, `MinHeap.ts`, `metrics.ts`, `starvation.ts`
 - `src/kernel/scheduler/priority.ts`
@@ -84,7 +84,10 @@ tests/kernel/golden/sched-mlfq-1.gantt
 ## Files you may modify
 
 ```
-src/kernel/scheduler/registry.ts       (replace the three throwing stubs only)
+src/kernel/scheduler/SchedulerRegistry.ts   (replace the three stubs; extend the
+                                             factory and restore construction with
+                                             the host dependencies the pre-flight
+                                             names. See Scope correction below.)
 src/kernel/scheduler/starvation.ts     (only if the onAge hook needs a call-site fix)
 ```
 
@@ -391,7 +394,7 @@ Rules:
 
 ### 7. Registry
 
-Replace the three throwing stubs in `src/kernel/scheduler/registry.ts` with the
+Replace the three throwing stubs in `src/kernel/scheduler/SchedulerRegistry.ts` with the
 real factories. Change nothing else in that file.
 
 ## Acceptance criteria
@@ -420,9 +423,16 @@ real factories. Change nothing else in that file.
     full 252-combination sweep belongs to WP-11; assert only the seven here.
 12. `snapshot()` on MLFQ returns three arrays and allocates nothing after the
     first call.
-13. `git diff --exit-code src/kernel/types.ts src/game/types.ts` exits 0.
+13. The only diff to `src/kernel/types.ts` is the reviewed amendment 6 patch, in
+    its own commit; `src/game/types.ts` has no diff. (Previously this item asked
+    for a zero types diff while the package also required a promotion, which is a
+    contradiction. Corrected in the pre-flight.)
 14. The forbidden-identifier scan still returns zero matches.
-15. `src/kernel/Kernel.ts` is byte-identical to its state before this package
+15. Every `src/kernel/Kernel.ts` hunk is one of the approved construction,
+    persistence or Amdahl accounting sites named in the Scope correction, and the
+    eleven phase bodies are byte-identical. (Previously this item demanded a
+    byte-identical Kernel.ts while the package required construction and
+    persistence edits. Corrected in the pre-flight.)
     started.
 
 ## Tests you must write
@@ -548,6 +558,91 @@ Restoring from it would silently reset a run's history.
 
 Acceptance, mechanically verifiable: a kernel running a mixed workload under MLFQ,
 snapshotted mid-run with processes spread across all three levels and at least one
-aged process, restored into a fresh kernel and stepped forward, produces a
-byte-identical continuation event log. A snapshot missing the accumulators is
+aged process, restored through the scheduler contribution against equivalent
+staged process state and stepped forward, produces a byte-identical continuation
+event log. The fresh-kernel version of that test, restoring the whole workload
+into an empty kernel, requires the process channel and belongs to WP-11; it is
+recorded there as a pending acceptance and is not claimed here. A snapshot missing
+the accumulators is
 rejected rather than accepted.
+
+---
+
+## Scope correction, 2026-09-14
+
+Raised by the pre-flight grant check. Eleven gaps, four of them in this package's
+own text, and one of them a design decision the package left implicit. All
+approved as follows.
+
+**Grants.** `SchedulerRegistry.ts` in full for factory, host dependencies and
+restore construction; `config.ts` for exactly one new key,
+`mlfqAccounting: 'per_slice' | 'cumulative'`, default `per_slice`, validated;
+`Kernel.ts` regions 4-5, 50, 580-600, 632-635, 892-896 for construction and
+persistence, and 445-447, 545-556 for Amdahl accounting, none of them a phase
+body; `SchedulerBase.ts`, `FCFS.ts`, `sjf.ts`, `priority.ts` and `metrics.ts`
+for persistence signatures and parsing only, selection algorithms untouched;
+`threads.ts` regions 58-73, 81-96, 99-123, 126-156, 197-205, 213-253, 256-275
+for the Amdahl accounting; the fixture migrations in the pre-flight table;
+`workloadRunner.ts` for worst-wait reporting, tuning overrides and the factored
+segment renderer; new `persistence.test.ts` and `amdahl-deferral.test.ts`.
+
+**The Amdahl accounting is a creation-debt model, decided here.** The original
+one-line grant was wrong: the line it named is never executed by AMDAHL-2, the
+recompute path uses `round` with no overhead, and a stateless recompute after a
+consumed tick restores the consumed work. So:
+
+- Accelerate useful work with C, the usable cores passed to the unchanged
+  `amdahlSpeedup`. Charge coordination overhead by T, the live thread count.
+  The fixture has C = T and is unchanged; over-threading past the core cap now
+  costs without speeding anything up, which is the lesson.
+- At admission the useful duration is `ceil(R / amdahlSpeedup(s, C))` plus one
+  outstanding overhead pool of `O * T`. Each later successful thread creation
+  adds O. A join never refunds. Wake, recompute and a new burst reprice remaining
+  useful raw work at the current C and never recharge overhead; recomputation at
+  unchanged C is idempotent.
+- Overhead is consumed before useful work. An overhead tick charges CPU and
+  PCB and TCB service and returns a delivered TID, but executes no instruction,
+  advances no PC, and reduces no raw work. It therefore cannot fault.
+- Integral raw progress: cache the C that priced the current budget; on a useful
+  tick retain the greatest integral raw remainder no larger than its old value
+  whose ceiling at that speedup equals the new useful budget.
+- Side state is a ThreadManager-owned map by PID holding `overheadRemaining` and
+  `pricedCores`. No PCB or RawProcessWork field. WP-11 restores both values; no
+  restored process may reinitialise its debt as fresh.
+- Deferral captures and restores both side values along with raw burst, raw
+  service and the useful budgets, keeping `totalCpuUsed` charged, as WP-06 does.
+- Fork: the child gets its own initial `O * T` on admission and keeps the copied
+  useful raw work. Exec: success clears old debt, creates fresh debt, and reprices
+  after lifecycle has reset raw work; failure changes nothing.
+- Halving (`halveRemainingBurst`, WP-06's ability): halve only useful raw work,
+  preserve outstanding overhead, reprice a blocked process at its cached C
+  without waking it.
+
+**Scheduler semantics, approved as proposed in the pre-flight.** RR and MLFQ
+keep a persisted `startCpu` cursor and measure their slice as
+`pcb.totalCpuUsed - startCpu`, renewed on every expiry including same-owner
+expiry, so a lone process's quantum renews without a fake dispatch and switch
+and copy debt are excluded. Policies emit `quantum.expired` once through a bound
+host emitter that stamps tick and seq; the frozen `SchedulerContext.emit` is
+unchanged. Cumulative MLFQ retains level CPU history across blocking and
+higher-level preemption, resets on promotion, demotion and first dispatch at a
+new level, and counts only real demotions. The bottom level is round robin with
+a finite quantum, whatever the older prose calls it. Fixture means are asserted
+as exact rationals within 1e-9 (RR q4: 17/3, 47/3, 11/3; RR q1: 17/3, 47/3, 1;
+MLFQ: 20/3, 50/3, 4/3), because the printed six-decimal figures miss by about
+3.3e-7. The fixture `worstWait` of 16 and 8 is the workload's maximum waiting
+time, reported by the runner; the live metric over currently-ready processes
+keeps its definition. Goldens follow this package's one-line format, not the
+grid in architecture 11.4.
+
+**Full fresh-kernel restore belongs to WP-11.** This package's earlier "Added
+scope" demanded a mid-run MLFQ snapshot restored into a fresh kernel. That needs
+the process channel, which is WP-11's, and its own reviewed process amendment.
+The scheduler contribution round-trips now, against equivalent staged process
+state; the fresh-kernel acceptance is recorded in WP-11 as pending and is not
+claimed here. This was the same defect shape as the five before it, made by the
+reviewer inside a correction meant to fix that shape.
+
+**Node.** The pre-flight ran on Node 25 because Docker was unavailable. CI runs
+Node 22 from `.nvmrc`. Where they disagree, CI wins.
+

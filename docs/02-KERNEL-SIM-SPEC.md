@@ -1117,7 +1117,8 @@ it, which is the hazard Leg 2 is built on. See
 `docs/07-CONTRACT-AMENDMENTS.md` amendment 2.
 
 Step 4 uses `Math.ceil`, not `Math.round`. `R / S` lands on an exact half at
-`N = 2` (66.5 for `R = 100, s = 0.25`), and a half-way tie rounds differently
+`N = 2` (62.5 for `R = 100, s = 0.25`; the effective 66.5 is that plus four
+overhead ticks), and a half-way tie rounds differently
 across implementations: JavaScript's `Math.round` gives 67 and Python's `round`
 gives 66. A fixture whose value depends on which language ran it is not a
 fixture. `ceil` also never under-charges service, which is the right bias for a
@@ -1142,10 +1143,12 @@ The speedup columns are test fixture `AMDAHL-1`; the effective burst column is
 `AMDAHL-2`. The effective figure has no limit at `N = ∞` because `O * N` grows
 without bound, which is the point.
 
-The teaching moment is now the whole shape of the curve rather than one row. The
-minimum sits at 6 threads, at 50 ticks. Eight threads costs 51, sixteen costs 62,
-and thirty-two costs 92, which is 1.85x worse than the optimum and slower than
-four threads. Leg 2's over-threading failure is exactly this arithmetic, and the
+The teaching moment is now the whole shape of the curve rather than one row. On
+the integer curve the fixture asserts, the minimum is 50 ticks and it is reached
+at five, six and seven threads alike; eight costs 51, sixteen costs 62, and
+thirty-two costs 92, which is 1.84x the optimum and slower than four threads.
+(The unrounded curve bottoms at six threads, 49.50, and thirty-two is 1.85x that.
+Name which curve you mean.) Leg 2's over-threading failure is exactly this arithmetic, and the
 player is expected to read it off the HUD.
 
 ### 4.4 Thread syscalls and events
@@ -1523,10 +1526,12 @@ contiguous).
 Dispatches: 4. Quantum expiries: 5 (P1 at ticks 4, 14, 18, 22, 26). Test fixture
 `SCHED-RR-1`. Assertions use a tolerance of 1e-9 on the averages.
 
-Compare with `SCHED-FCFS-1`: average waiting rose from 17 to 5.67 and average
-response fell from 17 to 3.67, while average turnaround rose from 27 to 15.67
-for this workload. RR trades turnaround for response, which is the Ch. 5.3.4
-point.
+Compare with `SCHED-FCFS-1`: on this workload every average fell, waiting from
+17 to 5.67, response from 17 to 3.67, and turnaround from 27 to 15.67. That is
+because the FCFS order happened to put the 24-tick job first, the convoy effect
+of Ch. 5.3.1, so RR wins on every axis here. The Ch. 5.3.3 tradeoff, in which RR
+buys response time at the cost of turnaround, needs a workload where the long job
+is not already at the front; this example does not demonstrate it.
 
 **Quantum sensitivity.** The same workload at other quanta, computed by the same
 implementation, is fixture `SCHED-RR-2`:

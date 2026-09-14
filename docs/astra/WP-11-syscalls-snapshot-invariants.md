@@ -877,3 +877,17 @@ WP-06 does not edit `invariants.ts`. The existing runtime checks and the new reg
 The VM host validates saved suspension PID/TID membership and the PCB sleep overlay. WP-11 must additionally compare actual live TCB wait states, lifecycle COW counts and IPC rights against their separately restored channels; this host does not expose those internals. The process channel must also restore programs/PCs, raw/TCB service, copy debt and lifecycle metadata before claiming full workload continuation.
 
 The tests cover one-frame queued faults completing without hanging, COW eviction/reuse and subsequent write recovery, a shared request surviving its original requester's exit, retained reclaim, pin exhaustion, invalidated translation timing, and suspension/recovery across VM restore. These are required exceptions tied to explicit state, not permission to relax the corresponding invariant globally.
+
+## Pending acceptance inherited from WP-04: the fresh-kernel scheduler restore
+
+WP-04's package once required a mid-run MLFQ snapshot, with processes on all
+three levels and at least one aged process, restored into a fresh kernel and
+stepped forward to a byte-identical continuation. That needs the process
+channel, which is yours, so the acceptance moves here. WP-04 proves the scheduler
+contribution round-trips against equivalent staged process state; you prove the
+whole workload restores into an empty kernel. Two values WP-04 adds must be in
+your process contribution or the test cannot pass: the ThreadManager side table
+of `overheadRemaining` and `pricedCores` per PID, from the creation-debt Amdahl
+model. The process schema also omits raw burst, TCB remaining work and the round
+robin TID cursor; your process amendment has to add them.
+
