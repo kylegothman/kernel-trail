@@ -820,8 +820,8 @@ field you leave out.
 
 - `src/kernel/syscall/**`. WP-11 owns the syscall table and the argument
   validator. This package's probe **calls** the validator; it does not implement
-  it. If WP-11 has not landed, stub the validator call behind
-  `// TODO(astra): WP-11 provides validateArgs` and mark `SEC-ARG-1` skipped.
+  it. WP-11 has not landed and the skip budget is zero, so nothing is marked
+  skipped: see the scope correction below for how `SEC-ARG-1` is asserted.
 - `src/kernel/storage/**` and `src/kernel/io/**`. WP-09 owns them. This package
   calls `dropDirty()` and the block device; it does not change them.
 - `src/kernel/scheduler/**`, `memory/**`, `sync/**`, `deadlock/**`,
@@ -837,14 +837,94 @@ field you leave out.
 State:
 
 1. Pass or fail for each of the twenty-seven acceptance criteria, by number.
-2. The three verification command outcomes.
+2. The four verification command outcomes, including the contract guard.
 3. The 20 block indices you pinned for `FS-ALLOC-1`, and confirmation that the
    linked-method cost came out at exactly 650.
 4. The measured physical write ratio for `FS-JOURNAL-COST` under the three modes.
 5. Where `kernelSecret` lives, and the specific measure that keeps it out of the
    event log, the snapshot and the terminal.
-6. Whether WP-11 had landed, and if not, which `SEC-ARG-1` assertions are
-   currently skipped.
+6. How `SEC-ARG-1` was asserted against your own bounds check, and which
+   assertions WP-11 takes over when its validator lands.
 7. The `ioctl` commands this package added (`crash`, `domain_switch` and any
    others), so WP-11 can wire them.
 8. Every `// TODO(astra):` left in the tree, with file and line.
+
+## Scope correction 2026-09-14
+
+Written before WP-10 starts, after WP-09 merged as d3f0861. The package above
+predates nine merged packages; where this section disagrees with the text
+above, this section wins.
+
+- **Verification is four gates.** `npm run check:contracts` precedes
+  typecheck, test and build. The guard enforces frozen hashes, one scanner, a
+  zero skip budget and zero em dashes. Baseline at d3f0861: 1158 passed, 0
+  skipped, 49 files.
+- **No skips.** `SEC-ARG-1` is asserted against a bounds check this package
+  owns in the security subsystem (`read(fd, hugeLength)` from ring 3 returns
+  `EINVAL` before any descriptor is touched), behind a
+  `// TODO(astra): WP-11 provides validateArgs` marker at the call site. WP-11
+  replaces the local check with the table validator and keeps the assertion.
+- **Syscall branches are yours.** The frozen `SyscallName` union carries
+  `open`, `close`, `read`, `write`, `seek`, `stat`, `unlink`, `mkdir`, `chmod`
+  and `sync`, and the dispatcher in `Kernel.ts` (currently 584-650) has none
+  of the file ones. Add them as branches in the style of WP-07's four sync
+  branches and WP-08's `request`/`release`: argument shape check, delegate to
+  your subsystem, `// TODO(astra): WP-11 validates <name> arguments`. `ioctl`
+  already exists and routes `tlb_flush` and device commands; your `crash` and
+  `domain_switch` commands extend the driver `control` path WP-09 built
+  (`src/kernel/io/drivers/DeviceDriver.ts`), not the `ioctl` branch itself.
+  The `sync` branch (619) exists and currently flushes the block cache; it
+  becomes the journal checkpoint entry point and stays one branch.
+- **Granted Kernel.ts regions**, beyond wiring the two hook interfaces:
+  constructor wiring for both subsystems (host callbacks for tick, process
+  lookup, emit, the block device, `blockCache.dirtyEntries()` and
+  `dropDirty()`, and the security rights lookup); the file syscall branches;
+  binding your live `inodes`, `journal` and `domains` arrays in
+  `initialiseFrameTable`, the way sync, deadlock and storage bound theirs;
+  and composition at the lifecycle callbacks (`retainDescriptor`,
+  `closeDescriptor`, `closeOnExec`, `removeFromWaitQueues`) which already
+  route to `this.fs`. Report exact line ranges. No phase body edit; phase 1
+  already calls `fs.expireTimers`.
+- **Two snapshot slots.** `fs` and `security` are yours and both are still
+  `SubsystemEnvelope`. Fill them through `installHooks({ snapshots })` with
+  `saveState` and `restoreState` returning commit closures, and promote them
+  by the amendment procedure: exact patch, written approval, contract-only
+  commit, then implementation. Provisional number 10 for both together.
+  Prove both payloads extend `JsonValue` with the standalone strict check
+  before sending the patch; embed type literals, never frozen interfaces.
+  The dummy-slot fixture in `tests/kernel/memory/frameTable.test.ts` (lines
+  439, 441, 451) uses `fs` today; migrating it to a numeric payload under
+  `security` is not possible once both are typed, so migrate it to a typed
+  `fs` payload of your own shape in the amendment commit and record the
+  change. That is the only protected-test edit foreseen.
+- **Storage addresses.** The block device speaks 512-byte sector LBAs
+  (`BlockId`); the file system's 4096-byte block `b` is sectors `8b` to
+  `8b+7`. `src/kernel/storage/geometry.ts` maps sectors to cylinders; the
+  package's `FS-ALLOC-1` seek-cost fixture must be computed through that
+  conversion, and the pinned 650 must be re-derived and reported, not
+  assumed.
+- **`kernelSecret`** lives in the security subsystem's private state, is
+  excluded from `saveState`, never appears in an event payload, and the
+  terminal (WP-15) has no accessor for it. State the measure in the report.
+- **No default attachment.** Enabling `fs` does not attach the paging adapter
+  or wrap `disk0` in a RAID; those stay explicit controls owned by WP-09.
+
+## Inherited from WP-09: the merge surface at d3f0861
+
+| File | Every touched range since 197f622 |
+|---|---|
+| `src/kernel/Kernel.ts` | 19-20; 132; 180-181; 226; 319; 336; 418-480; 482-485; 495; 612-617; 619-622; 730-756; 996; 1043-1049; 1155-1157 (stale TODO deleted near 227) |
+| `src/kernel/config.ts` | 42-52; 76-81; 152-162 (eleven keys) |
+| `src/kernel/index.ts` | 9 |
+| `src/kernel/memory/demandPaging.ts` | 6; 43-53; 82; 105-108; 224; 333; 346-374; 427-437; 462 (opt-in completion-aware adapter) |
+| `src/kernel/sync/scenarios/boundedBuffer.ts` | pure FIFO helpers only |
+
+The admission veto is line 558; `executeInstruction` starts at 1007 with
+`case 'io'` at 1043; the readiness helper's `io` kind is 924. All eleven phase
+bodies remain byte-identical to WP-02. What WP-09 exposes to you: the block
+device through `StorageSubsystem` (sector LBAs, `enqueue` with completion
+results, `setDiskPolicy`), `blockCache.dirtyEntries()` and `dropDirty()` for
+the crash simulator, `DeviceDriver.control` for `ioctl` commands, and the
+`tty0` character device (renamed from `console`, which the source scanner
+rejects as a literal under `src/kernel`).
+
