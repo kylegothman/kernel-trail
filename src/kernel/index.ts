@@ -6,6 +6,7 @@ export { SCHEDULERS } from './scheduler/SchedulerRegistry';
 export { ALLOCATORS } from './memory/contiguous';
 
 export { REPLACEMENT_POLICIES } from './memory/replacement/registry';
+export { DISK_POLICIES } from './storage/registry';
 
 export { DeadlockSubsystem } from './deadlock/DeadlockSubsystem';
 export type { DeadlockStrategy } from './deadlock/DeadlockSubsystem';

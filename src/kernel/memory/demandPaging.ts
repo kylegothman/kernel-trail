@@ -3,7 +3,7 @@ import type { CowCapacity } from '../process/lifecycle';
 import type { SharedMapping } from '../process/ipc';
 import type {
   AddressSpaceId, Frame, FrameId, MemoryContext, PageId, PageReplacementId, Pid, ProcessControlBlock,
-  Rng, TerminationReason, Tick, VmDemandState, VmSettingsSnapshot, VmSnapshotState, VmThrashingState,
+  Rng, TerminationReason, Tick, VmDemandState, VmSettingsSnapshot, VmSnapshotState, VmThrashingState, StorageResultSnapshot,
 } from '../types';
 import { asPageId, asTick } from '../types';
 import { memoryArray, memoryBoolean, memoryInteger, memoryObject } from './FrameTable';
@@ -40,8 +40,17 @@ export interface PagingStorageRequest {
   readonly page: PageId;
   readonly frame: FrameId;
   readonly completeAt: Tick;
+  /** Completion-aware adapters receive the actual backing ASID and page. */
+  readonly space?: AddressSpaceId;
 }
-export interface PagingStorage { enqueue(request: PagingStorageRequest): void }
+export interface PagingStorage {
+  enqueue(request: PagingStorageRequest): void;
+  result?(requestId: number, kind: 'read' | 'write'): StorageResultSnapshot | null;
+  has?(requestId: number, kind: 'read' | 'write'): boolean;
+  acknowledge?(requestId: number, kind: 'read' | 'write'): void;
+  cancel?(requestId: number): void;
+  reassign?(requestId: number, pid: Pid): void;
+}
 
 /** EAT = (1 - p) * ma + p * faultServiceNs. */
 export function demandPagingEat(p: number, ma = 200, faultServiceNs = 8e6): number {
@@ -70,7 +79,7 @@ export class DemandPager {
   private lastMetricsTick: Tick | null = null;
   private ownEmission = false;
   private storage: PagingStorage = {
-    // TODO(astra): route through the disk queue once WP-09 lands
+    // Timed paging remains the default; physical backing requires explicit attachment.
     enqueue: () => {},
   };
 
@@ -93,7 +102,10 @@ export class DemandPager {
     });
   }
 
-  setStorage(storage: PagingStorage): void { this.storage = storage; }
+  setStorage(storage: PagingStorage | undefined, restoring = false): void {
+    if (!restoring && storage?.result !== undefined && this.requests.length > 0) throw new Error('attach paging storage before pending faults');
+    this.storage = storage ?? { enqueue: () => {} };
+  }
   setPolicy(id: PageReplacementId): void {
     const next = createReplacementPolicy(id, { lfuAging: this.settings.lfuAging });
     next.reset(this.memory.frameTable.frames); next.bindContext(this.context()); this.policy = next;
@@ -209,6 +221,7 @@ export class DemandPager {
     }) : undefined;
     if (next === undefined) { this.cancel(request); return; }
     request.pid = next.pid; request.space = next.space; request.page = next.page; request.write = next.write;
+    this.storage.reassign?.(request.id, next.pid);
   }
   sharedFirstTouch(pid: Pid, page: PageId): boolean {
     const mapping = this.host.sharedMapping?.(pid, page); if (mapping === undefined) return false;
@@ -317,6 +330,7 @@ export class DemandPager {
       if (request.kind === 'cow' && this.memory.pageTables.get(request.space, request.page)?.writable === true) { this.cancel(request); continue; }
       if (request.phase === 'queued' && tick > request.faultTick) this.start(request);
       if (!this.requests.includes(request) || request.dueTick === null) continue;
+      if (this.storage.result !== undefined) continue; // Physical completions belong to phase 2.
       if (request.phase === 'write_back') {
         const writtenAt = this.serviceBase(request) + this.settings.majorFaultTicks;
         if (tick < writtenAt) continue;
@@ -327,6 +341,35 @@ export class DemandPager {
         if (request.dueTick > writtenAt) this.enqueue(request, 'read');
       }
       if (request.phase === 'read' && tick >= request.dueTick) this.complete(request);
+    }
+  }
+  /** Called after physical media service in phase 2; the original VM deadline is a floor. */
+  serviceStorageCompletions(tick: Tick): void {
+    if (this.storage.result === undefined) return;
+    const ready = (request: Request, kind: 'read' | 'write'): boolean => {
+      if (this.storage.has?.(request.id, kind) === false) return true; // Prefetch supplied this stage.
+      const result = this.storage.result?.(request.id, kind);
+      if (result === null || result === undefined) return false;
+      this.storage.acknowledge?.(request.id, kind);
+      if (result.kind === 'failed') {
+        const peers = new Set([request.pid, ...this.waiters(request).map(reference => reference.pid)]);
+        this.cancel(request);
+        for (const pid of peers) this.fail(pid, result.reason === 'io_timeout' ? 'io_timeout' : 'storage_corruption');
+        return false;
+      }
+      return true;
+    };
+    for (const request of [...this.requests]) {
+      if (!this.requests.includes(request)) continue;
+      if (request.dueTick === null) continue;
+      if (request.phase === 'write_back') {
+        const writtenAt = this.serviceBase(request) + this.settings.majorFaultTicks;
+        if (tick < writtenAt || !ready(request, 'write')) continue;
+        if (request.kind === 'cow') { request.phase = 'copy'; continue; }
+        request.phase = 'read';
+        if (request.dueTick > writtenAt) this.enqueue(request, 'read');
+      }
+      if (this.requests.includes(request) && request.phase === 'read' && tick >= request.dueTick && ready(request, 'read')) this.complete(request);
     }
   }
   private serviceBase(request: Request): number {
@@ -381,9 +424,17 @@ export class DemandPager {
   }
   private enqueue(request: Request, kind: 'read' | 'write'): void {
     if (request.frame === null || request.dueTick === null) throw new Error('paging request has no reservation');
-    this.storage.enqueue({ requestId: request.id, kind, pid: request.pid,
+    const submission: PagingStorageRequest = { requestId: request.id, kind, pid: request.pid,
       page: kind === 'write' ? request.victim?.page ?? request.page : request.page, frame: request.frame,
-      completeAt: kind === 'write' ? asTick(this.serviceBase(request) + this.settings.majorFaultTicks) : request.dueTick });
+      completeAt: kind === 'write' ? asTick(this.serviceBase(request) + this.settings.majorFaultTicks) : request.dueTick };
+    const backing = kind === 'write' && request.victim !== null ? request.victim : this.backing(request.pid, request.space, request.page);
+    try { this.storage.enqueue(this.storage.result === undefined ? submission : { ...submission, space: backing.space, page: backing.page }); }
+    catch (error) {
+      if (this.storage.result === undefined || !(error instanceof RangeError)) throw error;
+      const peers = new Set([request.pid, ...this.waiters(request).map(reference => reference.pid)]);
+      this.cancel(request);
+      for (const pid of peers) this.noSpace(pid);
+    }
   }
   private complete(request: Request): void {
     if (request.frame === null) throw new Error('completed page has no frame');
@@ -408,6 +459,7 @@ export class DemandPager {
     this.requests = this.requests.filter(item => item !== request);
   }
   private cancel(request: Request): void {
+    this.storage.cancel?.(request.id);
     if (request.frame !== null) this.memory.freeFrame(request.frame);
     this.requests = this.requests.filter(item => item !== request);
     for (const reference of this.references.values()) if (reference.requestId === request.id) reference.requestId = null;

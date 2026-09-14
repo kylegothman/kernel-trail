@@ -39,6 +39,17 @@ export interface KernelTuning {
   readonly maxPreemptionsPerProcess: number;
   readonly preventionMode: 'ordering' | 'all_or_nothing';
   readonly deadlockRecovery: 'none' | 'abort_one' | 'abort_all' | 'preempt';
+  readonly diskStarvationThreshold: number;
+  readonly interruptServiceTicks: number;
+  readonly maxInterruptsPerTick: number;
+  readonly interruptStormThreshold: number;
+  readonly interruptStormWindow: number;
+  readonly maxPendingInterrupts: number;
+  readonly dmaCycleStealRatio: number;
+  readonly nvmWriteBufferPages: number;
+  readonly rebuildBlocksPerTick: number;
+  readonly rebuildProgressInterval: number;
+  readonly blockCacheEntries: number;
   readonly threadModel: ThreadModel;
   readonly coreCount: number;
   readonly lwpPoolSize: number;
@@ -62,6 +73,12 @@ export const DEFAULT_TUNING: KernelTuning = Object.freeze({
   priorityInheritance: false, rwlockPolicy: 'writer_pref',
   rollbackCheckpointInterval: 25, maxPreemptionsPerProcess: 3,
   preventionMode: 'ordering', deadlockRecovery: 'abort_one',
+  diskStarvationThreshold: 400, interruptServiceTicks: 2, maxInterruptsPerTick: 2,
+  interruptStormThreshold: 32, interruptStormWindow: 10,
+  // Bound each line's backlog while leaving room for all storm escalation stages.
+  maxPendingInterrupts: 256, dmaCycleStealRatio: 0.1, nvmWriteBufferPages: 8,
+  // Report rebuild progress once per ten ticks without changing its issuance cap.
+  rebuildBlocksPerTick: 4, rebuildProgressInterval: 10, blockCacheEntries: 64,
   contextSwitchTicks: 0, deadlockDetectionInterval: 20, threadModel: 'one_to_one',
   coreCount: 4, lwpPoolSize: 4, defaultSerialFraction: 0.25,
   degreeOfMultiprogramming: 8, checkInvariants: true,
@@ -132,6 +149,17 @@ export function resolveTuning(overrides: Partial<KernelTuning> = {}): KernelTuni
   integer('maxPreemptionsPerProcess', tuning.maxPreemptionsPerProcess, 1);
   if (!['ordering', 'all_or_nothing'].includes(tuning.preventionMode)) throw new KernelConfigError('invalid prevention mode');
   if (!['none', 'abort_one', 'abort_all', 'preempt'].includes(tuning.deadlockRecovery)) throw new KernelConfigError('invalid deadlock recovery');
+  integer('diskStarvationThreshold', tuning.diskStarvationThreshold, 1);
+  integer('interruptServiceTicks', tuning.interruptServiceTicks, 1);
+  integer('maxInterruptsPerTick', tuning.maxInterruptsPerTick, 1);
+  integer('interruptStormThreshold', tuning.interruptStormThreshold, 1);
+  integer('interruptStormWindow', tuning.interruptStormWindow, 1);
+  integer('maxPendingInterrupts', tuning.maxPendingInterrupts, 1);
+  if (!Number.isFinite(tuning.dmaCycleStealRatio) || tuning.dmaCycleStealRatio < 0 || tuning.dmaCycleStealRatio > 1) throw new KernelConfigError('dmaCycleStealRatio must be in [0, 1]');
+  integer('nvmWriteBufferPages', tuning.nvmWriteBufferPages, 1);
+  integer('rebuildBlocksPerTick', tuning.rebuildBlocksPerTick, 1);
+  integer('rebuildProgressInterval', tuning.rebuildProgressInterval, 1);
+  integer('blockCacheEntries', tuning.blockCacheEntries, 1);
   integer('coreCount', tuning.coreCount, 1);
   integer('lwpPoolSize', tuning.lwpPoolSize, 1);
   integer('degreeOfMultiprogramming', tuning.degreeOfMultiprogramming, 1);
