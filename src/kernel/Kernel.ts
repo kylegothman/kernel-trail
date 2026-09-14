@@ -16,6 +16,8 @@ import { IpcManager } from './process/ipc';
 import { MemorySubsystem } from './memory/MemorySubsystem';
 import { SyncSubsystem } from './sync/SyncSubsystem';
 import { DeadlockSubsystem, deadlockSettings, decodeResourceVector, type DeadlockStrategy } from './deadlock/DeadlockSubsystem';
+import { StorageSubsystem } from './storage/StorageSubsystem';
+import { IoSubsystem } from './io/IoSubsystem';
 import type { ResourceDeclaration, ResourceVector } from './deadlock/resources';
 import type { SuspendedProcess } from './memory/demandPaging';
 import type {
@@ -127,6 +129,7 @@ export interface SyncHooks {
   removeWaiter(pid: Pid): void;
 }
 export interface IoHooks {
+  expireTimers(tick: Tick): void;
   serviceCompletions(tick: Tick): void;
   deliverInterrupts(tick: Tick): void;
   isSatisfied(pid: Pid, reason: BlockReason): boolean;
@@ -174,6 +177,8 @@ export class KernelImpl implements Kernel {
   readonly memorySubsystem: MemorySubsystem;
   readonly syncSubsystem: SyncSubsystem;
   readonly deadlockSubsystem: DeadlockSubsystem;
+  readonly storageSubsystem: StorageSubsystem;
+  readonly ioSubsystem: IoSubsystem;
   private readonly snapshotHooks: SnapshotHooks[] = [];
   readonly pageTables = new Map<AddressSpaceId, PageTableEntry[]>();
   private currentTick = asTick(0);
@@ -218,10 +223,8 @@ export class KernelImpl implements Kernel {
   private memory: MemoryHooks;
   private sync: SyncHooks = { expireTimers: noop, isSatisfied: () => false,
     acquire: noop, release: noop, releaseAll: noop, removeWaiter: noop };
-  // TODO(astra): WP-09 supplies completion, interrupt and device wait handling.
-  private io: IoHooks = { serviceCompletions: noop, deliverInterrupts: noop,
+  private io: IoHooks = { expireTimers: noop, serviceCompletions: noop, deliverInterrupts: noop,
     isSatisfied: () => false, request: noop, removeWaiter: noop };
-  // TODO(astra): WP-09 supplies RAID rebuild timers.
   private storage: StorageHooks = { expireTimers: noop };
   // TODO(astra): WP-10 supplies journal timers and descriptor reference counts.
   private fs: FsHooks = { expireTimers: noop, retainDescriptor: noop, closeDescriptor: noop, closeOnExec: () => false };
@@ -313,7 +316,7 @@ export class KernelImpl implements Kernel {
       },
       clearThreads: pcb => this.threads.clear(pcb),
       programNamed: name => this.namedPrograms.get(name),
-      detachIpc: pcb => { this.deadlockSubsystem.exec(pcb, this.enabled.has('deadlock')); this.syncSubsystem.exec(pcb.pid); this.ipc.removeProcess(pcb.pid); this.memorySubsystem.detachAddressSpace(pcb.addressSpaceId); },
+      detachIpc: pcb => { this.deadlockSubsystem.exec(pcb, this.enabled.has('deadlock')); this.syncSubsystem.exec(pcb.pid); this.io.removeWaiter(pcb.pid); this.storageSubsystem.removeWaiter(pcb.pid); this.ipc.removeProcess(pcb.pid); this.memorySubsystem.detachAddressSpace(pcb.addressSpaceId); },
       replaceProgram: (pcb, program) => {
         this.programs.set(pcb.pid, program);
         this.burstSizes.set(pcb.pid, program.length);
@@ -330,7 +333,7 @@ export class KernelImpl implements Kernel {
       closeDescriptor: (pcb, fd) => this.fs.closeDescriptor(pcb, fd),
       closeOnExec: (pcb, fd) => this.fs.closeOnExec(pcb, fd),
       releaseResources: pcb => { this.deadlockSubsystem.releaseResources(pcb, this.enabled.has('deadlock')); this.sync.releaseAll(pcb); },
-      removeFromWaitQueues: pcb => { this.deadlockSubsystem.removeWaiter(pcb.pid); this.sync.removeWaiter(pcb.pid); this.io.removeWaiter(pcb.pid); this.ipc.removeProcess(pcb.pid); this.memorySubsystem.detachAddressSpace(pcb.addressSpaceId); },
+      removeFromWaitQueues: pcb => { this.deadlockSubsystem.removeWaiter(pcb.pid); this.sync.removeWaiter(pcb.pid); this.io.removeWaiter(pcb.pid); this.storageSubsystem.removeWaiter(pcb.pid); this.ipc.removeProcess(pcb.pid); this.memorySubsystem.detachAddressSpace(pcb.addressSpaceId); },
       wakeParent: pid => { this.wakeable.add(pid); },
       chargeCowCopy: (pcb, ticks) => { this.copyDebt.set(pcb.pid, (this.copyDebt.get(pcb.pid) ?? 0) + ticks); },
       memory: { pageTables: this.pageTables,
@@ -412,8 +415,74 @@ export class KernelImpl implements Kernel {
       beforeAcquire: (actor, resource, operation) => deadlock.beforeAcquire(actor, resource, operation) });
     this.snapshotHooks.push({ saveState: () => deadlock.saveState(), restoreState: snapshot => deadlock.prepareKernelRestore(snapshot) });
     this.onPhase((phase, tick) => { if (this.enabled.has('deadlock')) deadlock.onPhase(phase, tick); });
+    const storageRng = this.rng.streams.get('storage'); const ioRng = this.rng.streams.get('io');
+    if (storageRng === undefined || ioRng === undefined) throw new Error('storage or I/O RNG stream missing');
+    this.storageSubsystem = new StorageSubsystem({ tick: () => this.tick, enabled: () => this.enabled.has('storage'),
+      emit: event => this.publish(event), rng: storageRng,
+      isPagingBackingLive: (space, page) => this.pageTables.get(space)?.some(entry => entry.page === page) === true
+        || this.frames.some(frame => frame.owner === space && frame.page === page)
+        || this.table.processes.some(pcb => (this.pageTables.get(pcb.addressSpaceId) ?? []).some(entry => {
+          const mapping = this.ipc.sharedMapping(pcb.pid, entry.page);
+          return mapping?.backingSpace === space && mapping.backingPage === page;
+        })),
+    }, {
+      totalCylinders: config.totalCylinders, policy: config.diskPolicy, nvmWriteBufferPages: this.tuning.nvmWriteBufferPages,
+      settings: { diskStarvationThreshold: this.tuning.diskStarvationThreshold,
+        rebuildBlocksPerTick: this.tuning.rebuildBlocksPerTick, rebuildProgressInterval: this.tuning.rebuildProgressInterval },
+    });
+    const storage = this.storageSubsystem;
+    const ioActor = (pid: Pid) => {
+      const pcb = this.table.get(pid); const tid = pcb === undefined ? undefined
+        : this.executingThread !== undefined && pcb.threads.includes(this.executingThread) ? this.executingThread : pcb.threads[0];
+      return tid === undefined ? undefined : { pid, tid };
+    };
+    this.ioSubsystem = new IoSubsystem({ tick: () => this.tick, enabled: () => this.enabled.has('io'),
+      process: pid => this.table.get(pid), thread: tid => this.threads.table.get(tid), actor: ioActor,
+      block: (actor, device) => this.blockProcess(actor.pid, { kind: 'io', device }, actor.tid),
+      emit: event => this.publish(event), chargeKernelDebt: ticks => this.chargeKernelDebt(ticks),
+      terminate: (pid, reason) => { const pcb = this.table.get(pid); if (pcb !== undefined) this.exitProcess(pcb, -1, reason); },
+      settings: () => ({ interruptServiceTicks: this.tuning.interruptServiceTicks, maxInterruptsPerTick: this.tuning.maxInterruptsPerTick,
+        interruptStormThreshold: this.tuning.interruptStormThreshold, interruptStormWindow: this.tuning.interruptStormWindow,
+        maxPendingInterrupts: this.tuning.maxPendingInterrupts, dmaCycleStealRatio: this.tuning.dmaCycleStealRatio,
+        blockCacheEntries: this.tuning.blockCacheEntries }),
+    }, ioRng, storage);
+    const io = this.ioSubsystem;
+    this.storage = { expireTimers: tick => storage.expireTimers(tick) };
+    this.io = { expireTimers: tick => io.expireTimers(tick), serviceCompletions: tick => {
+      if (this.enabled.has('storage')) storage.serviceCompletions(tick);
+      if (this.enabled.has('io')) io.serviceCompletions(tick);
+      if (this.enabled.has('memory') || this.enabled.has('vm')) this.memorySubsystem.pager.serviceStorageCompletions(tick);
+    }, deliverInterrupts: tick => io.deliverInterrupts(tick), request: (pid, device) => io.request(pid, device),
+    removeWaiter: pid => io.removeWaiter(pid), isSatisfied: (pid, reason) => {
+      const pcb = this.table.get(pid);
+      const matches = pcb?.threads.map(tid => this.threads.table.get(tid)).filter(thread => thread?.state === 'waiting' && thread.blockedOn === reason) ?? [];
+      return matches.length === 1 && io.isSatisfied(pid, matches[0]!.tid, reason);
+    } };
+    let ownerBeforeScheduling = this.lastCpuOwner;
+    this.onPhase((phase, tick) => {
+      if (!this.enabled.has('io')) return;
+      if (phase === 1) this.io.expireTimers(tick);
+      if (phase === 7) ownerBeforeScheduling = this.lastCpuOwner;
+      if (phase === 8 && io.debt > 0) {
+        if (this.lastCpuOwner !== ownerBeforeScheduling) this.chargeKernelDebt(io.debt);
+        // The unchanged phase 8 consumes debt only when a user process is selected.
+        if (!this.enabled.has('process') || this.running === null) this.switchDebt -= 1;
+        io.consumeDebtTick();
+      }
+    });
+    this.installHooks({ snapshots: { saveState: () => ({ storage: storage.saveState(), ...io.saveState() }), restoreState: snapshot => {
+      const commitStorage = storage.prepareKernelRestore(snapshot);
+      const commitIo = io.prepareKernelRestore(snapshot);
+      const ioDebt = snapshot.subsystems?.io?.payload.kernelDebt ?? 0;
+      const combinedDebt = snapshot.subsystems?.scheduler?.payload.runtime.switchDebt ?? 0;
+      if (ioDebt < 0 || ioDebt > combinedDebt) throw new Error('I/O debt exceeds combined kernel debt');
+      return () => { commitStorage(); commitIo(); this.bindPagingStorage(true); };
+    } } });
     const invariants = this.invariants;
-    this.invariants = { check: kernel => { invariants.check(kernel); deadlock.assertInvariants(); } };
+    this.invariants = { check: kernel => { invariants.check(kernel); deadlock.assertInvariants();
+      if (this.enabled.has('storage')) storage.assertInvariants();
+      if (this.enabled.has('io')) { io.assertInvariants(); this.assert(io.debt >= 0 && io.debt <= this.switchDebt, 33, 'I/O debt exceeds combined kernel debt'); }
+    } };
     this.initialiseFrameTable();
     this.initialiseSystemProcesses();
   }
@@ -423,7 +492,7 @@ export class KernelImpl implements Kernel {
   process(pid: Pid): Readonly<ProcessControlBlock> | undefined { return this.table.get(pid); }
   get activeReplacementPolicy(): PageReplacementId { return this.config.replacementPolicy; }
   get activeAllocationStrategy(): AllocationStrategy { return this.config.allocationStrategy; }
-  get activeDiskPolicy(): DiskSchedulingId { return this.config.diskPolicy; }
+  get activeDiskPolicy(): DiskSchedulingId { return this.storageSubsystem.activePolicy; }
   get invariantInterval(): number { return this.invariantSlowInterval; }
   frame(id: FrameId): Frame | undefined { return this.frames[id]; }
   program(pid: Pid): Program | undefined { return this.programs.get(pid); }
@@ -540,8 +609,17 @@ export class KernelImpl implements Kernel {
       }
       case 'ioctl':
         // TODO(astra): WP-11 validates ioctl arguments.
-        if (arg !== 'tlb_flush') return failure('EINVAL', 'unknown kernel ioctl subcommand');
+        if (arg !== 'tlb_flush') {
+          if (!this.enabled.has('io') || typeof arg !== 'string' || typeof request.args[1] !== 'string') return failure('EINVAL', 'unknown kernel ioctl subcommand');
+          const result = this.ioSubsystem.control(arg as DeviceId, request.args[1], request.args.slice(2), this.ioActor(pcb));
+          if (result.ok && request.args[1] === 'set_policy') this.currentConfig = cloneConfig({ ...this.config, diskPolicy: this.storageSubsystem.activePolicy });
+          return result;
+        }
         this.memorySubsystem.flush(); return { ok: true, value: null };
+      case 'sync':
+        // TODO(astra): WP-11 validates sync arguments.
+        // TODO(astra): WP-10 flushes the journal.
+        return this.enabled.has('io') ? this.ioSubsystem.sync(this.ioActor(pcb)) : failure('EINVAL', 'I/O is disabled');
       case 'sem_wait':
         // TODO(astra): WP-11 validates sem_wait arguments.
         return typeof arg === 'string' && request.args.length === 1 ? this.syncSubsystem.syscall(pcb.pid, 'sem_wait', arg as ResourceId) : failure('EINVAL', 'expected a synchronization resource');
@@ -649,9 +727,33 @@ export class KernelImpl implements Kernel {
     this.memorySubsystem.setAllocationStrategy(strategy);
     this.currentConfig = cloneConfig({ ...this.config, allocationStrategy: strategy });
   }
-  setDiskPolicy(_id: DiskSchedulingId): void {
-    // TODO(astra): WP-09 implements this.
-    throw new Error('not implemented: setDiskPolicy');
+  setDiskPolicy(id: DiskSchedulingId): void {
+    this.storageSubsystem.setPolicy(id);
+    this.currentConfig = cloneConfig({ ...this.config, diskPolicy: id });
+  }
+  /** Kernel-side CPU ticks charged to no process; consumed by the phase 8 debt check. */
+  chargeKernelDebt(ticks: number): void { this.switchDebt += ticks; }
+  /** Opt in before issuing faults; existing demand-paging deadlines remain the floor. */
+  attachPagingStorage(options?: Parameters<StorageSubsystem['attachPagingStorage']>[0]): void {
+    if (!this.enabled.has('storage')) throw new Error('paging storage requires storage to be enabled');
+    if (this.memorySubsystem.pager.saveState().demand.requests.length > 0) throw new Error('attach paging storage before pending faults');
+    this.storageSubsystem.attachPagingStorage({ pageBytes: this.config.pageSize, ...options }); this.bindPagingStorage();
+  }
+  private bindPagingStorage(restoring = false): void {
+    const storage = this.storageSubsystem;
+    this.memorySubsystem.pager.setStorage(storage.pagingAttached ? {
+      enqueue: request => {
+        if (request.space === undefined) throw new Error('paging storage needs backing address-space identity');
+        storage.enqueuePaging({ ...request, space: request.space });
+      },
+      result: (id, kind) => storage.pagingResult(id, kind), has: (id, kind) => storage.hasPagingTransfer(id, kind),
+      acknowledge: (id, kind) => storage.acknowledgePaging(id, kind), cancel: id => storage.cancelPaging(id),
+      reassign: (id, pid) => storage.reassignPaging(id, pid),
+    } : undefined, restoring);
+  }
+  private ioActor(pcb: ProcessControlBlock): { pid: Pid; tid: Tid } | undefined {
+    const tid = this.executingThread !== undefined && pcb.threads.includes(this.executingThread) ? this.executingThread : pcb.threads[0];
+    return tid === undefined ? undefined : { pid: pcb.pid, tid };
   }
   declareResource(resource: ResourceDeclaration): void { this.deadlockSubsystem.declare(resource); }
   declareClaims(pid: Pid, claims: ResourceVector): void { this.deadlockSubsystem.declareClaims(pid, claims); }
@@ -891,6 +993,7 @@ export class KernelImpl implements Kernel {
     }
   }
   private execute(pcb: ProcessControlBlock, thread: ThreadControlBlock): boolean {
+    if (this.enabled.has('io') && this.ioSubsystem.gate({ pid: pcb.pid, tid: thread.tid })) { this.threads.deferServiceCharge(); return false; }
     this.executingThread = thread.tid;
     const program = this.programs.get(pcb.pid);
     if (program === undefined) throw new KernelInvariantError(8, 'running process has no program');
@@ -937,7 +1040,13 @@ export class KernelImpl implements Kernel {
         const result = this.syscall({ ...instruction.call, pid: pcb.pid });
         return !(instruction.call.name === 'exec' && result.ok);
       }
-      case 'io': if (this.enabled.has('io')) this.io.request(pcb.pid, instruction.device); return true;
+      case 'io': {
+        if (!this.enabled.has('io')) return true;
+        this.io.request(pcb.pid, instruction.device);
+        const result = this.ioSubsystem.instructionOutcome({ pid: pcb.pid, tid: thread.tid });
+        if (result.deferService) this.threads.deferServiceCharge();
+        return result.advance;
+      }
       case 'acquire': if (this.enabled.has('sync')) this.sync.acquire(pcb.pid, instruction.resource); return true;
       case 'release': if (this.enabled.has('sync')) this.sync.release(pcb.pid, instruction.resource); return true;
       case 'thread_create': this.threads.create(pcb, thread.tid); return true;
@@ -1043,6 +1152,9 @@ export class KernelImpl implements Kernel {
   private initialiseFrameTable(): void {
     this.syncPrimitives = this.syncSubsystem.primitives;
     this.resources = this.deadlockSubsystem.resources.resources;
+    this.diskQueue = this.storageSubsystem.diskQueue;
+    this.diskHead = this.storageSubsystem.diskHead;
+    this.devices = this.ioSubsystem.devices;
     this.frames = this.memorySubsystem.frameTable.frames;
     this.tlb = this.memorySubsystem.tlb.entries;
     this.rebuildFreeList();

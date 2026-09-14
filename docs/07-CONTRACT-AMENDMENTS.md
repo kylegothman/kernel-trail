@@ -541,6 +541,93 @@ regenerated lock are committed alone, before implementation.
 ---
 
 
+## Amendment 9, 2026-09-14: typed storage and I/O continuation
+
+**Status:** applied on wp-09 after explicit human review of the exact
+wp09-contract-promotion.patch and its one-line driver discriminant correction,
+with approval of hash regeneration on 2026-09-14 for precisely those changes.
+The WP-09 pre-flight decisions are recorded in commit 17a5cb9. The reviewer
+also approved including the mechanical G7 fixture migration in this amendment
+commit so that the commit passes all four gates independently.
+
+### What was an envelope
+
+Amendment 1 introduced `SubsystemSnapshots.storage` as `SubsystemEnvelope`;
+amendment 3 added the `io` envelope. Neither described the media, request,
+interrupt or device state needed for deterministic continuation.
+
+### What changed
+
+The slots are now `StorageSnapshotState` and `IoSnapshotState`, both version 1.
+The exact reviewed patch adds 726 lines and removes three in types.ts. It
+changes no other existing subsystem, process, scheduler, memory, VM or game
+contract. The separately approved correction changes the driver discriminant
+from `console` to `character_output`. Storage records physical queues, committed routes, durable data,
+NVM mapping and GC, RAID dependencies and rebuilds, and opt-in paging backing.
+I/O records actor requests, CPU charges, interrupts and storm mitigation,
+device routing, buffers, cache generations and flushes, and spool jobs.
+
+The dummy snapshot contribution in `tests/kernel/memory/frameTable.test.ts`
+moves from `io` to the still-untyped `fs` slot. Only the slot key and owner on
+the three approved G7 lines change; assertions, values and run calls remain
+unchanged. This migration is a mechanical consequence of promoting `io`, not
+subsystem implementation.
+
+### Why this shape
+
+Both payloads use explicit readonly type literals and scalar brands rather
+than embedded runtime interfaces, callbacks, Map, Set or generic JSON fields.
+Standalone strict TypeScript checks prove that both payloads extend
+`JsonValue`, both outer states fit `SubsystemEnvelope`, and the media result
+types agree in both directions. The reviewer independently verified the
+payload and envelope checks before approving the exact patch.
+
+Request IDs preserve completion ownership across the two slots. Committed
+routes preserve their timing across policy changes. NVM state retains partial
+requests and reserved GC destinations; RAID state retains dependency results,
+spare ownership, rebuild frontiers and irreversible data loss. Cache generations
+cannot be reused after eviction, and flush progress identifies one completion
+route. Device-to-media bindings preserve where future queued work is sent.
+
+Paging backing is opt-in. Its snapshot is null until a leg or test explicitly
+calls `attachPagingStorage()`; enabling storage alone never attaches it.
+Restoring a nonnull contribution preserves prior explicit attachment. The
+existing WP-06 deadline remains a floor, and media acknowledgement may only
+delay completion. No `VmSnapshotState` field changes.
+
+### Consequences
+
+WP-09 must prepare both contributions without mutation, validate references,
+ordering, bounds and mirror tables together, then commit and rebind stable
+views. Completed-tick snapshots preserve the I/O portion of kernel debt while
+the existing scheduler slot remains the owner of the combined `switchDebt`.
+Root RNG state stays in `KernelSnapshot.rng`; process and VM state retain their
+existing owners. Full fresh-kernel program and thread reconstruction remains
+WP-11's obligation, and the inherited restore guard stays.
+
+WP-10 must migrate the frameTable dummy contribution again when it promotes
+`fs`. WP-10 and WP-11 must use the device ID `tty0`, driver module
+`io/drivers/characterOutput.ts` and snapshot discriminant `character_output`.
+The protected source scanner retains string literals and import paths, so the
+bare forbidden identifier `console` failed the test gate even as a harmless
+driver discriminant. The user approved these names instead of changing the
+scanner or its policy. Do not reintroduce that identifier in kernel strings or
+imports. The user will correct remaining device prose in the spec and package.
+
+The NVM amplification and RAID queue-ratio fixtures still require their
+approved fixed-input measurements; this type promotion does not establish
+those numerical claims.
+
+The original frozen-file patch and its one-line discriminant correction were
+applied exactly as reviewed. Hash regeneration was explicitly human-approved
+on 2026-09-14 for that combination only. This amendment,
+regenerated lock and approved mechanical fixture migration are committed
+together before subsystem implementation. All four Node 22 gates must pass
+before this amendment is committed.
+
+---
+
+
 # Package scope corrections
 
 Not contract changes, so no hash moves and no amendment number. Recorded here
@@ -630,4 +717,3 @@ conservation and I-22, I-23 scoped to exclusive primitives and internal actors,
 the readers-writers workload and throughput wording, the room solution's
 Coffman condition, and three scenario rows added to 16.7. Amendment 7 is
 reserved for the typed `SyncSnapshotState`, pending its own exact-patch review.
-

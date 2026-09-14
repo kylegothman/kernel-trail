@@ -19,6 +19,17 @@ export interface BoundedBufferOptions {
   readonly reordering?: boolean;
 }
 
+/** Pure bounded FIFO storage shared with device buffering. */
+export function boundedFifoPush<T>(items: readonly T[], capacity: number, item: T): readonly T[] {
+  check(Number.isSafeInteger(capacity) && capacity > 0 && items.length < capacity, 'bounded-buffer occupancy');
+  return [...items, item];
+}
+
+export function boundedFifoShift<T>(items: readonly T[]): { item: T; items: readonly T[] } {
+  check(items.length > 0, 'bounded-buffer occupancy');
+  return { item: items[0]!, items: items.slice(1) };
+}
+
 /** The five textbook lines are five separately scheduled instructions. */
 export function executeBoundedBuffer(ctx: ScenarioContext, initial: BoundedBufferState, actor: Actor, step: number): AttemptResult {
   const row = initial.actors.find(value => sameActor(value.actor, actor));
@@ -48,7 +59,7 @@ export function executeBoundedBuffer(ctx: ScenarioContext, initial: BoundedBuffe
     check(reservation !== undefined, 'bounded-buffer successful wait has no reservation');
     check(producer ? state.items.length < state.capacity : state.items.length > 0, 'bounded-buffer occupancy');
     ctx.setScenario({ ...state,
-      items: producer ? [...state.items, state.produced + 1] : state.items.slice(1),
+      items: producer ? boundedFifoPush(state.items, state.capacity, state.produced + 1) : boundedFifoShift(state.items).items,
       produced: state.produced + (producer ? 1 : 0), consumed: state.consumed + (producer ? 0 : 1),
       reservations: state.reservations.map(value => value.permitId === reservation.permitId ? { ...value, itemApplied: true } : value),
     });

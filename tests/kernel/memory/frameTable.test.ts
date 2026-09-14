@@ -436,9 +436,9 @@ describe('kernel memory snapshot dispatch and teardown', () => {
     const kernel = createKernel(REFERENCE_CONFIG);
     let retained = 5;
     kernel.installHooks({ snapshots: {
-      saveState: () => ({ io: { owner: 'io', version: 1, payload: retained } }),
+      saveState: () => ({ fs: { owner: 'fs', version: 1, payload: retained } }),
       restoreState: snapshot => {
-        const value = snapshot.subsystems?.io?.payload;
+        const value = snapshot.subsystems?.fs?.payload;
         if (typeof value !== 'number' || value < 0) throw new Error('invalid fixture contribution');
         return () => { retained = value; };
       },
@@ -448,7 +448,7 @@ describe('kernel memory snapshot dispatch and teardown', () => {
     retained = 9; kernel.run(2); kernel.restore(saved);
     expect(retained).toBe(5); expect(canonical(kernel.snapshot())).toBe(canonical(saved));
     const before = canonical(kernel.snapshot());
-    expect(() => kernel.restore({ ...saved, subsystems: { ...saved.subsystems, io: { owner: 'io', version: 1, payload: -1 } } })).toThrow();
+    expect(() => kernel.restore({ ...saved, subsystems: { ...saved.subsystems, fs: { owner: 'fs', version: 1, payload: -1 } } })).toThrow();
     expect(canonical(kernel.snapshot())).toBe(before);
   });
 
