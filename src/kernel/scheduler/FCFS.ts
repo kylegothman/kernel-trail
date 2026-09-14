@@ -1,5 +1,6 @@
-import type { JsonValue, Pid, ProcessControlBlock, SchedulerContext, SchedulingDecision, Tick } from '../types';
+import type { Pid, ProcessControlBlock, SchedulerContext, SchedulingDecision, Tick } from '../types';
 import { SchedulerBase, snapshotArray, snapshotInteger, snapshotObject } from './SchedulerBase';
+import type { SchedulerPolicyDetails } from './SchedulerBase';
 import { asTick } from '../types';
 import { tieBreak } from './tieBreak';
 
@@ -51,10 +52,10 @@ export class FcfsScheduler extends SchedulerBase {
     this.compact(); this.refresh();
     return this.decision(ctx, null, 'no process is ready');
   }
-  protected saveDetails(): JsonValue {
-    return this.entered.slice(this.head).map(entry => ({ tick: entry.tick, source: entry.source }));
+  protected saveDetails(): SchedulerPolicyDetails {
+    return { policy: 'fcfs', detail: this.entered.slice(this.head).map(entry => ({ tick: entry.tick, source: entry.source })) };
   }
-  protected prepareRestoreDetails(detail: JsonValue, queues: readonly (readonly Pid[])[], ctx: SchedulerContext): () => void {
+  protected prepareRestoreDetails(detail: unknown, queues: readonly (readonly Pid[])[], ctx: SchedulerContext): () => void {
     const queue = queues[0];
     if (queues.length !== 1 || queue === undefined) throw new Error('FCFS requires one queue');
     const entries = snapshotArray(detail, 'FCFS entries').map((value): { tick: Tick; source: 'admit' | 'unblock' } => {

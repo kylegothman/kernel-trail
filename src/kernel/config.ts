@@ -25,6 +25,7 @@ export interface KernelTuning {
   readonly thrashingControl: 'working_set' | 'pff';
   readonly pffUpperBound: number;
   readonly pffLowerBound: number;
+  readonly mlfqAccounting: 'per_slice' | 'cumulative';
   readonly contextSwitchTicks: number;
   readonly deadlockDetectionInterval: number;
   readonly threadModel: ThreadModel;
@@ -45,6 +46,7 @@ export const DEFAULT_TUNING: KernelTuning = Object.freeze({
   // The minimum suspension matches the default recovery observation period.
   thrashingSuspendInterval: 50, thrashingSuspendDuration: 100, thrashingRecoveryTicks: 100,
   thrashingControl: 'working_set', pffUpperBound: 300, pffLowerBound: 50,
+  mlfqAccounting: 'per_slice',
   contextSwitchTicks: 0, deadlockDetectionInterval: 20, threadModel: 'one_to_one',
   coreCount: 4, lwpPoolSize: 4, defaultSerialFraction: 0.25,
   degreeOfMultiprogramming: 8, checkInvariants: true,
@@ -101,6 +103,7 @@ export function resolveTuning(overrides: Partial<KernelTuning> = {}): KernelTuni
   if (!['working_set', 'pff'].includes(tuning.thrashingControl)) throw new KernelConfigError('invalid thrashing control');
   if (!Number.isFinite(tuning.pffLowerBound) || !Number.isFinite(tuning.pffUpperBound)
     || tuning.pffLowerBound < 0 || tuning.pffUpperBound <= tuning.pffLowerBound) throw new KernelConfigError('invalid PFF bounds');
+  if (!['per_slice', 'cumulative'].includes(tuning.mlfqAccounting)) throw new KernelConfigError('invalid MLFQ accounting mode');
   integer('contextSwitchTicks', tuning.contextSwitchTicks, 0);
   if (tuning.contextSwitchTicks > 2) throw new KernelConfigError('contextSwitchTicks must be <= 2');
   integer('deadlockDetectionInterval', tuning.deadlockDetectionInterval, 1);

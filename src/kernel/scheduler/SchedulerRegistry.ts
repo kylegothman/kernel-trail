@@ -1,10 +1,14 @@
-import type { JsonValue, KernelConfig, SchedulerContext, SubsystemEnvelope, Pid, SchedulerId, SchedulerParams, SchedulerPolicy } from '../types';
+import type { KernelConfig, SchedulerContext, SchedulerSnapshotState, Pid, SchedulerId, SchedulerParams, SchedulerPolicy } from '../types';
 import { FcfsScheduler } from './FCFS';
 import { SjfScheduler } from './sjf';
 import { SrtfScheduler } from './srtf';
 import { PriorityScheduler } from './priority';
 import { SchedulerBase, snapshotArray, snapshotInteger, snapshotObject, snapshotPid, restoreSchedulerParams, saveSchedulerParams } from './SchedulerBase';
 import { SchedulingAccounting } from './metrics';
+import type { EmittableEvent } from '../EventBus';
+import { PriorityAgingScheduler } from './priorityAging';
+import { RoundRobinScheduler } from './rr';
+import { MlfqScheduler } from './mlfq';
 
 export { tieBreak, EMPTY_METRICS, DEFAULT_SCHEDULER_PARAMS, isMetricsAware, isRunningAware } from './common';
 export type { MetricsAwarePolicy, RunningAwarePolicy } from './common';
@@ -12,22 +16,27 @@ export { FcfsScheduler } from './FCFS';
 export { SjfScheduler } from './sjf';
 export { SrtfScheduler } from './srtf';
 export { PriorityScheduler } from './priority';
-export type SchedulerFactory = () => SchedulerPolicy;
+export interface SchedulerHost {
+  readonly maxProcesses: number;
+  readonly mlfqAccounting: 'per_slice' | 'cumulative';
+  emit(event: EmittableEvent): void;
+}
+export type SchedulerFactory = (host?: SchedulerHost) => SchedulerPolicy;
 
-// TODO(astra): WP-04 implements this policy
-function priorityAging(): never { throw new Error('not implemented: priority_aging. Policy not implemented yet; see sim spec 5.6 (WP-04).'); }
-// TODO(astra): WP-04 implements this policy
-function roundRobin(): never { throw new Error('not implemented: rr. Policy not implemented yet; see sim spec 5.7 (WP-04).'); }
-// TODO(astra): WP-04 implements this policy
-function mlfq(): never { throw new Error('not implemented: mlfq. Policy not implemented yet; see sim spec 5.8 (WP-04).'); }
+function requireHost(host: SchedulerHost | undefined): SchedulerHost {
+  if (host === undefined) throw new Error('RR and MLFQ require scheduler host settings and an event emitter');
+  return host;
+}
 
 export const SCHEDULERS: Readonly<Record<SchedulerId, SchedulerFactory>> = {
   fcfs: () => new FcfsScheduler(), sjf: () => new SjfScheduler(),
   srtf: () => new SrtfScheduler(), priority: () => new PriorityScheduler(),
-  priority_aging: priorityAging, rr: roundRobin, mlfq,
+  priority_aging: () => new PriorityAgingScheduler(),
+  rr: host => new RoundRobinScheduler(requireHost(host)),
+  mlfq: host => new MlfqScheduler(requireHost(host)),
 };
-export function createScheduler(id: SchedulerId, params: SchedulerParams): SchedulerPolicy {
-  const policy = SCHEDULERS[id](); policy.configure(params); return policy;
+export function createScheduler(id: SchedulerId, params: SchedulerParams, host?: SchedulerHost): SchedulerPolicy {
+  const policy = SCHEDULERS[id](host); policy.configure(params); return policy;
 }
 
 /** Supply raw workload bursts without adding fields to the frozen policy or PCB. */
@@ -36,19 +45,20 @@ export function configureSchedulerWorkload(policy: SchedulerPolicy, initialBurst
 }
 
 
-export function saveSchedulerEnvelope(policy: SchedulerPolicy, accounting: SchedulingAccounting, runtime: JsonValue): SubsystemEnvelope {
+export function saveSchedulerEnvelope(policy: SchedulerPolicy, accounting: SchedulingAccounting, runtime: SchedulerSnapshotState['payload']['runtime']): SchedulerSnapshotState {
   if (!(policy instanceof SchedulerBase)) throw new Error('scheduler persistence requires SchedulerBase');
-  return { owner: 'scheduler', version: 1, payload: {
+  return { owner: 'scheduler', version: 2, payload: {
     policy: policy.saveState().payload, accounting: accounting.saveState(), runtime: structuredClone(runtime),
   } };
 }
 
 /** Prepare all three pieces before the kernel changes any execution state. */
-export function prepareSchedulerRestore(envelope: SubsystemEnvelope, ctx: SchedulerContext,
+export function prepareSchedulerRestore(envelope: unknown, ctx: SchedulerContext,
   accounting: SchedulingAccounting, initialBurst: (pid: Pid) => number | undefined,
-  config?: Pick<KernelConfig, 'scheduler' | 'schedulerParams'>) {
-  if (envelope.owner !== 'scheduler' || envelope.version !== 1) throw new Error('invalid scheduler envelope owner or version');
-  const payload = snapshotObject(envelope.payload, 'subsystem payload');
+  host: SchedulerHost, config?: Pick<KernelConfig, 'scheduler' | 'schedulerParams'>) {
+  const source = snapshotObject(envelope, 'subsystem envelope');
+  if (source['owner'] !== 'scheduler' || source['version'] !== 2) throw new Error('invalid scheduler envelope owner or version');
+  const payload = snapshotObject(source['payload'], 'subsystem payload');
   const runtime = snapshotObject(payload['runtime'], 'runtime');
   const tick = snapshotInteger(runtime['tick'], 'tick');
   if (tick !== ctx.tick) throw new Error('scheduler snapshot tick mismatch');
@@ -68,11 +78,11 @@ export function prepareSchedulerRestore(envelope: SubsystemEnvelope, ctx: Schedu
   if (config !== undefined && (config.scheduler !== id || !sameParams(params, config.schedulerParams))) {
     throw new Error('scheduler contribution disagrees with kernel config');
   }
-  const policy = createScheduler(id, params);
+  const policy = createScheduler(id, params, host);
   configureSchedulerWorkload(policy, initialBurst);
   if (!(policy instanceof SchedulerBase)) throw new Error('scheduler persistence requires SchedulerBase');
   const expectedParams = policy.configuredParams;
-  policy.restoreState({ owner: 'scheduler', version: 1, payload: policyPayload }, ctx);
+  policy.restoreState({ owner: 'scheduler', version: 2, payload: policyPayload }, ctx);
   if (!sameParams(expectedParams, policy.configuredParams)) throw new Error('scheduler policy and runtime params disagree');
   const accountingPayload = payload['accounting'];
   if (accountingPayload === undefined) throw new Error('missing scheduler accounting');
@@ -95,7 +105,7 @@ export function prepareSchedulerRestore(envelope: SubsystemEnvelope, ctx: Schedu
   return { policy, params, readyQueue, running, lastCpuOwner, sliceElapsed, switchDebt, contextSwitches, commitAccounting };
 }
 
-function restoreSchedulerId(value: JsonValue | undefined): SchedulerId {
+function restoreSchedulerId(value: unknown): SchedulerId {
   switch (value) {
     case 'fcfs': case 'sjf': case 'srtf': case 'priority': case 'priority_aging': case 'rr': case 'mlfq': return value;
     default: throw new Error('invalid saved scheduler id');

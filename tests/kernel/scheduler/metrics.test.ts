@@ -464,8 +464,8 @@ describe('phase 10 metrics hook dispatch', () => {
     expect(never).not.toHaveBeenCalled();
   });
   it('retains scheduler accounting when only the memory hook is replaced', () => {
-    const kernel = createKernel(REFERENCE_CONFIG);
-    const memoryValue = kernel.snapshot().metrics.memory;
+    const kernel = createKernel(REFERENCE_CONFIG, { threadCreateTicks: 0 });
+    const memoryValue = createKernel(REFERENCE_CONFIG).snapshot().metrics.memory;
     const spy = vi.spyOn(SchedulingAccounting.prototype, 'recompute');
     try {
       kernel.installHooks({ metrics: { memory: () => memoryValue } });

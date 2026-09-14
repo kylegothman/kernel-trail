@@ -47,7 +47,7 @@ describe('eleven-phase execution', () => {
   });
   it('degree of multiprogramming admits ascending pids and excludes init', () => {
     const kernel = createKernel(REFERENCE_CONFIG, { degreeOfMultiprogramming: 1 }); const first = kernel.spawn({ ...WORK, service: 1 }); const second = kernel.spawn(WORK);
-    kernel.step(); expect(kernel.process(first)?.state).toBe('zombie'); expect(kernel.process(second)?.state).toBe('new');
+    kernel.run(kernel.tuning.threadCreateTicks + 1); expect(kernel.process(first)?.state).toBe('zombie'); expect(kernel.process(second)?.state).toBe('new');
     kernel.step(); expect(kernel.process(second)?.state).toBe('running');
   });
   it.each([0, 1, 2])('context switch cost %i produces that many idle ticks before service', cost => {
@@ -70,7 +70,7 @@ describe('eleven-phase execution', () => {
     const ignored = createKernel({ ...REFERENCE_CONFIG, deadlockStrategy: 'ignore' }); const detect = vi.fn(); ignored.installHooks({ deadlock: { maybeDetect: detect } }); ignored.run(100); expect(detect).not.toHaveBeenCalled();
   });
   it('a major page fault charges CPU but preserves PC until phase 4 makes it runnable', () => {
-    const kernel = createKernel(REFERENCE_CONFIG); const pid = kernel.spawn({ ...WORK, pages: 1 }, { program: instructionProgram([{ kind: 'access', page: asPageId(0), write: false }]) });
+    const kernel = createKernel(REFERENCE_CONFIG, { threadCreateTicks: 0 }); const pid = kernel.spawn({ ...WORK, pages: 1 }, { program: instructionProgram([{ kind: 'access', page: asPageId(0), write: false }]) });
     let loaded = false; kernel.installHooks({ memory: { access: () => ({ hit: loaded }), isSatisfied: () => loaded } });
     kernel.step(); const tid = kernel.process(pid)?.threads[0]; if (tid === undefined) throw new Error('missing thread');
     expect(kernel.process(pid)).toMatchObject({ state: 'waiting', totalCpuUsed: 1 }); expect(kernel.threads.table.get(tid)?.programCounter).toBe(0);
@@ -78,7 +78,7 @@ describe('eleven-phase execution', () => {
     loaded = true; kernel.step(); expect(kernel.threads.table.get(tid)?.programCounter).toBe(1); expect(kernel.process(pid)?.totalCpuUsed).toBe(2);
   });
   it.each(['many_to_one', 'one_to_one'] as const)('THREAD integration: %s blocks the proper scheduling entity', model => {
-    const kernel = createKernel(REFERENCE_CONFIG, { threadModel: model }); const pid = kernel.spawn({ ...WORK, burst: 100, service: 100 }, { threadCount: 4 }); kernel.step();
+    const kernel = createKernel(REFERENCE_CONFIG, { threadModel: model, threadCreateTicks: 0 }); const pid = kernel.spawn({ ...WORK, burst: 100, service: 100 }, { threadCount: 4 }); kernel.step();
     const tid = kernel.process(pid)?.threads[0]; if (tid === undefined) throw new Error('missing thread');
     kernel.blockProcess(pid, { kind: 'sleep', untilTick: asTick(10) }, tid);
     const used = kernel.process(pid)?.totalCpuUsed ?? 0;
@@ -86,7 +86,7 @@ describe('eleven-phase execution', () => {
     expect((kernel.process(pid)?.totalCpuUsed ?? 0) - used).toBe(model === 'many_to_one' ? 0 : 3);
   });
   it('exec inside instruction delivery starts replacement at PC zero', () => {
-    const kernel = createKernel(REFERENCE_CONFIG); const pid = kernel.spawn(WORK, { program: instructionProgram([{ kind: 'syscall', call: { name: 'exec', pid: asPid(99), args: ['next'] } }]) });
+    const kernel = createKernel(REFERENCE_CONFIG, { threadCreateTicks: 0 }); const pid = kernel.spawn(WORK, { program: instructionProgram([{ kind: 'syscall', call: { name: 'exec', pid: asPid(99), args: ['next'] } }]) });
     kernel.registerProgram('next', instructionProgram([{ kind: 'compute' }, { kind: 'compute' }])); kernel.step();
     const tid = kernel.process(pid)?.threads[0]; expect(kernel.threads.table.get(tid as Tid)?.programCounter).toBe(0);
     kernel.run(2); expect(kernel.process(pid)?.state).toBe('zombie');
@@ -133,12 +133,13 @@ describe('populated process replay evidence', () => {
 describe('thread progress at blocking and completion boundaries', () => {
   it('creation on the last CPU unit preserves its charged work instead of exiting', () => {
     const kernel = createKernel(REFERENCE_CONFIG); const pid = kernel.spawn({ ...WORK, service: 1, burst: 1 }, { program: instructionProgram([{ kind: 'thread_create' }]) });
-    kernel.step(); expect(kernel.process(pid)?.state).toBe('running'); expect(kernel.process(pid)?.threads).toHaveLength(2);
-    expect(kernel.table.raw.get(pid)?.rawService).toBe(2); expect(kernel.process(pid)?.serviceRemaining).toBe(1);
+    // Admission debt runs before the last useful unit executes thread_create.
+    kernel.run(kernel.tuning.threadCreateTicks + 1); expect(kernel.process(pid)?.state).toBe('running'); expect(kernel.process(pid)?.threads).toHaveLength(2);
+    expect(kernel.table.raw.get(pid)?.rawService).toBe(0); expect(kernel.process(pid)?.serviceRemaining).toBe(kernel.tuning.threadCreateTicks);
     kernel.run(4); expect(kernel.process(pid)?.state).toBe('terminated');
   });
   it('a final-unit fault completes after wake instead of holding the CPU forever', () => {
-    const kernel = createKernel(REFERENCE_CONFIG); const pid = kernel.spawn({ ...WORK, service: 1, burst: 1 }, { program: instructionProgram([{ kind: 'access', page: asPageId(0), write: false }]) });
+    const kernel = createKernel(REFERENCE_CONFIG, { threadCreateTicks: 0 }); const pid = kernel.spawn({ ...WORK, service: 1, burst: 1 }, { program: instructionProgram([{ kind: 'access', page: asPageId(0), write: false }]) });
     let resident = false; const access = vi.fn(() => ({ hit: resident }));
     kernel.installHooks({ memory: { access, isSatisfied: () => { resident = true; return true; } } });
     kernel.step(); expect(kernel.process(pid)).toMatchObject({ state: 'waiting', serviceRemaining: 1 });

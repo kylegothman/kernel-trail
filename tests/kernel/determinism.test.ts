@@ -416,9 +416,10 @@ describe('policy swap mid-run, a core player verb', () => {
     expect(drive()).toBe(drive());
   });
 
-  it('throws a useful error for a policy that is not built yet', () => {
+  it('selects the implemented MLFQ policy through the existing registry', () => {
     const k = createKernel(REFERENCE_CONFIG);
-    expect(() => k.setScheduler('mlfq')).toThrow(/not implemented yet.*sim spec 5\.8/s);
+    k.setScheduler('mlfq');
+    expect(k.saveSchedulerState().payload.policy.policy).toBe('mlfq');
   });
 });
 

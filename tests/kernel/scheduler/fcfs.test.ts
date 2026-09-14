@@ -8,8 +8,8 @@ import { SrtfScheduler, srtfCmp } from '@kernel/scheduler/srtf';
 import { priorityCmp } from '@kernel/scheduler/priority';
 import { assertTotalOrder, tieBreak } from '@kernel/scheduler/tieBreak';
 import { asPid, asTick } from '@kernel/types';
-import type { JsonValue, Pid, ProcessControlBlock, SchedulerContext, SchedulerId,
-  SchedulingDecision, SubsystemEnvelope } from '@kernel/types';
+import type { Pid, ProcessControlBlock, SchedulerContext, SchedulerId,
+  SchedulingDecision } from '@kernel/types';
 import { canonical } from '../canonical';
 import { createWorkloadKernel, IMPLEMENTED_POLICIES, runWorkload, schedulerParams,
   unitContext, unitProcesses, type WorkloadRow } from './workloadRunner';
@@ -115,9 +115,14 @@ describe('scheduler foundation', () => {
     }));
   });
 
-  it.each(['priority_aging', 'rr', 'mlfq'] as const)('%s is an explicit WP-04 stub', id => {
-    expect(() => SCHEDULERS[id]()).toThrow(`not implemented: ${id}`);
-    expect(() => createScheduler(id, schedulerParams())).toThrow(/^not implemented:/);
+  it.each(['priority_aging', 'rr', 'mlfq'] as const)('%s resolves to a working WP-04 policy', id => {
+    const events: string[] = [];
+    const host = { maxProcesses: 64, mlfqAccounting: 'per_slice' as const,
+      emit: (event: { readonly type: string }) => { events.push(event.type); } };
+    expect(SCHEDULERS[id](host).id).toBe(id);
+    const policy = createScheduler(id, schedulerParams(), host);
+    expect(policy.onTick(unitContext([])).next).toBe(null);
+    expect(events).toEqual([]);
   });
 
   it.each([
@@ -257,11 +262,11 @@ function runningFixture(id: SchedulerId): PolicyRun {
   return run;
 }
 
-function payloadObject(value: JsonValue): value is { readonly [key: string]: JsonValue } {
+function payloadObject(value: unknown): value is Readonly<Record<string, unknown>> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-function replacePayload(envelope: SubsystemEnvelope, changes: { readonly [key: string]: JsonValue }): SubsystemEnvelope {
+function replacePayload<State extends { readonly payload: unknown }>(envelope: State, changes: Readonly<Record<string, unknown>>): State {
   if (!payloadObject(envelope.payload)) throw new Error('scheduler envelope must contain an object payload');
   return { ...envelope, payload: { ...envelope.payload, ...changes } };
 }
@@ -271,7 +276,8 @@ describe('scheduler envelope persistence', () => {
     const original = runningFixture(id);
     const saved = original.policy.saveState();
     const encoded = canonical(saved);
-    expect(saved).toMatchObject({ owner: 'scheduler', version: 1 });
+    expect(saved).toMatchObject({ owner: 'scheduler', version: 2 });
+    expect(saved.payload).not.toHaveProperty('metrics');
     const restored = persistentPolicy(id);
     restored.configure(schedulerParams({ quantum: 19, preemptive: false }));
     const resumed: PolicyRun = { ...original, policy: restored, processes: structuredClone(original.processes) };
@@ -283,7 +289,7 @@ describe('scheduler envelope persistence', () => {
     expect(restored.snapshot().queues).toBe(queues);
     expect(restored.snapshot().queues[0]).toBe(queue);
     expect(restored.configuredParams).toEqual(original.policy.configuredParams);
-    expect(restored.snapshot().metrics).toEqual(original.policy.snapshot().metrics);
+    expect(restored.snapshot().metrics).toEqual(EMPTY_METRICS);
     expect(canonical(restored.saveState())).toBe(encoded);
     const originalDecisions: SchedulingDecision[] = [];
     const restoredDecisions: SchedulingDecision[] = [];
@@ -364,15 +370,16 @@ describe('scheduler envelope persistence', () => {
     const live = run.policy.snapshot();
     const ready = runContext(run).readyQueue[0];
     if (ready === undefined) throw new Error('malformed envelope fixture requires a ready process');
-    const malformed: readonly SubsystemEnvelope[] = [
+    const malformed: readonly unknown[] = [
       { ...saved, owner: 'memory' },
-      { ...saved, version: 2 },
+      { ...saved, version: 1 },
       replacePayload(saved, { policy: id === 'fcfs' ? 'sjf' : 'fcfs' }),
       replacePayload(saved, { queues: [[asPid(999_999)]] }),
       replacePayload(saved, { queues: [[ready, ready]] }),
       replacePayload(saved, { queues: [[]] }),
       replacePayload(saved, { running: ready }),
       replacePayload(saved, { quantumRemaining: -1 }),
+      replacePayload(saved, { quantumRemaining: 1 }),
       { ...saved, payload: null },
     ];
     for (const envelope of malformed) {
@@ -457,7 +464,7 @@ describe('kernel scheduler contribution', () => {
   it('fills KernelSnapshot.subsystems.scheduler and preserves legacy init-only loads', () => {
     const a = createKernel(REFERENCE_CONFIG); a.run(20);
     const saved = a.snapshot();
-    expect(saved.subsystems?.scheduler).toMatchObject({ owner: 'scheduler', version: 1 });
+    expect(saved.subsystems?.scheduler).toMatchObject({ owner: 'scheduler', version: 2 });
     const b = createKernel(REFERENCE_CONFIG); b.restore(structuredClone(saved));
     expect(canonical(b.snapshot())).toBe(canonical(saved));
     const legacy = { ...saved }; delete legacy.subsystems;
@@ -499,15 +506,20 @@ describe('kernel scheduler contribution', () => {
     expect(canonical(empty.snapshot())).toBe(untouched);
   });
 
-  it('preserves a custom metrics view independently of execution counters', () => {
+  it('recomputes a custom metrics view through its hook from restored execution counters', () => {
     const a = createWorkloadKernel('fcfs', {}, LONG_FIRST).kernel;
     const b = createWorkloadKernel('fcfs', {}, LONG_FIRST).kernel;
+    const calls: number[] = [];
     for (const kernel of [a, b]) {
-      kernel.installHooks({ metrics: { scheduler: () => ({ ...EMPTY_METRICS, contextSwitches: 99 }) } });
+      kernel.installHooks({ metrics: { scheduler: () => { calls.push(kernel.tick); return { ...EMPTY_METRICS, contextSwitches: 99 }; } } });
       kernel.run(2);
     }
     const saved = a.saveSchedulerState();
+    const beforeRestoreCalls = calls.length;
     b.setScheduler('sjf'); b.restoreSchedulerState(saved);
+    expect(saved.payload.policy).not.toHaveProperty('metrics');
+    expect(calls).toHaveLength(beforeRestoreCalls + 1);
+    expect(calls.at(-1)).toBe(b.tick);
     expect(canonical(b.saveSchedulerState())).toBe(canonical(saved));
     expect(canonical(b.run(40))).toBe(canonical(a.run(40)));
     expect(canonical(b.saveSchedulerState())).toBe(canonical(a.saveSchedulerState()));
