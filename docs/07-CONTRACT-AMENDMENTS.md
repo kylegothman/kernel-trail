@@ -475,3 +475,19 @@ specifications and against the current `Kernel.ts`, `config.ts` and the syscall
 dispatch, so the sixth and seventh escalations do not happen. `config.ts` is a
 fourth shared file, alongside `Kernel.ts`, `index.ts` and the snapshot sites, and
 every subsystem will add tuning knobs to it.
+
+## 2026-09-14: WP-07 pre-flight grants and semantics
+
+Not a contract change. The WP-07 pre-flight requested five source grants (a
+sync `Instruction` variant and its `execute` dispatch, an optional `tid` on
+`SyncHooks.isSatisfied`, wrapping the scheduler hook for priority inheritance,
+an explicit `SyncPrimitive` projection in `snapshot()`, and exec cleanup through
+the `detachIpc` callback) and eleven groups of spec decisions. All were
+approved and recorded in the package under "Pre-flight decisions 2026-09-14".
+Spec corrections applied in the same commit: the store-buffer drain model
+(8.2), semaphore capacity versus initial value (8.4 table), bounded-buffer
+conservation and I-22, I-23 scoped to exclusive primitives and internal actors,
+the readers-writers workload and throughput wording, the room solution's
+Coffman condition, and three scenario rows added to 16.7. Amendment 7 is
+reserved for the typed `SyncSnapshotState`, pending its own exact-patch review.
+

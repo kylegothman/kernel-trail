@@ -37,7 +37,7 @@ Files that must already exist:
   sync resource ids and the wait-for graph must see them
 - `02-KERNEL-SIM-SPEC.md` section 16.7 (the synchronisation fixture table)
 - `02-KERNEL-SIM-SPEC.md` section 15, the "Synchronisation and deadlock"
-  invariant group, so I-20 and I-21 hold by construction
+  invariant group, so I-21 and I-23 hold by construction
 
 ## Files you will create
 
@@ -153,10 +153,10 @@ defaults, and validate each with the pattern the existing knobs use:
 | `priorityInheritance` | false | sim spec 8.5 |
 | `rwlockPolicy` | `'writer_pref'` | sim spec 8.4 and 8.8 |
 
-The three integer knobs use the existing integer check. `priorityInheritance` is
-a boolean and `rwlockPolicy` is a literal union, so validate them the way
-`threadModel` and `checkInvariants` are validated rather than inventing a new
-helper. `boundedWaitLimit` at 0 means the Ch. 6.2 bound rather than a limit of
+The four integer knobs use the existing integer check. `priorityInheritance` is
+a boolean and `rwlockPolicy` is a literal union, so validate them with a plain
+boolean check and the existing literal-union pattern respectively, rather than
+inventing a new helper. `boundedWaitLimit` at 0 means the Ch. 6.2 bound rather than a limit of
 zero, so comment it. Do not reformat anything, and do not touch a key you did not
 add: this file is shared with WP-09, which is adding its own keys at the same
 time.
@@ -363,7 +363,7 @@ The three critical-section requirements from sim spec 8.1. The simulator checks
 all three and reports which one a scenario violates.
 
 1. **Mutual exclusion.** A per-primitive counter `inCriticalSection` that must
-   never exceed the primitive's capacity. This is invariant I-20.
+   never exceed the primitive's capacity. This is invariant I-21.
 2. **Progress.** If the primitive is free and its `waitQueue` is non-empty for
    `progressStallLimit` consecutive ticks (default 4), emit `kernel.panic` with
    the message `` `progress violated on ${resource}` ``. A correct implementation
@@ -640,8 +640,9 @@ must not be invented.
 Satisfies `SyncHooks` from WP-02. Owns the primitive table
 (`Map<ResourceId, SyncPrimitive>` plus a sorted key array for iteration), the
 shared cell table, the store buffers, and the requirement checkers. Implements
-`isSatisfied(pcb)` for the `semaphore`, `mutex` and `condition` block reasons,
-which phase 4 already delegates to it.
+`isSatisfied(pid, reason, tid?)` for the `semaphore`, `mutex` and `condition`
+block reasons, which phase 4 already delegates to it (the optional `tid` is
+granted in the 2026-09-14 pre-flight decisions below).
 
 Wakes from a primitive with `ordered: true` are taken from the **head** of
 `waitQueue` only, so bounded waiting is preserved.
@@ -667,8 +668,9 @@ and the primitive table has to be flattened to a sorted array of pairs on the wa
 out. Validate the payload on restore and throw on a `version` this package does
 not understand, because a silently misread save is worse than a refused one.
 
-**Promote the envelope to a typed interface in the same commit that implements
-the subsystem**, additively, the way amendment 1 was made, and record the
+**Promote the envelope to a typed interface in its own contract commit, after
+written approval of the exact patch and before the implementation commit that
+uses it**, additively, the way amendments 4 to 6 were made, and record the
 promotion in `docs/07-CONTRACT-AMENDMENTS.md`. The envelope is a transition
 mechanism. Shipping with an opaque envelope means this package is not finished.
 
@@ -716,11 +718,15 @@ out.
     philosopher crossing `starvationThreshold`.
 16. `SYNC-PHIL-TABLE` values are recorded and pinned. The values appear in your
     report.
-17. Invariant I-20 holds at every tick of every scenario: `inCriticalSection`
-    never exceeds `capacity`.
+17. Invariant I-21 holds at every tick of every correct-primitive scenario:
+    `inCriticalSection` never exceeds `capacity`. The deliberately broken
+    Peterson and monitor fixtures record their expected violation and are
+    excluded from this item; no unrelated invariant is disabled anywhere.
 18. Mutex hand-off is genuine: a barging third process can never acquire between
     the unlock and the waiter's dispatch. Asserted directly.
-19. `git diff --exit-code src/kernel/types.ts src/game/types.ts` exits 0.
+19. `git diff --exit-code src/kernel/types.ts src/game/types.ts` exits 0
+    against the approved amendment commit: the implementation commit changes no
+    frozen file, and `src/game/types.ts` does not change at all.
 20. The forbidden-identifier scan still returns zero matches, and `DET-D1`,
     `DET-D3` and `DET-D4` still pass.
 21. Sync state survives a snapshot and restore round trip. Run the bounded buffer
@@ -803,7 +809,7 @@ out.
 | Fixture | Assertion |
 |---|---|
 | `SYNC-BB-1` | per acceptance criterion 10 |
-| `occupancy invariant` | `empty.value + full.value + inCriticalSection === 4` asserted on every one of 10,000 ticks |
+| `occupancy invariant` | `max(empty.value, 0) + max(full.value, 0) + inFlight === 4` asserted on every one of 10,000 ticks |
 | `SYNC-BB-DEADLOCK` | per acceptance criterion 11 |
 | `ordering remedy` | restoring the correct order (`empty` before `mutex`) makes the same workload complete with zero blocked-holder states |
 | `SYNC-BB-UNBALANCED` | producers at service 1 against consumers at service 5 saturate the buffer, and `cpuUtilisation` is recorded and pinned |
@@ -814,8 +820,8 @@ out.
 |---|---|
 | `SYNC-RW-STARVE` | per acceptance criterion 12 |
 | `SYNC-RW-WRITERPREF` | per acceptance criterion 13, and the longest-waiting process is a reader |
-| `both starve somebody` | the two runs together produce exactly one fatal starvation each, with different pids, which is Ch. 7.1.2's point |
-| `fair starves nobody` | under `'fair'`, zero fatal starvations, and total throughput is strictly lower than under either preference |
+| `both starve somebody` | the reader-preferring run produces exactly one fatal starvation naming the writer; the writer-preferring run completes the writer and its longest waiter is a reader, which is Ch. 7.1.2's point |
+| `fair starves nobody` | under `'fair'`, zero fatal starvations, every ticket is served within a bounded number of others' entries, and throughput under all three policies is measured and pinned |
 | `read_count protocol` | in the reader-preferring semaphore scenario, `rw_mutex` is taken by the first reader and released by the last |
 
 ### `tests/kernel/sync/philosophers.test.ts`
@@ -825,7 +831,7 @@ out.
 | `SYNC-PHIL-NAIVE` | a five-way circular wait exists by tick 200, with each philosopher holding exactly one chopstick and waiting on one held by a neighbour |
 | `deterministic deadlock` | 20 consecutive runs at the reference seed all reach it, at the same tick |
 | `SYNC-PHIL-ASYM` | zero circular waits over 20,000 ticks; meals completed recorded and pinned |
-| `SYNC-PHIL-ROOM` | zero circular waits over 20,000 ticks with `room` capacity 4; at least one philosopher always holds both chopsticks |
+| `SYNC-PHIL-ROOM` | zero circular waits over 20,000 ticks with `room` capacity 4; the room never seats more than four, and no complete five-way circular wait ever forms |
 | `SYNC-PHIL-MONITOR` | zero circular waits; at least one philosopher crosses `starvationThreshold`; the three monitor procedures behave as written |
 | `SYNC-PHIL-TABLE` | the four-row table's recorded values are pinned: meals completed and worst individual wait for each of the four solutions at the reference seed over 20,000 ticks |
 | `rng stream` | all think and eat durations draw from `root/sync` and from no other stream |
@@ -839,16 +845,17 @@ out.
 - `src/kernel/scheduler/**`, `memory/**`, `storage/**`, `io/**`, `fs/**`,
   `security/**`, `syscall/**`, `invariants.ts`.
 - Game-layer afflictions and Program names. Expose `inversions()` and stop.
-- Any change to `Kernel.ts` beyond wiring `SyncHooks`.
-- Anything outside `src/kernel/sync/`, `tests/kernel/sync/` and the one permitted
-  edit.
+- Any change to `Kernel.ts` beyond the regions granted by the scope correction
+  and the 2026-09-14 pre-flight decisions below.
+- Anything outside `src/kernel/sync/`, `tests/kernel/sync/` and the granted
+  shared-file regions.
 
 ## Report back
 
 State:
 
 1. Pass or fail for each of the twenty-one acceptance criteria, by number.
-2. The three verification command outcomes.
+2. The four verification command outcomes, including the contract guard.
 3. The recorded `SYNC-PHIL-TABLE` values: meals completed and worst individual
    wait for naive, asymmetric, arbitrator and monitor, stated as now frozen.
 4. The recorded `SYNC-BB-UNBALANCED` `cpuUtilisation` figure and the two
@@ -896,3 +903,143 @@ the WP-06 ranges above that lie beyond 445 have moved by a few lines; treat the
 WP-06 table as the pre-WP-04 numbering and use `git blame` at f6307e8 if you
 need the current position. Your worktree is already at f6307e8. Keep your own
 additions to distinct config keys and to your named regions.
+
+## Pre-flight decisions 2026-09-14
+
+The WP-07 agent's consolidated pre-flight (report `wp07-preflight.md`) mapped
+all twenty-one acceptance criteria, requested five source grants and proposed
+eleven groups of specification decisions. Every one was checked against the
+code at feaa043 and the spec before this section was written. All are approved
+as below, with the qualifications noted. The spec and package text changes
+that these decisions imply were applied in the same commit as this section.
+
+### Grants G1 to G5, approved
+
+- **G1, sync instructions.** Add one serializable variant to the `Instruction`
+  union in `src/kernel/process/Program.ts` (currently lines 5-13), with its
+  operand types defined in the sync files and copied or frozen at the existing
+  copy site. Add its dispatch in `Kernel.execute` (currently 789-827) as one
+  `case` that calls into the sync subsystem. A failed spin or retry attempt
+  calls the existing `threads.deferServiceCharge()` and returns false, exactly
+  as a TLB miss does: the tick is charged, useful service and PC are not. The
+  existing `acquire` and `release` instruction kinds keep their current
+  meaning. `Program.at` stays a pure lookup. No `threads.ts`, scheduler
+  metrics, or phase-body edit. Document the variant's exact shape in the WP-11
+  handoff, since WP-11 restores program decoders.
+- **G2, thread-specific readiness.** Add an optional third `tid` argument to
+  `SyncHooks.isSatisfied` (Kernel.ts:120). In `blockProcess` give the selected
+  TCB a fresh clone of the reason so each waiting TCB holds a distinct object;
+  phase 4 already passes `thread.blockedOn`, so the private `isSatisfied`
+  helper (currently 719-728) can find the unique waiting TCB whose `blockedOn`
+  is that object and forward its tid. Zero or multiple matches fail closed.
+  Persist tid plus wait generation, never object identity. Phase 4 and the
+  frozen TCB shape do not change.
+- **G3, inheritance across aging and dispatch.** Wrap the existing scheduler
+  hook at its construction site (Kernel.ts:228-234) with sync-owned
+  before-aging and after-aging projections; keep ordinary priority and
+  donations in sync side tables and publish their minimum; reapply after the
+  dispatch reset through the existing synchronous event observer; re-check
+  ownership after the wrapped hook, which can terminate processes. Final
+  unlock resets ordinary priority to base and reapplies remaining donations.
+  Donation applies only to primitives with a known exclusive owner (mutex,
+  monitor lock, rwlock writer), never to a counting-semaphore permit holder.
+  No transition, scheduler-source or phase-6 edit.
+- **G4, safe primitive projection.** Replace only the `syncPrimitives` spread
+  in `snapshot()` (Kernel.ts:604) with explicit copies of the eight frozen
+  `SyncPrimitive` fields. Monitor extras live in the typed sync contribution.
+  Keep the live array binding and the generic contribution dispatcher.
+- **G5, exec cleanup.** Extend only the constructor `detachIpc` callback
+  (Kernel.ts:313). On exec: flush the issuer's pending stores while bindings
+  still exist; release every exclusively owned lock with the normal hand-off,
+  as exit does; remove counting-permit attribution without posting (the S2
+  rule); cancel local execution and actor state for the TCBs about to be
+  replaced. Exec of a waiting process is already refused with EBUSY, so there
+  is no wait to cancel. No lifecycle-file edit and no new syscall branch.
+
+### Semantics S1 to S11, approved
+
+- **S1.** Spins are CPU-busy attempts with deferred useful service, per the
+  `spin counts as busy` test; the sentence at "consumes service" above meant
+  CPU time, not useful service. One `sync.busy_wait` per completed spin
+  iteration with cumulative `spunTicks`. Creation-debt ticks keep their
+  existing bypass. Bounded-buffer service times are useful item work inside
+  the produce or consume step; the synchronisation instructions have their own
+  costs.
+- **S2.** Counting semaphores have a maximum `capacity` and a separate initial
+  value (`empty` n/n, `full` n/0). Over-post is EINVAL before any mutation.
+  Outstanding permits are a ledger: unavailable initial permits are anonymous
+  debits; a post retires the caller's own debit when it has one, otherwise the
+  oldest; `max(value, 0) + outstandingDebits === capacity` always. `holders` is
+  the pid projection of attributed permits and may repeat a pid. Exit, exec and
+  join remove attribution without posting. Permit provenance is not exclusive
+  ownership. Mutexes keep exact ownership and EPERM; a same-actor recursive
+  lock returns EDEADLK with no queue mutation. The spec table row was
+  corrected to match.
+- **S3.** Conservation is `max(empty.value, 0) + max(full.value, 0) + inFlight
+  === n`, with `inFlight` defined in I-22; persist it. SYNC-BB-UNBALANCED
+  measures and pins utilisation and asserts producer blocking and the item
+  rate; the universal utilisation-collapse claim was removed from the spec.
+- **S4.** The store-buffer model is the attempt-counted drain now written into
+  spec 8.2, including the release and atomic ordering rules. The reference
+  seed and 10,000-tick window for SYNC-PETERSON-2 stay fixed; if the approved
+  model does not produce the violation at that seed, report it. No seed search.
+- **S5.** Keep overlap provenance until the episode closes; the printed 41-44
+  trace is a direct detector-format fixture and the scheduled 100-increment
+  workload reports its real ticks with the same load/load/store/store pattern
+  and exact formatting; ring stays 32 plus bounded witness records, and the
+  ring test is amended to say so. Persist `serialValue`. Lost-update
+  confirmation applies to explicit RMW increments. Atomic operations with an
+  empty lockset are not unprotected accesses. Actors are (pid, tid);
+  suppression is per actor; frozen event participants stay sorted unique pids.
+- **S6.** Reservations established by release, signal or arrival; `isSatisfied`
+  reads them without consuming or waking; ordered resources grant the head
+  only. Mesa, Hoare, broadcast, rwlock admission and barrier generations as
+  described. Cleanup cancels the dying process's own waits first, then hands
+  off owned locks; `removeWaiter` is idempotent; unknown resources are ignored.
+  I-23 compares internal actors for exclusive primitives, and the spec text
+  for I-23 was corrected to say so.
+- **S7.** Sync-owned starvation bookkeeping for blocked sync waits, using the
+  scheduler's `starvationThreshold` and `starvationFatalThreshold` and the same
+  SABLE multiplier, through the granted timer and construction hooks. Fatal
+  means the event followed by termination through a host callback wired the
+  same way the scheduler hook's `terminate` is (Kernel.ts:230-233). Before
+  relying on it, confirm that `lifecycle.exit` of a waiting process runs
+  `releaseAll` and `removeWaiter`; if it does not, report rather than patch
+  lifecycle. Persist the clocks and deduplication state.
+- **S8.** Readers repeat their 10-tick reads with no remainder; same workload
+  for all three policies. Acceptance 12 and 13 stand as written; the stronger
+  "exactly one fatal each" and the strict throughput inequality were replaced
+  in the test table and the spec.
+- **S9.** Explicit, documented, pinned contention schedules for pathology
+  witnesses, separate from the reference-seed comparison runs. Unordered
+  selection follows `root/sync` unchanged; if the witness does not occur in
+  its fixed window, report the fixture gap. Interleaving scenarios use a local
+  RR q=1 configuration, the inversion witness uses preemptive priority;
+  REFERENCE_CONFIG is untouched and each new fixture pins its own config.
+- **S10.** One initial rendezvous after all five philosophers complete their
+  first think draw, for the naive fixture and all four comparison variants;
+  later draws unchanged. The room solution breaks circular wait, not
+  hold-and-wait; the monitor solution, which takes both chopsticks or neither,
+  breaks hold-and-wait. Both the prose and the Coffman table were corrected.
+- **S11.** Every listed documentation correction was applied: I-21 numbering,
+  the scoped acceptance 17, the four integer knobs, the `isSatisfied`
+  signature, the amendment procedure in acceptance 19 and the snapshot section,
+  the four-gate report, the WP-08 qualification on SYNC-BB-DEADLOCK, and the
+  three missing 16.7 rows. `Kernel.checkInvariants` does not yet inspect
+  `syncPrimitives`; the global I-21 to I-23 harness is WP-11's.
+
+### Not granted
+
+- No new production module or test file beyond the package's lists.
+- No edit to `threads.ts`, `transitions.ts`, `lifecycle.ts`, any scheduler
+  source, `metrics.ts`, or any phase body.
+- No `SyncMetrics` or metrics hook registration.
+- No change to `REFERENCE_CONFIG` or any protected assertion without the
+  quote-and-wait procedure.
+
+### Amendment 7
+
+Provisional number 7, against WP-09's merge order. The exact `SyncSnapshotState`
+patch is a separate written approval; nothing in this section approves a hash
+regeneration.
+

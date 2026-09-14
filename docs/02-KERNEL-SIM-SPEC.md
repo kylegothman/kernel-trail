@@ -2588,11 +2588,32 @@ interface MemoryOrderModel {
 ```
 
 Under `reordering: true`, a store instruction is placed into a per-process store
-buffer instead of being applied. The buffer drains one entry per tick, in FIFO
-order, **except** that the sim drains it in an order chosen by
-`rng.shuffle` on the `root/sync` stream when `storeBufferDepth > 1`, which models
-a processor free to commit independent stores in any order. A `mfence`
-instruction drains the buffer completely before proceeding.
+buffer instead of being applied. `storeBufferDepth` (D) is both the buffer's
+capacity and its drain period, counted in that process's instruction execution
+attempts (compute and spin attempts included). After every Dth attempt the
+buffer commits at most one store. The eligible candidates are the oldest pending
+store at each distinct address, so same-address order is preserved; at D = 1
+this is plain FIFO with no RNG draws, and at D > 1 the eligible heads are
+shuffled once on the `root/sync` stream and the first is committed, consuming
+exactly max(k - 1, 0) draws for k candidates. An attempt against a full buffer
+retries: it burns the tick, defers useful service, and still advances the drain
+clock, so a full buffer always makes progress. A load returns the process's own
+newest pending store to that address if one exists, otherwise committed memory.
+A `mfence` instruction flushes the process's buffer completely, in issue order,
+before retiring, and performs no additional ordinary drain that attempt. Exit and
+exec flush pending stores before their bindings are removed.
+
+Synchronisation operations order stores explicitly: a release, post, monitor
+exit or hand-off, rwlock unlock or barrier arrival commits the issuer's pending
+stores before publishing availability, ownership or arrival, and an acquire
+observes those committed writes. `test_and_set` and `compare_and_swap` are
+sequentially consistent single-tick operations that flush the issuer's pending
+stores before their atomic access. Without this rule a payload store could stay
+pending past an unlock and the next owner would read stale data. This is a
+teaching model of an issuer's execution, not a claim about hardware timing, and
+it replaces an earlier sentence that promised a fixed maximum store age in
+instructions, which the one-store-per-tick drain could never demonstrate.
+(Corrected 2026-09-14 in the WP-07 pre-flight.)
 
 Running `SYNC-PETERSON-2` (the same scenario with `reordering: true`) produces a
 mutual exclusion violation within 10,000 ticks for the reference seed, emits
@@ -2659,7 +2680,7 @@ All five kinds share `SyncPrimitive` from `types.ts`. Semantics per kind:
 | Kind | `value` means | `capacity` | `holders` | Wake policy |
 |---|---|---|---|---|
 | `mutex` | 1 free, 0 held | 1 | 0 or 1 pids | head of `waitQueue` |
-| `semaphore` | current count | initial count | pids that decremented and have not posted | head, or `rng.pick` when `ordered: false` |
+| `semaphore` | current count | maximum count (initial value is set separately, so a `full` semaphore starts at 0 with capacity n) | outstanding permits, attributed to the pid that took each one; a post retires the caller's own permit when it has one, otherwise the oldest unattributed one | head, or `rng.pick` when `ordered: false` |
 | `monitor` | 1 free, 0 held (the monitor lock) | 1 | 0 or 1 | head; condition queues are separate |
 | `rwlock` | reader count, or -1 when a writer holds it | max readers | all current readers, or the single writer | writer-preferring, see below |
 | `barrier` | processes arrived | party size | all arrived | all released at once when `value === capacity` |
@@ -2968,7 +2989,9 @@ consumer 2 ticks. Assertions after 10,000 ticks:
 
 - items produced === items consumed === 60
 - buffer occupancy is always in `[0, 4]` (invariant I-22)
-- `empty.value + full.value + (processes inside the critical section) === 4`
+- `max(empty.value, 0) + max(full.value, 0) + inFlight === 4`, where `inFlight`
+  counts slot or item reservations taken by a successful counting wait and not
+  yet returned by the complementary post (see I-22)
 - zero `sync.race_detected` events
 
 **Scenario `SYNC-BB-DEADLOCK`.** Swap producer lines 1 and 2, so the producer
@@ -2980,11 +3003,13 @@ player must derive is the ordering rule: **acquire the counting semaphore before
 the mutex, always.**
 
 **Scenario `SYNC-BB-UNBALANCED`.** Producers faster than consumers (service 1
-versus 5). The buffer saturates, producers spend most of their time blocked on
-`empty`, and `SchedulingMetrics.cpuUtilisation` collapses even though nothing is
-wrong. The lesson is that a bounded buffer is a rate limiter, and the fix is more
-consumers or a larger `n`, not a scheduler change. The game offers the scheduler
-change as a tempting wrong answer.
+versus 5). The buffer saturates and producers spend most of their time blocked
+on `empty` even though nothing is wrong. Throughput is consumer-bound; CPU
+utilisation is measured and pinned at implementation rather than assumed to
+collapse, since a runnable slow consumer keeps the CPU busy. The lesson is that
+a bounded buffer is a rate limiter, and the fix is more consumers or a larger
+`n`, not a scheduler change. The game offers the scheduler change as a tempting
+wrong answer.
 
 ### 8.8 Readers-writers (Ch. 7.1.2)
 
@@ -3007,8 +3032,9 @@ Writer:                          Reader:
                                  9. sem_post(mutex)
 ```
 
-**Scenario `SYNC-RW-STARVE`.** Six readers arriving every 3 ticks with 10-tick
-reads, one writer arriving at tick 5. `read_count` never reaches 0, so the writer
+**Scenario `SYNC-RW-STARVE`.** Six readers arriving every 3 ticks, each
+repeating 10-tick reads back to back with no remainder section, one writer
+arriving at tick 5. `read_count` never reaches 0, so the writer
 blocks on `rw_mutex` for the whole run and eventually crosses
 `starvationFatalThreshold`. Assertion: exactly one
 `process.starving { fatal: true }` event, naming the writer.
@@ -3022,8 +3048,10 @@ different names.
 
 **Third option, fair.** A ticket lock: readers and writers take a monotonically
 increasing ticket and are served in ticket order, with consecutive readers
-batched. Available as `rwlockPolicy: 'fair'`. Nobody starves, and throughput
-falls, which is the honest trade.
+batched. Available as `rwlockPolicy: 'fair'`. Nobody starves, every ticket is
+served within a bounded number of others' entries, and throughput is measured
+and pinned against the two preferring policies rather than asserted to be lower
+on every workload.
 
 ### 8.9 Dining philosophers (Ch. 7.1.3)
 
@@ -3077,9 +3105,11 @@ philosopher(i):
   8. sem_post(room)
 ```
 
-With at most four philosophers holding chopsticks and five chopsticks available,
-at least one philosopher always has both. This breaks hold-and-wait at the
-population level. Scenario `SYNC-PHIL-ROOM`.
+With at most four philosophers seated and five chopsticks available, a complete
+circular wait can never form: the missing fifth participant leaves one chopstick
+pair through which an acquisition can always progress. Individual philosophers
+still hold one chopstick while waiting for another, so this breaks circular wait
+at the population level, not hold-and-wait. Scenario `SYNC-PHIL-ROOM`.
 
 **Solution 3, the monitor (Ch. 7.1.3's own).** A monitor with a state array and
 one condition variable per philosopher:
@@ -3118,8 +3148,8 @@ reference seed with each solution:
 |---|---|---|---|---|
 | naive | 1 (fatal) | recorded at implementation | n/a | none |
 | asymmetric | 0 | recorded | recorded | circular wait |
-| arbitrator (room = 4) | 0 | recorded | recorded | hold and wait |
-| monitor | 0 | recorded | recorded | circular wait |
+| arbitrator (room = 4) | 0 | recorded | recorded | circular wait |
+| monitor | 0 | recorded | recorded | hold and wait (both chopsticks or neither) |
 
 "Recorded at implementation" means the first correct implementation run
 establishes the numbers and they are frozen as fixture `SYNC-PHIL-TABLE`. They
@@ -5415,10 +5445,18 @@ switch (s.kind) {
 
 **I-22. Bounded buffer occupancy.** In any scenario declaring a bounded buffer,
 `0 <= occupancy <= capacity` and
-`emptySemaphore.value + fullSemaphore.value + inFlight === capacity`.
+`max(emptySemaphore.value, 0) + max(fullSemaphore.value, 0) + inFlight === capacity`,
+where `inFlight` counts reservations granted by a counting wait and not yet
+returned by the complementary post. Negative values are waiter counts, not
+slots, so they are clamped out of the sum.
 
-**I-23. No holder is in its own wait queue.** For every `SyncPrimitive`,
-`holders` and `waitQueue` are disjoint.
+**I-23. No holder is in its own wait queue.** For every exclusive
+`SyncPrimitive` (mutex, monitor lock, rwlock writer), the internal owning actor
+(pid, tid) is not a waiter on the same primitive. Counting semaphores and
+barriers are exempt: a process may hold one permit while waiting for another,
+and an arrived barrier participant is not an owner. `holders` and `waitQueue`
+are pid projections and may legitimately share a pid when two threads of one
+process take different roles.
 
 **I-24. Under `deadlockStrategy: 'prevent'`, the wait-for graph is acyclic.**
 
@@ -5669,7 +5707,10 @@ stack-algorithm property.
 | `SYNC-RACE-2` | same, wrapped in a mutex | zero `sync.race_detected`; final value exactly 200 |
 | `SYNC-TAS-1` | test-and-set spinlock, 4 contenders | mutual exclusion holds; at least one `process.starving { fatal: false }` from the bounded-waiting check; `sync.busy_wait` total exceeds 0 |
 | `SYNC-BB-1` | bounded buffer n=4, 3 producers × 20, 2 consumers × 30 | produced === consumed === 60; occupancy always in [0,4]; zero races |
-| `SYNC-BB-DEADLOCK` | producer takes mutex before empty | `deadlock.detected` with a cycle of exactly 2 pids |
+| `SYNC-BB-DEADLOCK` | producer takes mutex before empty | `deadlock.detected` with a cycle of exactly 2 pids. Requires WP-08 for the event; under WP-07 alone this scenario asserts the blocked-holder state (a producer holding `mutex` while blocked on `empty`, consumers blocked on `mutex`) and nothing more |
+| `SYNC-BB-UNBALANCED` | producers service 1, consumers service 5, n=4 | buffer saturates; producers' blocked time on `empty` dominates; utilisation measured and pinned |
+| `SYNC-MONITOR-BROKEN` | Mesa monitor with `if` instead of `while` | the predicate is violated at least once; the `while` version never violates it |
+| `SYNC-CAS-BOUNDED` | `waiting[]` hand-off with n contenders | mutual exclusion holds and no waiter observes more than n - 1 entries |
 | `SYNC-RW-STARVE` | reader-preferring, 6 readers, 1 writer | exactly one `process.starving { fatal: true }`, naming the writer |
 | `SYNC-RW-WRITERPREF` | writer-preferring, same workload | the writer completes; a reader is the longest waiter |
 | `SYNC-PHIL-NAIVE` | 5 philosophers, left-then-right, q=1 | `deadlock.detected` by tick 200 with a cycle of exactly 5 pids; `conditions` contains all four Coffman values. Requires WP-08: only the deadlock subsystem emits that event, so under WP-07 alone this scenario asserts the circular wait and nothing more |
