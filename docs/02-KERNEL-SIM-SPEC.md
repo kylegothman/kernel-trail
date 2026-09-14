@@ -3776,8 +3776,10 @@ At the defaults, with a 4096-byte transfer:
 | seek, 50 cylinders | 2.5 ms |
 | seek, 199 cylinders | 8.46 ms |
 
-Total service for a 4 KB read at a seek distance of 50: `2.5 + 4.1667 + 0.0410 =
-6.7077 ms`. Test fixture `DISK-COST-1`.
+Total service for a 4 KB read at a seek distance of 50 is the unrounded sum
+`2.5 + 4.16667 + 0.04096 = 6.7076 ms` (the rounded components above sum to
+6.7077, which is a display artifact; assert 6.7076 to four decimals). Test
+fixture `DISK-COST-1`.
 
 **Conversion to ticks.**
 
@@ -3788,7 +3790,7 @@ function ticksFor(serviceMs: number): number {
 }
 ```
 
-The 6.7077 ms request above costs `round(13.4154) = 13` ticks. A zero-distance
+The 6.7076 ms request above costs `round(13.4153) = 13` ticks. A zero-distance
 request costs `round((0.5 + 4.1667 + 0.0410) / 0.5) = round(9.4154) = 9` ticks.
 **The floor is 9 ticks even with no seek at all**, because rotation dominates,
 which is the number that makes the player care about the scheduling policy only
@@ -3892,12 +3894,18 @@ Path: `53 -> 65 -> 67 -> 98 -> 122 -> 124 -> 183 -> 199 -> 0 -> 14 -> 37`
 
 **With `direction = 'down'`:** total 386 cylinders. Test fixture `DISK-CSCAN-2`.
 
-C-SCAN moves more than SCAN on this queue and gives a **more uniform waiting
-time**: under SCAN, a request just behind the head waits for a full round trip
-while one just ahead is served immediately, and under C-SCAN every request waits
-at most one sweep. The metric the sim reports for this is the standard deviation
-of `servedAtTick - queuedAtTick` across the queue, printed on the Leg 9 debrief
-next to total head movement so the trade is one table.
+C-SCAN moves more than SCAN on this queue. The textbook's case for it is
+uniformity under a steady arrival stream: under SCAN a request just behind the
+head waits for a full round trip while one just ahead is served immediately,
+and under C-SCAN every request waits at most one sweep. On this eight-request
+batch, where everything is queued at tick 0, that advantage does not appear:
+the measured standard deviation of `servedAtTick - queuedAtTick` is higher
+under C-SCAN than under SCAN in both directions. The sim reports the measured
+figure, `waitUniformity()` over completed requests (zero with fewer than two
+samples), printed on the Leg 9 debrief next to total head movement so the
+trade is one table, and the debrief text says which claim holds for which
+workload. (Corrected 2026-09-14: the earlier text asserted C-SCAN wins on this
+batch, which the arithmetic does not support.)
 
 #### LOOK (Ch. 11.2.4)
 
@@ -4200,8 +4208,8 @@ the interrupt queue grows. This is livelock, and it is the pathology the
 | 4 | `pending` reaches `maxPending` on any line | `kernel.panic` with `"interrupt storm on <device>"` |
 
 **The player's remedies**, in the order the game expects them to be discovered:
-switch the device from `interrupt` to `dma` (one completion instead of one per
-word), reduce the request rate by lowering the degree of multiprogramming, or
+switch the device from `interrupt` to `dma` (the controller moves the words, so
+the kernel stops paying the per-word copy), reduce the request rate by lowering the degree of multiprogramming, or
 spend bandwidth on KESTREL's `prefetch` to drain the backlog. Masking is what the
 kernel does on its own, and the player watching the device drop to polling and
 seeing throughput recover is how they learn that interrupts are not free.
@@ -5782,7 +5790,7 @@ Queue `98, 183, 37, 122, 14, 124, 65, 67`, head 53, 200 cylinders.
 
 | Fixture | Input | Expected |
 |---|---|---|
-| `DISK-COST-1` | 4 KB read, seek distance 50, 7200 rpm, 100 MB/s | seek 2.5 ms, rotation 4.1667 ms, transfer 0.0410 ms, total 6.7077 ms |
+| `DISK-COST-1` | 4 KB read, seek distance 50, 7200 rpm, 100 MB/s | seek 2.5 ms, rotation 4.1667 ms, transfer 0.0410 ms, total 6.7076 ms (unrounded sum) |
 | `DISK-COST-2` | ticks for the above at 0.5 ms per tick | 13 ticks; zero-seek request costs 9 ticks |
 | `DISK-NVM-1` | the standard queue on `nvm0` under all six policies | identical completion ticks for all six |
 | `DISK-NVM-2` | 1000 random 4 KB writes vs 1000 sequential | write amplification > 3 random, ≈ 1 sequential |
@@ -5798,8 +5806,8 @@ Queue `98, 183, 37, 122, 14, 124, 65, 67`, head 53, 200 cylinders.
 | `IO-COST-1` | 10 requests of 4096 bytes, latency 20, wordSize 64 | polling 840 CPU ticks, interrupt 670, dma 100 |
 | `IO-POLL-1` | polled device, one request | `io.poll_wasted { wastedTicks: 19 }`; `cpuUtilisation` near 1.0 with zero process progress |
 | `IO-INT-1` | interrupt device, two lines at priorities 0 and 2 both pending | the priority-0 line is delivered first; the priority-2 line is deferred while the first is in service |
-| `IO-STORM-1` | 5 interrupts per tick against `maxInterruptsPerTick` 2, for 10 ticks | the storm condition fires; at `2 * window` the line is masked and the device drops to polling |
-| `IO-BUF-1` | single vs double buffering, matched producer and consumer rates | double-buffered throughput is within 5% of 2x the single-buffered figure |
+| `IO-STORM-1` | 5 interrupts per tick against `maxInterruptsPerTick` 2, sustained | pending grows by 3 per tick, so the strict threshold of 32 is first exceeded after delivery on tick 11; the storm condition fires there; escalation stages follow at `window` boundaries from that tick (20, 30, 50 with the defaults); the line is masked and the device drops to polling at the masking stage |
+| `IO-BUF-1` | single vs double buffering, matched producer and consumer rates, measured at steady state over a workload long enough to amortise start-up and drain | double-buffered throughput is within 5% of 2x the single-buffered figure; with the producer 5x faster the improvement is 1/max(p,c) over 1/(p+c), which is 20% at p=1, c=5 |
 | `IO-SPOOL-1` | two processes writing the printer without spooling | `fs.corruption { recoverable: false }` on the output; with spooling, zero corruption and the second job waits |
 
 ### 16.11 File systems (Ch. 13 to 15)

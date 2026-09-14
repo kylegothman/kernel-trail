@@ -577,9 +577,10 @@ of the disk, and repeat.
 SCAN's cost depends on the starting direction, so the implementation must read
 `DiskHead.direction` rather than assume one.
 
-**C-SCAN.** Serve requests only while travelling toward the high end. On reaching
-the end, return immediately to cylinder 0 without servicing anything on the way
-back, and resume. The return sweep costs full head movement, which is the price
+**C-SCAN.** Serve requests only while travelling in the current direction. On
+reaching the end, return immediately to the opposite end (cylinder 0 when
+travelling up, the last cylinder when travelling down) without servicing
+anything on the way back, and resume in the same direction. The return sweep costs full head movement, which is the price
 of the uniform wait time.
 
 - `direction: 'up'`: `53, 65, 67, 98, 122, 124, 183, 199, 0, 14, 37`, total
@@ -596,8 +597,9 @@ direction rather than at the end of the disk.
 - `direction: 'down'`: `53, 37, 14, 65, 67, 98, 122, 124, 183`, total **208**.
 - `direction: 'up'`: `53, 65, 67, 98, 122, 124, 183, 37, 14`, total **299**.
 
-**C-LOOK.** C-SCAN, except the return jump goes to the **lowest requested
-cylinder** rather than to cylinder 0.
+**C-LOOK.** C-SCAN, except the return jump goes to the **farthest requested
+cylinder in the opposite direction** (the lowest requested cylinder when
+travelling up, the highest when travelling down) rather than to the edge.
 
 - `direction: 'up'`: `53, 65, 67, 98, 122, 124, 183, 14, 37`, total **322**
   (130 up, 169 back, 23 up).
@@ -851,7 +853,7 @@ Four drivers ship:
 |---|---|---|
 | `disk0` | block | the geometry and scheduling of section 4 |
 | `nvm0` | block | the NVM model of section 5, appears after the depot upgrade |
-| `console` | character | one byte per tick, always `interrupt` mode |
+| `console` | character | one byte per tick, `interrupt` mode by default (the mode controls and storm fallback still apply) |
 | `net0` | network | fixed latency, packet loss drawn from `root/io`, used by the Leg 12 adversary |
 
 `ioctl` is the escape hatch and every driver-specific behaviour goes through it,
@@ -934,8 +936,10 @@ out.
     priority-0 line is delivered first and the priority-2 line is deferred while
     the first is in service.
 16. Fixture `IO-STORM-1` passes: 5 interrupts per tick against
-    `maxInterruptsPerTick` 2 for 10 ticks fires the storm condition, and at
-    `2 * window` the line is masked and the device drops to polling.
+    `maxInterruptsPerTick` 2, sustained, fires the storm condition on tick 11
+    (pending grows by 3 per tick and the threshold of 32 is strict), escalates
+    at window boundaries from there, and at the masking stage the line is
+    masked and the device drops to polling.
 17. Fixture `IO-BUF-1` passes: double-buffered throughput is within 5 percent of
     2x the single-buffered figure at matched producer and consumer rates.
 18. Fixture `IO-SPOOL-1` passes: two processes writing the printer without
@@ -983,7 +987,7 @@ Plus:
 | `select returns index` | every policy's `select` returns a valid index into the queue, never a request object |
 | `sstf tie-break` | two requests equidistant from the head resolve to the lower cylinder, then the lower id |
 | `look beats scan` | LOOK down (208) is strictly less than SCAN down (236), and LOOK up (299) is strictly less than SCAN up (331) |
-| `cscan uniformity` | the standard deviation of wait times under C-SCAN is strictly lower than under SCAN on the same queue |
+| `cscan uniformity` | `waitUniformity()` is measured and pinned for SCAN, C-SCAN and LOOK in both directions on the standard batch; on this all-at-tick-0 batch C-SCAN is not more uniform than SCAN, and the test asserts the measured values, not a direction |
 | `seek starvation` | a request queued 401 ticks ago under SSTF against a busy region raises `process.starving` naming its pid |
 | `projected path` | `snapshot().projectedPath` matches the actual path taken when no further requests arrive, and calling it does not mutate the queue |
 | `disk.seek emitted` | each service emits `disk.seek { from, to, distance }` with `distance === |to - from|` |
@@ -1001,7 +1005,7 @@ Plus:
 | `tick floor` | `ticksFor` never returns less than 1, for 1000 sampled service times |
 | `capacity` | the default geometry gives 26,214,400 bytes |
 | `block to cylinder` | block 0 maps to cylinder 0, block 255 to cylinder 0, block 256 to cylinder 1 |
-| `cost multiplier` | `setCostMultiplier(0.5)` halves seek overhead, per-cylinder cost and device latency, and affects all six policies by the same factor |
+| `cost multiplier` | `setCostMultiplier(0.5)` halves seek overhead, per-cylinder cost and device latency (rotation and transfer unchanged), so the distance-50 read costs 5.4576 ms and 11 ticks under every policy; an HDD request never also pays a fixed `Device.latency` on top of its computed service |
 
 ### `tests/kernel/storage/nvm.test.ts`
 
@@ -1013,7 +1017,7 @@ Plus:
 | `erase before write` | overwriting a logical page writes a new physical page and marks the old invalid; the logical-to-physical map reflects it |
 | `gc trigger` | GC runs when free physical pages fall below `overProvisionRatio * pages` |
 | `gc selection` | GC picks the block with the most invalid pages, tie-broken by lowest block index |
-| `write buffer` | 8 small writes merge into one physical write with `nvmWriteBufferPages` at 8 |
+| `write buffer` | 8 sub-page (512-byte) updates to one 4096-byte logical page merge into one physical page program with `nvmWriteBufferPages` at 8; eight distinct full pages still cost eight programs |
 
 ### `tests/kernel/storage/raid.test.ts`
 
@@ -1027,8 +1031,8 @@ Plus:
 | `raid5 parity spread` | parity for stripe `s` lands on disk `(n - 1 - (s mod n))`, asserted for 20 stripes |
 | `raid4 bottleneck` | after 200 random writes, the RAID 4 parity disk's queue length exceeds every data disk's by at least 3x, while RAID 5's queues are within 25 percent of each other |
 | `rebuild progress` | `raid.rebuild` fires with `progress` monotonically increasing from 0 toward 1 and never exceeding 1 |
-| `rebuild rate` | rebuild advances `rebuildBlocksPerTick` blocks per tick |
-| `pause rebuild` | `pauseRebuild()` halts progress and restores throughput; `resumeRebuild()` continues from the same progress |
+| `rebuild rate` | `rebuildBlocksPerTick` caps rebuild issuance per tick; progress counts completed reconstructed blocks through the same physical queues as foreground work, and the measured foreground throughput impact is reported |
+| `pause rebuild` | `pauseRebuild()` stops new rebuild issuance (already-issued operations may finish) and foreground throughput recovers; `resumeRebuild()` continues from the same progress |
 | `failure not random` | 10,000 ticks of normal operation inject zero failures and consume zero `root/storage` draws for failure decisions |
 
 ### `tests/kernel/io/modes.test.ts`
@@ -1041,7 +1045,7 @@ Plus:
 | `interrupt charged to kernel` | interrupt service ticks increment the kernel overhead counter and no process's `totalCpuUsed` |
 | `interrupt requester cost` | the requesting process is charged exactly 1 tick |
 | `dma cycle steal` | 0.1 of the transfer duration is charged to the currently running process, not to the requester |
-| `dma one interrupt` | a 4096-byte DMA transfer produces exactly one `io.interrupt`, and word-by-word interrupt mode produces one per word |
+| `dma one interrupt` | a 4096-byte DMA transfer produces exactly one `io.interrupt` and no kernel copy debt; interrupt mode produces one `io.interrupt` per request plus `bytes / wordSize` ticks of kernel copy debt, which is the 670 in the comparison table |
 | `io.dma_transfer` | the event carries the exact byte count |
 | `mode side table` | switching a device to polling changes the live mode without mutating `Device.mode` |
 
@@ -1068,7 +1072,7 @@ Plus:
 |---|---|
 | `IO-BUF-1` | per acceptance criterion 17 |
 | `single serialises` | under `single`, producer and consumer never run in the same tick |
-| `double no help when skewed` | with the producer 5x faster, double buffering improves throughput by less than 5 percent |
+| `double no help when skewed` | with the producer 5x faster (p=1, c=5), double buffering improves throughput by 20 percent (1/max(p,c) against 1/(p+c)), far short of the 2x at matched rates |
 | `circular reuses bounded buffer` | the `circular` scheme imports WP-07's bounded buffer, verified by an import assertion in the test |
 | `occupancy metric` | with a full buffer for 100 ticks, `bufferOccupancy` equals capacity |
 | `stalls counted` | every tick the producer waits increments `bufferStalls` |
@@ -1191,4 +1195,157 @@ What moved that you will bump into:
   you send the patch.
 - Verification is four gates. Baseline at 83e1d26 is 1011 passed, 0 skipped,
   42 files.
+
+## Pre-flight decisions 2026-09-14
+
+The WP-09 agent's pre-flight (the WP-08 agent, continuing) mapped all
+twenty-three acceptance criteria, requested seven grants and proposed eleven
+decision groups. Every code and spec claim was checked at 83e1d26, and the
+arithmetic in S1, S2, S5, S7 and S8 was recomputed independently, before this
+section was written. All are approved, with the qualifications below. The
+spec and package corrections were applied in the same commit.
+
+### Grants G1 to G7
+
+- **G1, approved.** Add `expireTimers(tick)` to the unfrozen `IoHooks`
+  interface with a noop default, and dispatch it from a constructor-registered
+  `onPhase` callback at phase 1; phase 1's body does not change. Keep the I/O
+  portion of kernel debt in a side counter in `IoSubsystem`, add charges in
+  phase 3 through the `chargeKernelDebt` accessor, record the CPU owner at the
+  phase 7 probe, re-add the I/O portion at the phase 8 probe when a context
+  switch overwrote `switchDebt`, and consume one I/O debt tick per idle tick
+  at that probe when `running` is null. Persist the I/O portion in your slot
+  and validate `0 <= ioDebt <= switchDebt` at completed-tick boundaries. No
+  phase body, threads.ts or metrics edit.
+- **G2, approved.** One early gate at the top of `execute`, before sync
+  attempt bookkeeping, for a stolen DMA cycle or a polling continuation: it
+  calls `threads.deferServiceCharge()` and returns false, and a stolen tick
+  suppresses the instruction completely (no memory fault, no sync attempt).
+  Continuation state lives in the `case 'io'` branch and your subsystem.
+  Nothing else in `execute` or `executeInstruction` changes.
+- **G3, approved.** Extract pure bounded-FIFO operations inside
+  `src/kernel/sync/scenarios/boundedBuffer.ts` and route its existing item
+  mutation through them; the circular buffering scheme imports those. The
+  scenario's protocol, state shape and every WP-07 test stay as they are, and
+  no new module is added. This is the only permitted edit under
+  `src/kernel/sync/**`.
+- **G4, approved with a boundary.** The completion-aware paging adapter is
+  opt-in. `memory/demandPaging.ts` may gain backing `{ space, page }`
+  identity, completion acknowledgement and cancellation, and a phase 2
+  completion pump, but the kernel installs the storage-backed adapter only
+  when a leg or test calls a granted control method (`attachPagingStorage()`
+  on the kernel, or an equivalent you name in the report), never by default
+  and never merely because `storage` is enabled. With no adapter attached,
+  every existing WP-05 and WP-06 fixture keeps its exact timing, including
+  everything that runs under `REFERENCE_CONFIG`. With the adapter attached,
+  WP-06's deadline is the floor and media acknowledgement can only delay
+  completion. No `VmSnapshotState` change.
+- **G5, approved.** Extend the constructor invariant wrapper (Kernel.ts
+  414-416) with storage and I/O assertions for I-27, I-28, I-32 and I-33,
+  gated on the subsystem being enabled. I-29 to I-31 stay with WP-10.
+- **G6, approved.** `tests/kernel/stepOrder.test.ts:101` becomes exactly
+  `kernel.setDiskPolicy('sstf'); expect(kernel.activeDiskPolicy).toBe('sstf');`
+  and lines 102-104 stay.
+- **G7, approved.** In `tests/kernel/memory/frameTable.test.ts` the dummy
+  contribution's slot key and owner move from `io` to `fs` on exactly the
+  three quoted lines, with every assertion, value and run call preserved.
+  Record it in the WP-10 handoff so the `fs` promotion migrates it again.
+
+Tuning: all eleven keys as listed, with `maxPendingInterrupts` 256 and
+`rebuildProgressInterval` 10, integer validation for the integer knobs and a
+bounded-fraction check for `dmaCycleStealRatio`.
+
+### Decisions S1 to S11
+
+- **S1, approved.** `DISK-COST-1` total is 6.7076 (unrounded sum); 13 and 9
+  ticks stand under `round`. The multiplier scales seek overhead, per-cylinder
+  cost and device latency only; rotation and transfer are fixed; distance 50
+  at 0.5 gives 5.4576 ms and 11 ticks. An HDD request never pays a fixed
+  `Device.latency` on top of computed service. Storage addresses are 512-byte
+  sector LBAs; the filesystem converts block x 8, documented for WP-10; the
+  0/255/256 cylinder fixture stands.
+- **S2, approved.** All ten published paths and totals are preserved through
+  an owned route helper with virtual endpoints; the frozen select result stays
+  a queue index; one seek overhead, rotation and transfer per real request,
+  rounded once; one seek event per physical leg; in-flight routes finish under
+  their committed policy. C-SCAN and C-LOOK mirror downward. Uniformity is
+  measured and pinned, and the strict C-SCAN assertion was replaced in the
+  package, the spec and the debrief wording. `waitUniformity()` is the
+  population standard deviation over completed requests, zero below two.
+- **S3, approved.** The fixed NVM fixture as proposed: 2048 physical pages,
+  64-page erase blocks (explicit override of the 256 default), 1728 logical
+  pages, sequential prefill and flush, counter reset, then 1000 sequential
+  writes to 0-999 against 1000 uniform writes to 0-1727 from `root/storage`;
+  lowest-free-page allocation, ascending relocation, the specified GC
+  selection, final drain, and GC reserving relocation space before erasing.
+  Report the measured random amplification before the `> 3` threshold is
+  accepted; no seed search and no model adjustment to reach it. The write
+  buffer merges sub-page updates within one page; the timing ratio is tested
+  in microseconds before tick quantisation; NVM completion order is
+  independent of the HDD policy.
+- **S4, approved.** Adjacent mirror pairs, rotating RAID-5 parity, mirror
+  reads from the lower live index, degraded-read cost only for reconstructed
+  reads, independent P and Q parity for RAID 6 with full-stripe width n-2
+  (n-1 for RAID 4 and 5). The queue-ratio fixture as proposed (five disks,
+  200 reference-stream draws over logical blocks 0-319, no combining, one
+  submission tick, sampled before service, all planned physical operations
+  counted), with RAID-5's bound `maxQueue <= 1.25 * minQueue`, validated
+  before the ratio claims are treated as established.
+  `rebuildBlocksPerTick` is an issuance cap; progress counts completed
+  reconstructed blocks through the shared physical queues; pause stops new
+  issuance; throughput impact is measured, not asserted against an undefined
+  ratio.
+- **S5, approved.** The comparison table's 670 stands: one interrupt per
+  request, word copying charged as kernel debt. The per-word interrupt
+  assertion and the spec's "one per word" remedy wording were corrected.
+  Polling 840 and 19 wasted polls stand in an explicitly uninterrupted,
+  zero-context-overhead fixture; general workloads count executed polls. DMA
+  stealing quantises per request as `round(0.1 * 64) = 6`, giving 10; steals
+  need an eligible continuously runnable process and produce no phantom ticks
+  without one; context, copy and creation overhead ticks are never eligible.
+- **S6, approved** as described under G1.
+- **S7, approved.** NMI bypasses masking and nesting but shares the delivery
+  budget; budget is reserved before nested handlers run; lower lines may run
+  after a higher handler returns in the same tick. The storm fixture fires on
+  tick 11 (30 pending after ten ticks is below the strict 32), escalates at
+  window boundaries (20, 30, 50 with the defaults), masks at the masking
+  stage; the fixture row and acceptance 16 were corrected. Offender by largest
+  backlog then priority and device id; attribution by contribution count then
+  pid; each escalation edge emitted once; masking drains existing completion
+  tokens by polling without losing waiters; the storm window is the long
+  polling interval and the prior mode returns after one healthy window.
+- **S8, approved.** The skewed-producer expectation is 20 percent, corrected
+  in the package and the 16.9 row; matched-rate measurement is steady state
+  over a long enough workload. The block cache reimplements LRU's ordering
+  rule (recency, then id) over `BlockId` without importing WP-06's private
+  comparator. Write-through enqueues the physical write in the same tick and
+  acknowledges on durable completion; write-back eviction and sync keep dirty
+  data until completion; generations prevent an older flush from cleaning a
+  newer write; crash loss is uncommitted dirty data only.
+- **S9, approved** with the G4 opt-in boundary.
+- **S10, approved.** `IoRequest`, `IoContext` and `DeviceSnapshot` are local
+  to `DeviceDriver.ts`; the frozen `Device` and the `{ kind: 'io', device }`
+  instruction are unchanged, with the documented default requests (one
+  4096-byte read at LBA 0, one console byte, one 64-byte packet). The printer
+  is a spool test adapter with a supplied output inode, not a fifth driver.
+  Console defaults to interrupt mode. Network loss draws once per completed
+  packet from `root/io` and is represented in the owned completion result.
+  Internal ownership is `(pid, tid, requestId)`; `Device.queue` projects only
+  whole-process waiters (I-32); the waiting TCB is resolved through the
+  readiness reason object. Cleanup composes the existing exit and exec
+  callbacks. Storage-only and I/O-only operation are independent; disabled
+  owners produce no activity, counters or draws.
+- **S11, approved.** One amendment promoting `storage` and `io` together if
+  their shapes settle together, provisional number 9; otherwise 9 and 10 in
+  the order you send them. Prove both payloads extend `JsonValue` with the
+  standalone strict check before sending the patch. Fresh-kernel restore
+  stays WP-11's and the existing guard stays.
+
+### Not granted
+
+- No default installation of the storage-backed paging adapter.
+- No edit under `src/kernel/sync/**` beyond G3, none under
+  `tests/kernel/sync/**` or `tests/kernel/deadlock/**`, none to any phase
+  body, threads.ts, lifecycle.ts, metrics.ts or WP-06's replacement policies.
+- No twelfth tuning key without a pre-flight amendment to this section.
 
