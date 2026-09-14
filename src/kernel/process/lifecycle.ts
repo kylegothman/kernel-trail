@@ -8,11 +8,19 @@ import type { Program } from './Program';
 import type { ProcessTable } from './ProcessTable';
 import type { TransitionOptions } from './transitions';
 
+export type CowCapacity =
+  | { readonly state: 'ready'; readonly frame: FrameId; readonly reported: boolean }
+  | { readonly state: 'pending'; readonly reported: boolean }
+  | { readonly state: 'failed' };
+
+export type CowResolution = SyscallResult | { readonly pending: true };
+
 export interface ProcessMemoryHooks {
   readonly pageTables: Map<AddressSpaceId, PageTableEntry[]>;
   allocateFrame(space: AddressSpaceId, page: PageId): FrameId | null;
   freeFrame(frame: FrameId): void;
   copyFrame(from: FrameId, to: FrameId): void;
+  prepareCow?(pid: Pid, page: PageId, source: FrameId): CowCapacity;
 }
 
 export interface LifecycleContext {
@@ -188,14 +196,20 @@ export class ProcessLifecycle {
     });
   }
 
-  /** Returns null when the access is not a COW fault. Allocation is a WP-05 hook. */
-  resolveCow(pcb: ProcessControlBlock, page: PageId): SyscallResult | null {
+  /** Lifecycle owns COW events and copying; memory owns any asynchronous capacity request. */
+  resolveCow(pcb: ProcessControlBlock, page: PageId): CowResolution | null {
     const pte = this.ctx.memory.pageTables.get(pcb.addressSpaceId)?.find(entry => entry.page === page);
     if (pte === undefined || !pte.valid || pte.writable || pte.frame === null) return null;
     const from = pte.frame;
     const count = this.cowRefCount.get(from) ?? 0;
     if (count <= 1) return null;
-    const frame = this.ctx.memory.allocateFrame(pcb.addressSpaceId, page);
+    const capacity = this.ctx.memory.prepareCow?.(pcb.pid, page, from);
+    if (capacity?.state === 'failed') return { ok: false, errno: 'ENOMEM', message: 'no frame for copy-on-write' };
+    if (capacity?.state === 'pending') {
+      if (!capacity.reported) this.ctx.emit({ type: 'memory.page_fault', pid: pcb.pid, page, major: false });
+      return { pending: true };
+    }
+    const frame = capacity?.frame ?? this.ctx.memory.allocateFrame(pcb.addressSpaceId, page);
     if (frame === null) return { ok: false, errno: 'ENOMEM', message: 'no frame for copy-on-write' };
     this.ctx.memory.copyFrame(from, frame);
     pte.frame = frame;
@@ -205,9 +219,15 @@ export class ProcessLifecycle {
     this.cowRefCount.set(from, count - 1);
     if (count - 1 === 1) this.restoreSingleWriter(from);
     this.ctx.chargeCowCopy(pcb, this.ctx.cowCopyTicks);
-    this.ctx.emit({ type: 'memory.page_fault', pid: pcb.pid, page, major: false });
+    if (capacity?.reported !== true) this.ctx.emit({ type: 'memory.page_fault', pid: pcb.pid, page, major: false });
     this.ctx.emit({ type: 'memory.page_loaded', pid: pcb.pid, page, frame });
     return { ok: true, value: frame };
+  }
+
+  /** Evicted COW aliases become independent backing mappings before physical reuse. */
+  forgetEvictedFrame(frame: FrameId): void {
+    if (this.cowRefCount.has(frame)) this.restoreSingleWriter(frame);
+    this.cowRefCount.delete(frame);
   }
 
   releaseAddressSpace(pcb: ProcessControlBlock): void {
