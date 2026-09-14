@@ -2615,6 +2615,18 @@ it replaces an earlier sentence that promised a fixed maximum store age in
 instructions, which the one-store-per-tick drain could never demonstrate.
 (Corrected 2026-09-14 in the WP-07 pre-flight.)
 
+The remainder section (line 6) is not empty: each iteration it draws
+`rng.int(0, 8)` ticks of ordinary work from `root/sync`, for all three Peterson
+variants alike. That draw is part of the fixture, not decoration. Two processes
+with identical loop bodies fall into a fixed alternation after their first
+entry, offset by the critical section, and from then on each one always sees
+the other's committed flag; the only reordering window would be the first
+entry, which the shuffle takes with probability one in four. A variable
+remainder keeps bringing the two entry sections back into coincidence, so the
+reordering window recurs throughout the run. (Corrected 2026-09-14 after the
+WP-07 implementation measured 625 clean entries each and zero overlaps at the
+reference seed with an empty remainder.)
+
 Running `SYNC-PETERSON-2` (the same scenario with `reordering: true`) produces a
 mutual exclusion violation within 10,000 ticks for the reference seed, emits
 `sync.race_detected`, and is the fixture that proves the point. Inserting
@@ -5700,8 +5712,8 @@ stack-algorithm property.
 
 | Fixture | Scenario | Expected |
 |---|---|---|
-| `SYNC-PETERSON-1` | Peterson, `reordering: false`, 10,000 ticks | mutual exclusion holds at every tick; zero `sync.race_detected` |
-| `SYNC-PETERSON-2` | Peterson, `reordering: true`, storeBufferDepth 2 | at least one mutual exclusion violation, at least one `sync.race_detected`, before tick 10,000 |
+| `SYNC-PETERSON-1` | Peterson, `reordering: false`, 10,000 ticks, remainder `rng.int(0, 8)` per iteration | mutual exclusion holds at every tick; zero `sync.race_detected` |
+| `SYNC-PETERSON-2` | Peterson, `reordering: true`, storeBufferDepth 2, same remainder draw | at least one mutual exclusion violation, at least one `sync.race_detected`, before tick 10,000 |
 | `SYNC-PETERSON-3` | Peterson with `mfence` between lines 2 and 3, reordering on | zero violations |
 | `SYNC-RACE-1` | two processes incrementing a shared counter, unprotected, 100 increments each | `sync.race_detected` fires; `expectedValue - corruptedValue > 0`; `interleaving` contains the four-line load/load/store/store pattern |
 | `SYNC-RACE-2` | same, wrapped in a mutex | zero `sync.race_detected`; final value exactly 200 |

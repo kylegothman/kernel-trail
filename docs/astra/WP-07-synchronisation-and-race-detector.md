@@ -1043,3 +1043,22 @@ Provisional number 7, against WP-09's merge order. The exact `SyncSnapshotState`
 patch is a separate written approval; nothing in this section approves a hash
 regeneration.
 
+## Implementation review 2026-09-14: the Peterson remainder
+
+The first implementation (73667ef) measured SYNC-PETERSON-2 at the reference
+seed under the approved S4 model: 625 entries per process, zero overlaps, zero
+races. The trace shows why. With an empty remainder section, the two loop
+bodies are identical, so after the first entry the processes settle into a
+16-tick alternation in which each always sees the other's committed flag. The
+only reordering window is the very first entry, and the shuffle takes it with
+probability one in four; the reference seed did not.
+
+That is a fixture defect, not a model defect. The fix is to the scenario:
+every iteration's remainder section (line 6) draws `rng.int(0, 8)` ticks of
+ordinary work from `root/sync`, for SYNC-PETERSON-1, -2 and -3 alike. The
+entry section stays six instructions, the seed and 10,000-tick window stay
+fixed, and no seed search is permitted. If the reference seed still produces
+zero overlaps with the remainder in place, report the number of coincident
+entry attempts observed rather than changing anything else. Spec 8.2 and the
+16.7 rows were updated in the same commit as this section.
+
