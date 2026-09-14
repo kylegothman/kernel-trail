@@ -312,7 +312,8 @@ export class SyncSubsystem implements ScenarioContext, RequirementContext {
   }
   work(actor: Actor, ticks: number | (() => number)): AttemptResult {
     const state = this.execution(actor); const remaining = state.remainingWork ?? (typeof ticks === 'number' ? ticks : ticks());
-    check(integer(remaining, 1), 'work duration');
+    check(integer(remaining), 'work duration');
+    if (remaining === 0) return RETIRE;
     this.executions.set(actorKey(actor), { ...state, remainingWork: remaining === 1 ? null : remaining - 1 });
     return remaining === 1 ? RETIRE : WORKING;
   }

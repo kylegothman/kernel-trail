@@ -45,7 +45,8 @@ export function executePeterson(ctx: ScenarioContext, state: PetersonState, acto
     if (!ctx.store(actor, own, 0)) return RETRY;
     ctx.leave(actor, state.requirement); ctx.setRegister(actor, 'peterson.inside', 0); return RETIRE;
   }
-  return RETIRE;
+  // Line 6 draws once per iteration from root/sync, including a zero remainder.
+  return ctx.work(actor, () => ctx.rng.int(0, 8));
 }
 
 export function createPeterson(kernel: KernelImpl, options: PetersonOptions = {}): PetersonState {
