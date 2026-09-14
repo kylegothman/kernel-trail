@@ -1,6 +1,6 @@
 import { InstancedBufferAttribute, StorageInstancedBufferAttribute, InstancedMesh, DynamicDrawUsage, WebGPURenderer, BoxGeometry, CylinderGeometry, PlaneGeometry, TorusGeometry, NoToneMapping } from 'three/webgpu';
 import type { BufferGeometry, Camera, Material, Object3D, Scene } from 'three/webgpu';
-import { type Capabilities, type RenderQualityProfile } from '@platform';
+import { detectCapabilities,type Capabilities, type RenderQualityProfile } from '@platform';
 import { FORM, SEMANTICS, DASH, HATCH_ID, linearColor, gainFor } from '@design';
 import { getMaterial,createInstanceMaterial,type TrailMaterial } from './materials';
 import { PostChain } from './postChain';
@@ -110,6 +110,12 @@ export interface RendererBackend {
   dispose(): void;
 }
 
+/** AA belongs to the post graph; the legacy antialias flag never enables canvas MSAA. */
+export function profileWithSamples(profile:RenderQualityProfile,samples:1|2|4):RenderQualityProfile {
+  if(profile.msaaSamples===0)return profile;
+  const msaaSamples=samples===1?0:samples;
+  return profile.msaaSamples===msaaSamples?profile:{...profile,msaaSamples};
+}
 export const STRATEGY_GROUPS=['msaa','particleIntegration','volumetricCeiling','gpuTimer','hdrFormat','instanceStorage','depthPrepass'] as const;
 export function strategies(c:Capabilities,p:RenderQualityProfile) {
   return { msaa:c.backend==='webgpu'?(p.msaaSamples>0?4:0):Math.min(p.msaaSamples,c.maxSamples),
@@ -128,22 +134,27 @@ export class ThreeUnifiedBackend implements RendererBackend {
   private canvas:HTMLCanvasElement|null=null;
   private width=1;private height=1;private pixelRatio=1;
   private gpuMs:number|null=null;
+  private requestedSamples:1|2|4=4;
   private post:PostChain|null=null;
   private runtimeId:BackendId;
   private readonly mutableStats={drawCalls:0,triangles:0,programs:0,textures:0,geometries:0,gpuMs:null as number|null,targetMemoryBytes:0};
   private readonly contextLost=(event:Event):void=>{event.preventDefault();this.announceLoss('webglcontextlost');};
-  constructor(readonly capabilities:Capabilities){this.runtimeId=capabilities.backend;this.budget=new DrawCallBudget('high');}
+  private actualCapabilities:Capabilities;
+  constructor(capabilities:Capabilities){this.actualCapabilities=capabilities;this.runtimeId=capabilities.backend;this.budget=new DrawCallBudget('high');}
+  get capabilities():Capabilities{return this.actualCapabilities;}
   get id():BackendId{return this.runtimeId;}
   get domElement():HTMLCanvasElement {if(!this.canvas)throw new Error('Backend not initialized');return this.canvas;}
   get postChain():PostChain|null{return this.post;}
   get deviceRenderer():WebGPURenderer {if(!this.renderer)throw new Error('Backend not initialized');return this.renderer;}
   async init(canvas:HTMLCanvasElement,opts:BackendInitOptions):Promise<void> {
-    this.canvas=canvas;this.profile=opts.profile;this.resources=opts.resources??createDefaultResources();this.lossReported=false;
+    this.canvas=canvas;this.requestedSamples=opts.samples;this.profile=profileWithSamples(opts.profile,opts.samples);this.resources=opts.resources??createDefaultResources();this.lossReported=false;
+    if(opts.forceWebGL&&this.capabilities.backend!=='webgl2')this.actualCapabilities=(await detectCapabilities('forced-backend',true)).caps;
     const r=new WebGPURenderer({canvas,forceWebGL:opts.forceWebGL,antialias:false,alpha:false,powerPreference:'high-performance',trackTimestamp:this.capabilities.timestampQuery});
     r.shadowMap.enabled=false;r.toneMapping=NoToneMapping;r.toneMappingExposure=1;
     r.onDeviceLost=info=>this.announceLoss(info.reason??info.message);
     await r.init();this.renderer=r;r.info.autoReset=false;
     this.runtimeId='isWebGPUBackend' in r.backend && r.backend.isWebGPUBackend===true?'webgpu':'webgl2';
+    if(this.runtimeId!==this.capabilities.backend)this.actualCapabilities=(await detectCapabilities('fallback-backend',true)).caps;
     canvas.addEventListener('webglcontextlost',this.contextLost);
     this.budget.setTier(opts.profile.tier);
   }
@@ -152,7 +163,7 @@ export class ThreeUnifiedBackend implements RendererBackend {
     this.post?.resize(width,height,pixelRatio);
   }
   setQuality(profile:RenderQualityProfile):void {
-    this.profile=profile;this.budget.setTier(profile.tier);for(const b of this.batches)b.clamp(profile);
+    profile=profileWithSamples(profile,this.requestedSamples);this.profile=profile;this.budget.setTier(profile.tier);for(const b of this.batches)b.clamp(profile);
     this.post?.setTier(profile.tier,profile);
   }
   createInstancedBatch(desc:InstancedBatchDesc):InstancedBatchHandle {
