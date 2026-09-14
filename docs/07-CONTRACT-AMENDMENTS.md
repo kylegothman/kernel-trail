@@ -470,6 +470,77 @@ alone, before implementation.
 ---
 
 
+## Amendment 8, 2026-09-14: typed deadlock continuation
+
+**Status:** applied on wp-08 after explicit human review of the exact
+wp08-contract-promotion.patch with two required corrections and approval of
+hash regeneration on 2026-09-14. Number provisional against WP-09's merge
+order. The WP-08 pre-flight decisions are recorded in commit 1a31b08.
+
+### What was an envelope
+
+Amendment 3 introduced `SubsystemSnapshots.deadlock` as `SubsystemEnvelope`.
+The envelope did not describe resource claims, actor-specific requests,
+recovery state or the observation history needed for deterministic detection.
+
+### What changed
+
+The slot is now `DeadlockSnapshotState`, version 1. Explicit readonly records
+preserve resource declarations and ranks, maximum claims, ordered atomic
+requests and reservations, declared mailbox endpoints, resource-free PC
+checkpoints, preemption counts and temporary preemptibility overrides. They
+also retain dependency observation generations and formation times, confirmed
+witness episodes, pre-recovery I-26 evidence and integer statistics. No other
+subsystem slot, PCB, TCB, BlockReason or game contract changes.
+
+The reviewed correction spells `lastDetection.report` as a structurally
+identical type literal instead of referencing the `DeadlockReport` interface.
+Interfaces have no implicit index signature and that reference prevented the
+payload from extending `JsonValue`. The other correction brands both mailbox
+fields as `ResourceId`, matching the rest of the contract.
+
+### Why this shape
+
+Every payload field is explicit readonly plain data. There are no callbacks,
+Map, Set or generic JSON escape fields. A standalone strict TypeScript check
+resolves `DeadlockSnapshotState['payload'] extends JsonValue` to true and
+checks assignability in both directions between the saved report literal and
+`DeadlockReport`. All three checks pass on Node 22.23.2 with TypeScript 7.0.2.
+
+Allocation, Need and Available remain derived from staged PCB multisets and
+resource declarations. Reserved requests are already allocated and are not
+charged twice on restore. Declaration preemptibility is the base value;
+active overrides determine the effective shared resource projection.
+
+Actors carry PID and TID before graph projection. Dependency records retain
+complete alternative groups and distinguish resource, sync, mailbox and child
+waits. Generation sets preserve continuously observed witnesses without running
+detection during bookkeeping. Captured I-26 evidence predates recovery and
+cannot be checked against owners that recovery has already removed. Integer
+accumulators preserve exact utilization and latency without saving averages.
+
+### Consequences
+
+WP-08 prepares its contribution against equivalent staged process, TCB, sync,
+IPC, resource and configuration state, validates before mutation and returns a
+commit closure. Strategy remains in `KernelSnapshot.config`. Full fresh-kernel
+reconstruction, process decoders, IPC continuations and general syscall results
+remain WP-11's responsibilities. PC rollback does not rewind service, CPU,
+Amdahl debt, scheduler state, time, RNG or external subsystem effects.
+
+Resource-table waits reuse the existing semaphore BlockReason and are routed
+after IPC matching and before sync. Every detector-confirmed cycle has all four
+Coffman conditions. Preemptibility is a recovery property and never suppresses
+detection; near-deadlocks are acyclic hold-and-wait chains.
+
+The exact frozen-file patch, with the report-literal and branded-mailbox
+corrections, was reviewed before application. Hash regeneration was explicitly
+human-approved on 2026-09-14 for that corrected patch only. This amendment and
+regenerated lock are committed alone, before implementation.
+
+---
+
+
 # Package scope corrections
 
 Not contract changes, so no hash moves and no amendment number. Recorded here

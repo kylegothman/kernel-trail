@@ -740,15 +740,149 @@ export interface SubsystemSnapshots {
   readonly vm?: VmSnapshotState;
   /** Amendment 7. Synchronisation continuation: primitives, waits, memory order, race detector and scenario state. */
   readonly sync?: SyncSnapshotState;
-  /** Amendment 3. Detection interval position and the wait-for graph edges that
-   *  are not recoverable from the resource table alone. */
-  readonly deadlock?: SubsystemEnvelope;
+  /** Amendment 8. Deadlock continuation: requests, recovery, dependencies and detection history. */
+  readonly deadlock?: DeadlockSnapshotState;
   readonly storage?: SubsystemEnvelope;
   /** Amendment 3. In-flight requests, interrupt queue, and DMA transfers. */
   readonly io?: SubsystemEnvelope;
   readonly fs?: SubsystemEnvelope;
   readonly security?: SubsystemEnvelope;
 }
+
+/** WP-08 deadlock continuation. Plain versioned data, not a live graph view. */
+export interface DeadlockSnapshotState {
+  readonly owner: 'deadlock';
+  readonly version: 1;
+  readonly payload: {
+    readonly tick: Tick;
+    readonly settings: {
+      readonly deadlockDetectionInterval: number;
+      readonly rollbackCheckpointInterval: number;
+      readonly maxPreemptionsPerProcess: number;
+      readonly preventionMode: 'ordering' | 'all_or_nothing';
+      readonly deadlockRecovery: 'none' | 'abort_one' | 'abort_all' | 'preempt';
+    };
+    /** Resource ID order. Availability is derived from staged PCB holdings. */
+    readonly declarations: readonly {
+      readonly id: ResourceId;
+      readonly displayName: string;
+      readonly totalInstances: number;
+      /** The declared value to restore when a temporary override expires. */
+      readonly preemptible: boolean;
+    }[];
+    /** Declaration order across the two governed namespaces determines rank. */
+    readonly ranks: readonly {
+      readonly resource: ResourceId;
+      readonly source: 'resource' | 'sync';
+    }[];
+    /** PID order; each vector contains positive counts in resource ID order. */
+    readonly claims: readonly {
+      readonly pid: Pid;
+      readonly resources: readonly (readonly [ResourceId, number])[];
+    }[];
+    readonly nextRequestGeneration: number;
+    /** Generation order; one complete vector per requesting actor. */
+    readonly requests: readonly {
+      readonly generation: number;
+      readonly actor: DeadlockSnapshotActor;
+      readonly requestedAt: Tick;
+      readonly resources: readonly (readonly [ResourceId, number])[];
+      /** Null means queued; otherwise every instance is already allocated. */
+      readonly grantedAt: Tick | null;
+    }[];
+    /** Intended protocol participants; IPC remains the owner of actual waits. */
+    readonly mailboxEndpoints: readonly {
+      readonly mailbox: ResourceId;
+      readonly senders: readonly DeadlockSnapshotActor[];
+      readonly receivers: readonly DeadlockSnapshotActor[];
+    }[];
+    /** Resource-free PC checkpoints; no service, CPU or external state rewind. */
+    readonly checkpoints: readonly {
+      readonly pid: Pid;
+      readonly tid: Tid;
+      readonly tick: Tick;
+      readonly programCounter: number;
+    }[];
+    /** PID order. Counts survive exec for the lifetime of the PID. */
+    readonly preemptionCounts: readonly (readonly [Pid, number])[];
+    readonly preemptibilityOverrides: readonly {
+      readonly resource: ResourceId;
+      readonly preemptible: boolean;
+      readonly untilTick: Tick;
+    }[];
+    readonly lastObservationTick: Tick | null;
+    readonly lastStatisticsTick: Tick | null;
+    readonly nextDependencyGeneration: number;
+    /** Generation order. A changed alternative group begins a new observation. */
+    readonly observations: readonly {
+      readonly generation: number;
+      readonly dependency: DeadlockSnapshotDependency;
+      readonly sinceTick: Tick;
+    }[];
+    /** Canonical observation-generation sets for continuously present witnesses. */
+    readonly confirmedEpisodes: readonly (readonly number[])[];
+    /** Historical I-26 evidence, captured before recovery changes live owners. */
+    readonly lastDetection: {
+      readonly report: {
+        readonly tick: Tick;
+        readonly cycle: readonly Pid[];
+        readonly resources: readonly ResourceId[];
+        readonly conditions: readonly CoffmanCondition[];
+        readonly suggestedVictims: readonly Pid[];
+      };
+      readonly actorCycle: readonly DeadlockSnapshotActor[];
+      /** Includes the closed alternative groups supporting the actor witness. */
+      readonly dependencies: readonly DeadlockSnapshotDependency[];
+    } | null;
+    /** Ratios are derived from integer accumulators, never saved as averages. */
+    readonly statistics: {
+      readonly deadlocks: number;
+      readonly processesLost: number;
+      readonly occupiedInstanceTicks: number;
+      readonly capacityInstanceTicks: number;
+      readonly totalTicks: number;
+      readonly detectionLatencyTicks: number;
+      readonly detectionSamples: number;
+    };
+  };
+}
+
+export type DeadlockSnapshotActor = {
+  readonly pid: Pid;
+  readonly tid: Tid;
+};
+
+/** An effective dependency before PID projection, with source-specific groups. */
+export type DeadlockSnapshotDependency = {
+  readonly waiter: DeadlockSnapshotActor;
+  readonly source:
+    | {
+        readonly kind: 'resource_request';
+        readonly resource: ResourceId;
+        readonly requestGeneration: number;
+      }
+    | {
+        readonly kind: 'sync_wait';
+        readonly resource: ResourceId;
+        readonly waitGeneration: number;
+      }
+    | {
+        readonly kind: 'mailbox';
+        readonly mailbox: ResourceId;
+        readonly operation: 'send' | 'recv';
+      }
+    | {
+        readonly kind: 'child_wait';
+        readonly child: Pid;
+      };
+  /**
+   * PID/TID order. Resource requests group one holder's eligible actors; sync
+   * and mailbox waits group alternative releasers/signallers; child waits use
+   * one required child actor per dependency. Instance thresholds are proved by
+   * the multi-instance detector, not by treating holders as interchangeable.
+   */
+  readonly alternatives: readonly DeadlockSnapshotActor[];
+};
 
 /** WP-07 synchronization continuation. Plain versioned data, not a live view. */
 export interface SyncSnapshotState {
