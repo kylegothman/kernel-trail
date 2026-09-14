@@ -508,8 +508,10 @@ against. It is not a leg and it must not import anything from `src/world/` or
    `/0x[0-9a-fA-F]{6}\b/` and `/#[0-9a-fA-F]{3,8}\b/`.
 7. `gainFor('amber', 'active')` returns `2.3125` and `gainFor('cyan', 'active')`
    returns `1.85`.
-8. Every text token pair in visual bible 2.6 meets its stated contrast ratio,
-   computed in `tests/design/contrast.test.ts` and asserted against the table.
+8. Every text token pair in visual bible 2.6 meets its stated contrast floor
+   (the corrected table of 2026-09-14), computed in
+   `tests/design/contrast.test.ts` and asserted against the table, plus the
+   worst-case backing-plate bound stated in 2.6 rule 2.
 9. Every semantic token in visual bible 2.4 carries a shape or pattern channel in
    addition to its colour. Asserted for all of them.
 10. `PROFILES` has one entry per tier and every row of the visual bible 13.1
@@ -520,8 +522,11 @@ against. It is not a leg and it must not import anything from `src/world/` or
     throwing benchmark.
 12. Bloom threshold is 1.15 and bloom strength is 0.055 at every tier, asserted
     for all three.
-13. The post chain builds all fourteen passes in the documented order at high
-    tier, and the documented reduced set at medium and low. Asserted by
+13. The post chain builds the thirteen GPU stages of visual bible 4.1 in the
+    documented order at high tier (entry 14, the HUD, is DOM and is not a
+    pass), composite kept as stage 8 and stages 9 to 12 merged in the
+    shipping build, SMAA inserted after tone mapping and before the text
+    stage at medium, and the documented reduced set at low. Asserted by
     inspecting the constructed pass list.
 14. Every intermediate render target is `HalfFloatType`. Asserted across the
     whole chain at all three tiers.
@@ -697,4 +702,112 @@ the text above, this section wins.
   approved amendment commit) and `scripts/**` are untouched.
 - **`src/world/`** already holds scaffold for `EffectPool.ts` and
   `WorldEventRouter.ts`; they are WP-13's and WP-14's, not yours.
+
+## Pre-flight decisions 2026-09-14
+
+The WP-12 agent's pre-flight mapped all twenty-two acceptance criteria against
+the scaffold, the visual bible (V), the architecture document (A) and Three
+0.185.0 as installed, and raised fifteen decisions. Every Three.js claim was
+re-checked against a clean install of 0.185.0 (PostProcessing deprecated in
+favour of RenderPipeline since r183, `agxToneMapping` exported from
+`three/tsl`, `onBeforeCompile` WebGL-only, EffectComposer WebGL-only, SMAA's
+two embedded PNG lookups, `info.render.drawCalls`), and the contrast table was
+recomputed independently; the agent's numbers are exact. All fifteen are
+approved as below. The V corrections were applied in the same commit; A is
+corrected by this section where noted.
+
+1. **Quality authority.** V 13.1 governs the look at each tier (AA method,
+   volumetrics, grading, pass order). A's capacity limits (instance ceilings,
+   draw-call and triangle budgets, memory) are retained where they do not
+   conflict. Shadows off everywhere. The scaffold's FXAA/TAA, three-mip low
+   bloom, medium volumetrics and high shadow maps are replaced.
+2. **HDR and memory.** Every intermediate colour buffer is half-float
+   (acceptance 14); the resolved depth is R32F and the final output and text
+   stage are RGBA8, as V 4.1 says. A WebGL2 device without
+   `EXT_color_buffer_float` takes A 5.4's RGBA8 plus Reinhard pre-tonemap
+   path, reported as `hdr: false` in capabilities; acceptance 14 is asserted
+   on HDR-capable paths and the fallback is asserted separately. One common
+   210 MiB render-target ceiling from A 7.2, met at lower tiers by
+   aspect-preserving resolution reduction, not three ceilings. Sample counts
+   are 1 or 4; a request of 2 rounds up to 4 on WebGPU and is honoured on
+   WebGL2 only where `MAX_SAMPLES` allows.
+3. **Strategy groups, not a literal four.** The backend branches on
+   capabilities in named strategy groups (MSAA, particle integration,
+   volumetric ceiling, GPU timer, HDR format, instance storage, depth
+   prepass); report the count. The "fifth branch" rule in the package text
+   meant unnamed conditionals scattered through the backend, and that rule
+   stands.
+4. **Thirteen GPU stages.** Fourteen conceptual entries, thirteen GPU stages;
+   no fabricated HUD pass. Composite stays stage 8; 9 to 12 merge in the
+   shipping build and stay separate in debug. Medium-tier SMAA runs after
+   tone mapping and before the text stage. Acceptance 13 was corrected.
+5. **Node materials and RenderPipeline.** The unified path uses TSL node
+   materials and `RenderPipeline`; the printed GLSL in V 3 is the equation
+   source, not the implementation. "Only the material factory constructs
+   materials" is scoped to application-owned materials; Three's internal
+   post materials are exempt.
+6. **SMAA lookups.** Three's two embedded SMAA lookup textures are approved
+   as an explicit exception to V 12.5, recorded there. No FXAA substitution
+   at medium.
+7. **Contrast.** V 2.6's table now carries the computed floors truncated to
+   one decimal; the backing plate is `rgba(4, 6, 10, 0.92)` with its
+   precondition stated (background at or below display luminance 0.15 under
+   rule 1) and a worst-case AAA assertion. `scripts/verify-contrast.ts` does
+   not exist; the Node test is the enforcement mechanism.
+8. **Bloom.** 1.15 and 0.055 at every tier in normal operation, with exactly
+   two documented exceptions: kernel panic (V 4.6: 0.35 and 0.22 for 900 ms)
+   and the `reducedBloom` accessibility setting (V: threshold 1.6, strength
+   halved). Exposure stays 1.0; the panic black cut is a separate fade. V
+   4.5's gain-equals-luminance explanation was corrected; the shader is
+   unchanged.
+9. **Instance contract.** Keep the existing handle fields (`matrices`,
+   `colours`, `state`) for compatibility and add the three packed vec4
+   attributes of the `InstanceData` layout plus explicit per-channel dirty
+   marking (`touch(from, to, channel?)`). This is the public interface WP-13
+   and WP-14 build against; document it in the report.
+10. **Layers.** A 5.6's semantic layers 1 to 8 are the convention; the
+    scaffold's 0/1/2 assignment is replaced and exported from tokens.
+    Render-side validators (layer membership, the ninth-repeated-mesh check,
+    the transparency depth check) are yours; invoking them during stage
+    construction is WP-13's.
+11. **Benchmark and tier selection.** A 6.3's representative benchmark (3000
+    slabs, 6000 particles, medium post, 960x600, 12 warm-up plus 30 measured,
+    median), with renderer work injected into platform so platform stays a
+    leaf. Evidence order: cache, explicit user choice, benchmark, throwing
+    benchmark falls to medium. Add the explicit-choice input and the
+    capability cache; remove the scaffold's memory veto and the governor's
+    unspecified history and initial-cooldown additions.
+12. **Recovery.** One same-backend rebuild attempt through an injected host
+    callback; if the lost backend was WebGPU and the rebuild fails, one
+    attempt with `forceWebGL`; then the recoverable card. This supersedes
+    A 10.3's two attempts. The card, loop throttling, world reconstruction
+    and HUD are downstream and are demonstrated with the probe host only.
+13. **Bootstrap.** Minimal edits to `src/main.ts` (currently 245-279 and its
+    import block) to replace hex and rgba literals with token-derived CSS
+    values, so acceptance 6 holds across `src/`.
+14. **Configuration.** Bare `@design`, `@platform` and `@render` aliases in
+    tsconfig and vitest; `playwright` as a dev dependency; the `test:gpu`
+    script and helpers under `tests/render/gpu/`; `.gpu.ts` files excluded
+    from `npm test` by the existing include pattern. Node environment,
+    timeouts and kernel coverage unchanged.
+15. **Text and derived tokens.** Add `troika-three-text` (with typings) and
+    `@fontsource/jetbrains-mono` and `@fontsource/jost` as dependencies; the
+    `holoLabel` material and glyph atlas loading are yours, label placement
+    and layout are WP-13's. The scaffold's sixth `off` gain, the void
+    corruption placeholder and the documented derived glyph and dash mappings
+    are ratified as tokens. V 7's `micro` style is raised to 0.8125rem so the
+    13-device-pixel floor holds at DPR 1.
+
+Also approved: the exact pin to `three@0.185.0` (the lockfile currently
+resolves 0.185.1; regenerate it), and the six scaffold paths kept as they are.
+
+### Not granted
+
+- No edit under `src/kernel`, `src/game`, `src/world`, `tests/kernel`,
+  `scripts/`, or `contracts.lock.json` outside the approved tokens freeze.
+- No `it.skip` for a missing GPU context anywhere in `npm test`.
+- No CPU timing reported as GPU timing.
+- No dependency beyond `three`, `@webgpu/types`, `playwright`,
+  `troika-three-text` and the two font packages without a pre-flight
+  amendment.
 

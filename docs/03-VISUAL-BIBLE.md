@@ -433,28 +433,36 @@ accessibility mode cannot rot without failing CI.
 ### 2.6 Contrast ratios for text
 
 All ratios are against `VOID.base` (`#04060A`, relative luminance 0.00178). WCAG 2.1
-contrast ratio, computed at build time by `scripts/verify-contrast.ts`, which fails the
-build if any text token drops below its stated floor.
+contrast ratio, computed and asserted by `tests/design/contrast.test.ts`, which fails
+`npm test` if any text token drops below its stated floor. The floors below are the
+computed values truncated to one decimal (corrected 2026-09-14; the earlier figures
+were approximations and two of them were wrong in the other direction).
 
 | Token | Hex | Ratio vs void | Permitted use |
 |---|---|---|---|
-| `SLATE.primary` | `#E8F4FF` | 17.4:1 | any text at any size |
-| `CYAN.white` | `#D6F7FF` | 18.0:1 | any text at any size |
-| `AMBER.white` | `#FFE0B0` | 16.0:1 | any text at any size |
-| `CYAN.core` | `#5FD7F5` | 12.1:1 | any text at any size |
-| `AMBER.core` | `#FF9A2E` | 9.6:1 | any text at any size |
-| `SLATE.protected` | `#9FB4C4` | 9.5:1 | any text at any size |
+| `SLATE.primary` | `#E8F4FF` | 18.1:1 | any text at any size |
+| `CYAN.white` | `#D6F7FF` | 17.9:1 | any text at any size |
+| `AMBER.white` | `#FFE0B0` | 15.9:1 | any text at any size |
+| `CYAN.core` | `#5FD7F5` | 12.0:1 | any text at any size |
+| `AMBER.core` | `#FF9A2E` | 9.5:1 | any text at any size |
+| `SLATE.protected` | `#9FB4C4` | 9.4:1 | any text at any size |
 | `SLATE.secondary` | `#6B7A88` | 4.6:1 | body text 14 px and above only |
 | `CYAN.dim` | `#2F8FA8` | 5.4:1 | body text 14 px and above only |
-| `AMBER.dim` | `#7A3C06` | 1.9:1 | **never text.** Fill and outline only. |
-| `SLATE.outline` | `#39434D` | 1.6:1 | **never text.** |
+| `AMBER.dim` | `#7A3C06` | 2.3:1 | **never text.** Fill and outline only. |
+| `SLATE.outline` | `#39434D` | 2.0:1 | **never text.** |
 
 Three additional rules keep those ratios true in practice:
 
 1. Text is never drawn over an emissive panel whose gain exceeds `EMISSIVE_GAIN.dim`. If
    a label must sit over a bright surface, the backing plate in section 7.5 goes under it.
-2. The backing plate is `rgba(4, 6, 10, 0.72)`, which holds the local background luminance
-   below 0.012 regardless of what is behind it, so the table above remains accurate.
+2. The backing plate is `rgba(4, 6, 10, 0.92)`. No plate can bound the background
+   independently of what lies behind it (the old 0.72 plate over linear white left
+   `SLATE.primary` at about 2.8:1), so the guarantee is stated with its precondition:
+   rule 1 caps whatever is under a label at the `dim` gain, which after tone mapping is a
+   display luminance of at most 0.15, and over any background at or below 0.15 the 0.92
+   plate holds the local luminance at or below 0.014. Under that bound every "any text"
+   token in the table stays above 7:1 (AAA), and `tests/design/contrast.test.ts` asserts
+   the worst case for each of them.
 3. Text is rendered after tone mapping and after bloom (section 4.7), so bloom never lifts
    the background behind a glyph.
 ---
@@ -961,9 +969,13 @@ void main() {
 }
 ```
 
-The threshold at 1.15 is chosen against `EMISSIVE_GAIN`. `ambient` (0.45) and `dim` (1.10)
-sit below it and never bloom. `active` (1.85) sits comfortably above and produces a tight
-halo. `hot` (3.20) and `critical` (4.60) produce the flares. This is why the grid floor and
+The threshold at 1.15 is chosen against `EMISSIVE_GAIN`, but the bright pass compares
+scene-referred luminance, not gain, and the soft knee (0.55) starts contributing at
+1.15 - 0.55 = 0.60. So `ambient` (0.45) never blooms; `dim` (1.10) on the brightest core
+colours barely reaches the knee's foot; `active` (1.85) on `CYAN.core` has luminance about
+1.07, inside the knee, and produces a soft, partial halo; `hot` (3.20) and `critical`
+(4.60) clear the threshold outright and produce the flares. (Corrected 2026-09-14: the
+earlier text equated gain with luminance.) This is why the grid floor and
 idle structure stay crisp while working structure glows, and it is why changing the gain
 table without revisiting the threshold breaks the whole image.
 
@@ -1812,7 +1824,7 @@ Screen-space, in rem against a 16 px root.
 | `body` | 0.9375rem | 1.55 | 0.0em | Jost 400 | Narrative prose, man pages' prose sections |
 | `data` | 0.8125rem | 1.40 | 0.02em | JetBrains Mono 400 | HUD values, terminal output, all numbers |
 | `dataEmphasis` | 0.8125rem | 1.40 | 0.02em | JetBrains Mono 700 | Values that changed this tick |
-| `micro` | 0.6875rem | 1.30 | 0.06em | JetBrains Mono 400 | Chip labels, axis ticks. Uppercase only. |
+| `micro` | 0.8125rem | 1.30 | 0.06em | JetBrains Mono 400 | Chip labels, axis ticks. Uppercase only. (Raised from 0.6875rem on 2026-09-14: 11 px violated the 13-device-pixel floor in 13.2 at DPR 1.) |
 
 Positive tracking on the monospace tokens is deliberate. Monospace at small sizes against a
 black background with bloom in the frame tends to close up, and 0.02em opens the counters
@@ -2827,8 +2839,10 @@ depth pass per light.
 
 - Zero image files ship other than the two web font files. There are no textures.
 - The only GPU textures allocated at runtime are the render targets, the SDF glyph atlases
-  generated by troika from the loaded fonts, and (optionally) the 8x8 Bayer `DataTexture`
-  from 4.9.
+  generated by troika from the loaded fonts, (optionally) the 8x8 Bayer `DataTexture`
+  from 4.9, and the two small area and search lookup textures that Three's SMAA pass
+  embeds as data URIs for the medium tier. Those two are lookup tables, not art, and they
+  ship inside Three's JavaScript rather than as image files.
 - Every geometry generator returns a shared, cached `BufferGeometry`. Two stele in the same
   leg reference the same geometry object.
 - Geometry is disposed in `LegStage.dispose()` and a leak test asserts that
@@ -2841,7 +2855,8 @@ depth pass per light.
 ## 13. Quality tiers
 
 Detected in `src/platform/capability.ts` from renderer string, maximum texture size, WebGPU
-availability, `deviceMemory`, and a 60-frame startup benchmark. The player can override the
+availability, `deviceMemory`, and the startup benchmark of architecture 6.3 (12 warm-up
+frames discarded, 30 measured, median taken). The player can override the
 detected tier at any time and the change takes effect without a reload.
 
 ### 13.1 The table
