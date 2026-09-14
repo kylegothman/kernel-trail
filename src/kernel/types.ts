@@ -738,7 +738,8 @@ export interface SubsystemSnapshots {
   /** Amendment 3. Demand paging state distinct from the frame table: the working
    *  set window, the replacement policy's own ordering, and the fault counters. */
   readonly vm?: VmSnapshotState;
-  readonly sync?: SubsystemEnvelope;
+  /** Amendment 7. Synchronisation continuation: primitives, waits, memory order, race detector and scenario state. */
+  readonly sync?: SyncSnapshotState;
   /** Amendment 3. Detection interval position and the wait-for graph edges that
    *  are not recoverable from the resource table alone. */
   readonly deadlock?: SubsystemEnvelope;
@@ -748,6 +749,347 @@ export interface SubsystemSnapshots {
   readonly fs?: SubsystemEnvelope;
   readonly security?: SubsystemEnvelope;
 }
+
+/** WP-07 synchronization continuation. Plain versioned data, not a live view. */
+export interface SyncSnapshotState {
+  readonly owner: 'sync';
+  readonly version: 1;
+  readonly payload: {
+    readonly tick: Tick;
+    readonly settings: {
+      readonly progressStallLimit: number;
+      readonly boundedWaitLimit: number;
+      readonly spinWaitTicks: number;
+      readonly storeBufferDepth: number;
+      readonly priorityInheritance: boolean;
+      readonly rwlockPolicy: 'reader_pref' | 'writer_pref' | 'fair';
+      readonly starvationThreshold: number;
+      readonly starvationFatalThreshold: number;
+    };
+    readonly nextWaitGeneration: number;
+    readonly nextPermitId: number;
+    readonly lastTimerTick: Tick | null;
+    readonly lastInversionTick: Tick | null;
+    /** Resource ID order; detailed records produce the shared PID projections. */
+    readonly primitives: readonly SyncSnapshotPrimitive[];
+    readonly waits: readonly SyncSnapshotWait[];
+    readonly reservations: readonly {
+      readonly waitGeneration: number;
+      readonly grantedAt: Tick;
+    }[];
+    readonly requirements: readonly {
+      readonly resource: ResourceId;
+      readonly capacity: number;
+      readonly mode: 'enforce' | 'observe';
+      readonly criticalActors: readonly SyncSnapshotActor[];
+      readonly mutualExclusionViolations: number;
+      readonly progressFreeSince: Tick | null;
+      readonly progressReported: boolean;
+    }[];
+    readonly priorities: readonly {
+      readonly pid: Pid;
+      readonly ordinaryPriority: number;
+      readonly donations: readonly {
+        readonly resource: ResourceId;
+        readonly ownerTid: Tid;
+        readonly waitGeneration: number;
+        readonly priority: number;
+      }[];
+    }[];
+    readonly inversions: readonly {
+      readonly blocked: Pid;
+      readonly holder: Pid;
+      readonly interposed: Pid;
+    }[];
+    readonly memoryOrder: SyncSnapshotMemoryOrder;
+    readonly raceDetector: {
+      readonly nextAccessId: number;
+      readonly cells: readonly SyncSnapshotRaceCell[];
+    };
+    readonly atomicLocks: readonly SyncSnapshotAtomicLock[];
+    /** Cumulative PID totals survive an individual thread's join. */
+    readonly spinTicks: readonly (readonly [Pid, number])[];
+    readonly actors: readonly SyncSnapshotExecution[];
+    readonly scenarios: readonly SyncSnapshotScenario[];
+  };
+}
+
+export type SyncSnapshotActor = {
+  readonly pid: Pid;
+  readonly tid: Tid;
+};
+
+export type SyncSnapshotWait = {
+  /** Unique episode ID; fair RW admission uses this ticket order. */
+  readonly generation: number;
+  readonly actor: SyncSnapshotActor;
+  readonly resource: ResourceId;
+  readonly operation:
+    | { readonly kind: 'mutex' | 'semaphore' | 'monitor_entry' | 'rw_read' | 'rw_write' | 'spin' }
+    | { readonly kind: 'condition'; readonly condition: string }
+    | { readonly kind: 'barrier'; readonly barrierGeneration: number };
+  readonly requestedAt: Tick;
+  readonly entriesObserved: number;
+  readonly boundedWarningEmitted: boolean;
+  readonly starvationWarningEmitted: boolean;
+  readonly starvationFatalEmitted: boolean;
+};
+
+export type SyncSnapshotPrimitive = {
+  readonly id: ResourceId;
+  readonly displayName: string;
+  readonly capacity: number;
+  readonly ordered: boolean;
+} & (
+  | {
+      readonly kind: 'mutex';
+      readonly owner: SyncSnapshotActor | null;
+      /** Queue arrays contain wait generations, in head-to-tail order. */
+      readonly entryQueue: readonly number[];
+    }
+  | {
+      readonly kind: 'semaphore';
+      readonly initialValue: number;
+      /** Oldest first; null attribution never removes the debit. */
+      readonly debits: readonly {
+        readonly id: number;
+        readonly actor: SyncSnapshotActor | null;
+      }[];
+      readonly waitQueue: readonly number[];
+    }
+  | {
+      readonly kind: 'monitor';
+      readonly owner: SyncSnapshotActor | null;
+      readonly signalDiscipline: 'signal_and_continue' | 'signal_and_wait';
+      readonly entryQueue: readonly number[];
+      readonly conditions: readonly {
+        readonly name: string;
+        readonly waitQueue: readonly number[];
+      }[];
+    }
+  | {
+      readonly kind: 'rwlock';
+      readonly policy: 'reader_pref' | 'writer_pref' | 'fair';
+      readonly writer: SyncSnapshotActor | null;
+      readonly readers: readonly SyncSnapshotActor[];
+      readonly waitQueue: readonly number[];
+    }
+  | {
+      readonly kind: 'barrier';
+      readonly generation: number;
+      readonly arrivals: readonly number[];
+    }
+);
+
+/** Only local control cells store a value here; external owners restore theirs. */
+export type SyncSnapshotCell =
+  | { readonly id: string; readonly kind: 'control'; readonly value: number }
+  | { readonly id: string; readonly kind: 'region'; readonly region: ResourceId }
+  | { readonly id: string; readonly kind: 'inode'; readonly inode: InodeId; readonly field: string };
+
+export type SyncSnapshotMemoryOrder = {
+  readonly cells: readonly SyncSnapshotCell[];
+  readonly nextWriteId: number;
+  readonly buffers: readonly {
+    readonly pid: Pid;
+    readonly reordering: boolean;
+    readonly depth: number;
+    readonly attemptResidue: number;
+    /** Issue order is authoritative; draining shuffles eligible heads only. */
+    readonly writes: readonly {
+      readonly id: number;
+      readonly actor: SyncSnapshotActor;
+      readonly cell: string;
+      readonly value: number;
+      readonly issuedAt: Tick;
+      readonly held: readonly ResourceId[];
+      /** Explicit RMW load-access ID, or null for plain/control stores. */
+      readonly rmw: number | null;
+    }[];
+  }[];
+};
+
+export type SyncSnapshotAccess = {
+  /** Global access order also distinguishes multiple accesses in one tick. */
+  readonly id: number;
+  readonly tick: Tick;
+  readonly actor: SyncSnapshotActor;
+  readonly op: 'load' | 'store';
+  readonly value: number;
+  readonly atomic: boolean;
+  readonly held: readonly ResourceId[];
+  readonly rmw: number | null;
+};
+
+export type SyncSnapshotRaceCell = {
+  readonly cell: string;
+  readonly serialValue: number;
+  readonly lockSet: readonly ResourceId[] | null;
+  /** Oldest first, at most 32 records. */
+  readonly history: readonly SyncSnapshotAccess[];
+  /** Each category retains at most two distinct actor representatives. */
+  readonly observed: {
+    readonly plainReads: readonly SyncSnapshotAccess[];
+    readonly plainWrites: readonly SyncSnapshotAccess[];
+    readonly atomicReads: readonly SyncSnapshotAccess[];
+    readonly atomicWrites: readonly SyncSnapshotAccess[];
+  };
+  readonly episodeOrigin: SyncSnapshotAccess | null;
+  readonly pending: readonly {
+    /** The load's access ID identifies this RMW until its store commits. */
+    readonly load: SyncSnapshotAccess;
+    readonly writeId: number | null;
+    /** At most one competing completed operation per pending RMW. */
+    readonly witness: {
+      readonly load: SyncSnapshotAccess | null;
+      readonly store: SyncSnapshotAccess;
+    } | null;
+  }[];
+};
+
+export type SyncSnapshotAtomicLock = {
+  readonly resource: ResourceId;
+  readonly lockCell: string;
+  readonly algorithm: 'tas' | 'cas_bounded';
+  readonly owner: SyncSnapshotActor | null;
+  /** Cyclic algorithm order, not PID sorting. */
+  readonly contenders: readonly {
+    readonly actor: SyncSnapshotActor;
+    readonly waiting: boolean;
+  }[];
+  readonly handoff: SyncSnapshotActor | null;
+};
+
+/** TCB state owns the program counter; these are instruction-local operands. */
+export type SyncSnapshotExecution = {
+  readonly actor: SyncSnapshotActor;
+  readonly scenario: string | null;
+  readonly registers: readonly (readonly [string, number])[];
+  /** Positive while useful item/read/think/eat work is in progress. */
+  readonly remainingWork: number | null;
+  readonly spin: {
+    readonly resource: ResourceId;
+    readonly elapsedTicks: number;
+  } | null;
+};
+
+export type SyncSnapshotScenario =
+  | {
+      readonly kind: 'bounded_buffer';
+      readonly id: string;
+      readonly variant: 'correct' | 'wrong_order' | 'unbalanced';
+      readonly capacity: number;
+      readonly mutex: ResourceId;
+      readonly empty: ResourceId;
+      readonly full: ResourceId;
+      readonly cell: string;
+      readonly items: readonly number[];
+      readonly produced: number;
+      readonly consumed: number;
+      readonly inFlight: number;
+      /** Each reservation names its source counting-semaphore debit. */
+      readonly reservations: readonly {
+        readonly permitId: number;
+        readonly actor: SyncSnapshotActor | null;
+        readonly role: 'producer' | 'consumer';
+        readonly itemApplied: boolean;
+      }[];
+      readonly actors: readonly {
+        readonly actor: SyncSnapshotActor;
+        readonly role: 'producer' | 'consumer';
+        readonly targetItems: number;
+        readonly workTicks: number;
+        readonly completedItems: number;
+      }[];
+    }
+  | {
+      readonly kind: 'readers_writers';
+      readonly id: string;
+      readonly policy: 'reader_pref' | 'writer_pref' | 'fair';
+      readonly cell: string;
+      readonly bindings:
+        | { readonly kind: 'semaphores'; readonly mutex: ResourceId; readonly rwMutex: ResourceId; readonly readCountCell: string }
+        | { readonly kind: 'rwlock'; readonly rwlock: ResourceId };
+      readonly actors: readonly {
+        readonly actor: SyncSnapshotActor;
+        readonly role: 'reader' | 'writer';
+        readonly workTicks: number;
+        readonly iterationLimit: number | null;
+        readonly completedOperations: number;
+        readonly waitStartedAt: Tick | null;
+        readonly worstWait: number;
+        readonly outcome: 'active' | 'completed' | 'starved' | 'cancelled';
+      }[];
+    }
+  | {
+      readonly kind: 'philosophers';
+      readonly id: string;
+      readonly solution: 'naive' | 'asymmetric' | 'room' | 'monitor';
+      readonly rendezvous: ResourceId;
+      readonly bindings:
+        | { readonly kind: 'chopsticks'; readonly chopsticks: readonly [ResourceId, ResourceId, ResourceId, ResourceId, ResourceId]; readonly room: ResourceId | null }
+        | { readonly kind: 'monitor'; readonly monitor: ResourceId; readonly conditions: readonly [string, string, string, string, string] };
+      /** Exactly five records, in philosopher index order. */
+      readonly actors: readonly {
+        readonly actor: SyncSnapshotActor;
+        readonly state: 'thinking' | 'hungry' | 'eating';
+        readonly hungrySince: Tick | null;
+        readonly meals: number;
+        readonly worstWait: number;
+      }[];
+    }
+  | {
+      readonly kind: 'peterson';
+      readonly id: string;
+      readonly actors: readonly [SyncSnapshotActor, SyncSnapshotActor];
+      readonly flagCells: readonly [string, string];
+      readonly turnCell: string;
+      readonly counterCell: string;
+      readonly requirement: ResourceId;
+      readonly fenced: boolean;
+      readonly entries: readonly [number, number];
+    }
+  | {
+      readonly kind: 'counter';
+      readonly id: string;
+      readonly cell: string;
+      readonly protection:
+        | { readonly kind: 'unprotected' | 'cas' }
+        | { readonly kind: 'mutex'; readonly mutex: ResourceId };
+      readonly actors: readonly {
+        readonly actor: SyncSnapshotActor;
+        readonly increments: number;
+        readonly incrementBy: number;
+        readonly completedIncrements: number;
+      }[];
+    }
+  | {
+      readonly kind: 'spinlock';
+      readonly id: string;
+      /** References the atomic lock record, including its ordered roster. */
+      readonly resource: ResourceId;
+      readonly criticalTicks: number;
+      readonly remainderTicks: number;
+      readonly iterationLimit: number | null;
+      readonly actors: readonly {
+        readonly actor: SyncSnapshotActor;
+        readonly completedEntries: number;
+      }[];
+    }
+  | {
+      readonly kind: 'monitor_predicate';
+      readonly id: string;
+      readonly check: 'while' | 'if';
+      readonly monitor: ResourceId;
+      readonly condition: string;
+      readonly predicateCell: string;
+      readonly actors: readonly {
+        readonly actor: SyncSnapshotActor;
+        readonly role: 'waiter' | 'signaller' | 'barger';
+      }[];
+      readonly successfulEntries: number;
+      readonly falsePredicateEntries: number;
+    };
 
 /** Persistent scheduler state. Distinct from the per-tick SchedulerSnapshot view. */
 export interface SchedulerSnapshotState {
