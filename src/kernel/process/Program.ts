@@ -1,9 +1,11 @@
 import type { DeviceId, PageId, ResourceId, Rng, SyscallRequest, Tid } from '../types';
 import { asPageId } from '../types';
 import { LocalityGenerator, type LocalityOptions } from '../memory/locality';
+import { freezeSyncInstruction, type SyncInstruction } from '../sync/SyncSubsystem';
 
 export type Instruction =
   | { kind: 'compute' }
+  | { kind: 'sync'; operation: SyncInstruction }
   | { kind: 'access'; page: PageId; write: boolean }
   | { kind: 'syscall'; call: SyscallRequest }
   | { kind: 'io'; device: DeviceId }
@@ -37,7 +39,9 @@ export function instructionProgram(
 ): Program {
   const saved = instructions.map(instruction => instruction.kind === 'syscall'
     ? Object.freeze({ ...instruction, call: Object.freeze({ ...instruction.call, args: Object.freeze([...instruction.call.args]) }) })
-    : Object.freeze({ ...instruction }));
+    : instruction.kind === 'sync'
+      ? Object.freeze({ ...instruction, operation: freezeSyncInstruction(instruction.operation) })
+      : Object.freeze({ ...instruction }));
   const references = referenceString === null ? null : Object.freeze([...referenceString]);
   return Object.freeze({
     length: saved.length,

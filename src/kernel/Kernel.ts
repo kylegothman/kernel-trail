@@ -11,9 +11,10 @@ import { ProcessTable } from './process/ProcessTable';
 import { transition, type TransitionOptions } from './process/transitions';
 import { ProcessLifecycle, type CowCapacity } from './process/lifecycle';
 import { ThreadManager, type ThreadControlBlock } from './process/threads';
-import { generatedProgram, scriptedProgram, instructionProgram, type Program, type ProgramSpec } from './process/Program';
+import { generatedProgram, scriptedProgram, instructionProgram, type Program, type ProgramSpec, type Instruction } from './process/Program';
 import { IpcManager } from './process/ipc';
 import { MemorySubsystem } from './memory/MemorySubsystem';
+import { SyncSubsystem } from './sync/SyncSubsystem';
 import type { SuspendedProcess } from './memory/demandPaging';
 import type {
   AddressSpaceId,
@@ -117,7 +118,7 @@ export interface MemoryHooks {
 }
 export interface SyncHooks {
   expireTimers(tick: Tick): void;
-  isSatisfied(pid: Pid, reason: BlockReason): boolean;
+  isSatisfied(pid: Pid, reason: BlockReason, tid?: Tid): boolean;
   acquire(pid: Pid, resource: ResourceId): void;
   release(pid: Pid, resource: ResourceId): void;
   releaseAll(pcb: ProcessControlBlock): void;
@@ -169,6 +170,7 @@ export class KernelImpl implements Kernel {
   readonly lifecycle: ProcessLifecycle;
   readonly ipc: IpcManager;
   readonly memorySubsystem: MemorySubsystem;
+  readonly syncSubsystem: SyncSubsystem;
   private readonly snapshotHooks: SnapshotHooks[] = [];
   readonly pageTables = new Map<AddressSpaceId, PageTableEntry[]>();
   private currentTick = asTick(0);
@@ -211,7 +213,6 @@ export class KernelImpl implements Kernel {
   private readonly devBuild: boolean;
 
   private memory: MemoryHooks;
-  // TODO(astra): WP-07 supplies ordered synchronization waits and condition timers.
   private sync: SyncHooks = { expireTimers: noop, isSatisfied: () => false,
     acquire: noop, release: noop, releaseAll: noop, removeWaiter: noop };
   // TODO(astra): WP-09 supplies completion, interrupt and device wait handling.
@@ -226,7 +227,7 @@ export class KernelImpl implements Kernel {
   // TODO(astra): WP-08 supplies periodic wait-for graph detection.
   private deadlock: DeadlockHooks = { maybeDetect: noop };
   private schedulerHooks: SchedulerHooks = createSchedulerHooks(() => this.scheduler, {
-    emit: event => this.publish(event),
+    emit: event => this.syncSubsystem.withEffectivePriorities(() => this.publish(event)),
     terminate: pcb => {
       this.schedulingAccounting.complete(pcb, asTick(this.tick - 1));
       this.lifecycle.exit(pcb, -1, 'starvation');
@@ -310,7 +311,7 @@ export class KernelImpl implements Kernel {
       },
       clearThreads: pcb => this.threads.clear(pcb),
       programNamed: name => this.namedPrograms.get(name),
-      detachIpc: pcb => { this.ipc.removeProcess(pcb.pid); this.memorySubsystem.detachAddressSpace(pcb.addressSpaceId); },
+      detachIpc: pcb => { this.syncSubsystem.exec(pcb.pid); this.ipc.removeProcess(pcb.pid); this.memorySubsystem.detachAddressSpace(pcb.addressSpaceId); },
       replaceProgram: (pcb, program) => {
         this.programs.set(pcb.pid, program);
         this.burstSizes.set(pcb.pid, program.length);
@@ -342,6 +343,47 @@ export class KernelImpl implements Kernel {
       onSharedMap: (pid, mapping) => memory.sharedMapped(pid, mapping),
       onSharedUnmap: (pid, mapping) => memory.sharedUnmapped(pid, mapping),
     });
+    const syncRng = this.rng.streams.get('sync');
+    if (syncRng === undefined) throw new Error('sync RNG stream missing');
+    this.syncSubsystem = new SyncSubsystem({
+      tick: () => this.tick, process: pid => this.table.get(pid), processes: () => this.table.processes,
+      originalWait: actor => this.memorySubsystem.pager.control.suspendedRecords.find(row => row.pid === actor.pid)?.threads.find(row => row.tid === actor.tid)?.blockedOn ?? undefined,
+      thread: tid => this.threads.table.get(tid), actor: pid => {
+        const pcb = this.table.get(pid); const tid = pcb === undefined ? undefined
+          : this.executingThread !== undefined && pcb.threads.includes(this.executingThread) ? this.executingThread : pcb.threads[0];
+        return tid === undefined ? undefined : { pid, tid };
+      },
+      block: (pid, reason, tid) => this.blockProcess(pid, reason, tid), emit: event => this.publish(event),
+      terminate: pid => { const pcb = this.table.get(pid); if (pcb !== undefined) {
+        this.schedulingAccounting.complete(pcb, asTick(this.tick - 1)); this.lifecycle.exit(pcb, -1, 'starvation');
+      } },
+      complete: pid => { const pcb = this.table.get(pid); if (pcb !== undefined) this.exitProcess(pcb, 0); },
+      settings: () => ({ progressStallLimit: this.tuning.progressStallLimit, boundedWaitLimit: this.tuning.boundedWaitLimit,
+        spinWaitTicks: this.tuning.spinWaitTicks, storeBufferDepth: this.tuning.storeBufferDepth,
+        priorityInheritance: this.tuning.priorityInheritance, rwlockPolicy: this.tuning.rwlockPolicy,
+        starvationThreshold: this.schedulerParams.starvationThreshold, starvationFatalThreshold: this.schedulerParams.starvationFatalThreshold }),
+      cell: binding => {
+        if (binding.kind === 'region') {
+          const region = this.ipc.sharedRegion(binding.region);
+          return region === undefined ? undefined : { get: () => region.value, set: value => { region.value = value; } };
+        }
+        const inode = this.inodes.find(item => item.id === binding.inode);
+        if (inode === undefined || typeof Reflect.get(inode, binding.field) !== 'number') return undefined;
+        return { get: () => { const value: unknown = Reflect.get(inode, binding.field);
+          if (typeof value !== 'number') throw new Error('inode cell is not numeric'); return value; },
+        set: value => { Reflect.set(inode, binding.field, value); } };
+      },
+    }, syncRng);
+    const sync = this.syncSubsystem;
+    this.sync = { expireTimers: tick => sync.expireTimers(tick), isSatisfied: (pid, reason, tid) => sync.isSatisfied(pid, reason, tid),
+      acquire: (pid, resource) => sync.acquire(pid, resource), release: (pid, resource) => sync.release(pid, resource),
+      releaseAll: pcb => sync.releaseAll(pcb), removeWaiter: pid => sync.removeWaiter(pid) };
+    this.snapshotHooks.push({ saveState: () => sync.saveState(), restoreState: snapshot => sync.prepareKernelRestore(snapshot) });
+    this.events.onAny(event => sync.observe(event));
+    const schedulerHooks = this.schedulerHooks;
+    this.schedulerHooks = { ageAndDetectStarvation: ctx => {
+      sync.beforeAging(); try { schedulerHooks.ageAndDetectStarvation(ctx); } finally { sync.afterAging(); }
+    } };
     this.initialiseFrameTable();
     this.initialiseSystemProcesses();
   }
@@ -470,6 +512,18 @@ export class KernelImpl implements Kernel {
         // TODO(astra): WP-11 validates ioctl arguments.
         if (arg !== 'tlb_flush') return failure('EINVAL', 'unknown kernel ioctl subcommand');
         this.memorySubsystem.flush(); return { ok: true, value: null };
+      case 'sem_wait':
+        // TODO(astra): WP-11 validates sem_wait arguments.
+        return typeof arg === 'string' && request.args.length === 1 ? this.syncSubsystem.syscall(pcb.pid, 'sem_wait', arg as ResourceId) : failure('EINVAL', 'expected a synchronization resource');
+      case 'sem_post':
+        // TODO(astra): WP-11 validates sem_post arguments.
+        return typeof arg === 'string' && request.args.length === 1 ? this.syncSubsystem.syscall(pcb.pid, 'sem_post', arg as ResourceId) : failure('EINVAL', 'expected a synchronization resource');
+      case 'mutex_lock':
+        // TODO(astra): WP-11 validates mutex_lock arguments.
+        return typeof arg === 'string' && request.args.length === 1 ? this.syncSubsystem.syscall(pcb.pid, 'mutex_lock', arg as ResourceId) : failure('EINVAL', 'expected a synchronization resource');
+      case 'mutex_unlock':
+        // TODO(astra): WP-11 validates mutex_unlock arguments.
+        return typeof arg === 'string' && request.args.length === 1 ? this.syncSubsystem.syscall(pcb.pid, 'mutex_unlock', arg as ResourceId) : failure('EINVAL', 'expected a synchronization resource');
       case 'nice':
         if (typeof arg !== 'number' || !Number.isSafeInteger(arg) || arg < 0 || arg > 39) return failure('EINVAL', 'priority must be in [0, 39]');
         pcb.priority = arg; return { ok: true, value: arg };
@@ -491,7 +545,7 @@ export class KernelImpl implements Kernel {
     if (pcb === undefined || pcb.state !== 'running') throw new KernelInvariantError(11, 'only a running process can block');
     const selected = tid ?? this.executingThread ?? pcb.threads[0];
     if (selected === undefined) throw new KernelInvariantError(7, 'blocking process has no thread');
-    const wholeProcess = this.threads.block(pcb, selected, reason);
+    const wholeProcess = this.threads.block(pcb, selected, { ...reason });
     if (wholeProcess) this.move(pcb, 'waiting', { blockReason: reason });
     else { this.threads.recompute(pcb); this.move(pcb, 'ready'); }
   }
@@ -601,7 +655,8 @@ export class KernelImpl implements Kernel {
       version: 1, tick: this.tick, seq: this.events.seq, config: cloneConfig({ ...this.config, scheduler: this.requestedScheduler, schedulerParams: this.schedulerParams }), rng: this.rng.save(),
       processes: this.processes.map(clonePcb), frames: this.frames.map(frame => ({ ...frame })),
       pageTables: [...this.pageTables].sort(([a], [b]) => a - b).map(([space, entries]) => [space, entries.map(entry => ({ ...entry }))] as const),
-      syncPrimitives: this.syncPrimitives.map(s => ({ ...s, holders: [...s.holders], waitQueue: [...s.waitQueue] })),
+      syncPrimitives: this.syncPrimitives.map(s => ({ id: s.id, kind: s.kind, displayName: s.displayName, value: s.value,
+        capacity: s.capacity, holders: [...s.holders], waitQueue: [...s.waitQueue], ordered: s.ordered })),
       resources: this.resources.map(r => ({ ...r })), diskQueue: this.diskQueue.map(r => ({ ...r })),
       diskHead: { ...this.diskHead }, devices: this.devices.map(d => ({ ...d, queue: [...d.queue] })),
       inodes: this.inodes.map(i => ({ ...i, blocks: [...i.blocks] })), journal: this.journal.map(j => ({ ...j, blocks: [...j.blocks] })),
@@ -725,7 +780,10 @@ export class KernelImpl implements Kernel {
       case 'page_fault': return (this.enabled.has('memory') || this.enabled.has('vm')) && this.memory.isSatisfied(pcb.pid, reason);
       case 'semaphore': case 'mutex': case 'condition':
         if (this.ipc.matchesWait(pcb.pid, reason)) return this.ipc.hasCompletion(pcb.pid);
-        return this.enabled.has('sync') && this.sync.isSatisfied(pcb.pid, reason);
+        {
+          const matches = pcb.threads.map(tid => this.threads.table.get(tid)).filter(thread => thread?.state === 'waiting' && thread.blockedOn === reason);
+          return matches.length === 1 && this.enabled.has('sync') && this.sync.isSatisfied(pcb.pid, reason, matches[0]?.tid);
+        }
     }
   }
   private phase05_admitNewProcesses(): void {
@@ -791,7 +849,21 @@ export class KernelImpl implements Kernel {
     const program = this.programs.get(pcb.pid);
     if (program === undefined) throw new KernelInvariantError(8, 'running process has no program');
     const instruction = program.at(thread.programCounter);
+    if (!this.enabled.has('sync')) return this.executeInstruction(pcb, thread, instruction);
+    const actor = { pid: pcb.pid, tid: thread.tid };
+    this.syncSubsystem.beginAttempt(actor);
+    try { return this.executeInstruction(pcb, thread, instruction); }
+    finally { this.syncSubsystem.endAttempt(actor); }
+  }
+  private executeInstruction(pcb: ProcessControlBlock, thread: ThreadControlBlock, instruction: Instruction): boolean {
     switch (instruction.kind) {
+      case 'sync': {
+        if (!this.enabled.has('sync')) return true;
+        const result = this.syncSubsystem.execute({ pid: pcb.pid, tid: thread.tid }, instruction.operation);
+        if (result.deferService) this.threads.deferServiceCharge();
+        if (result.target !== null) thread.programCounter = result.target;
+        return result.advance;
+      }
       case 'compute': return true;
       case 'access': {
         if (!this.enabled.has('memory') && !this.enabled.has('vm')) return true;
@@ -923,6 +995,7 @@ export class KernelImpl implements Kernel {
     this.programs.set(init.pid, instructionProgram([{ kind: 'compute' }]));
   }
   private initialiseFrameTable(): void {
+    this.syncPrimitives = this.syncSubsystem.primitives;
     this.frames = this.memorySubsystem.frameTable.frames;
     this.tlb = this.memorySubsystem.tlb.entries;
     this.rebuildFreeList();

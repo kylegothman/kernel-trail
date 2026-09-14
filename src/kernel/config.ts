@@ -26,6 +26,13 @@ export interface KernelTuning {
   readonly pffUpperBound: number;
   readonly pffLowerBound: number;
   readonly mlfqAccounting: 'per_slice' | 'cumulative';
+  readonly progressStallLimit: number;
+  /** Zero selects the contender-count bound, rather than a zero-entry limit. */
+  readonly boundedWaitLimit: number;
+  readonly spinWaitTicks: number;
+  readonly storeBufferDepth: number;
+  readonly priorityInheritance: boolean;
+  readonly rwlockPolicy: 'reader_pref' | 'writer_pref' | 'fair';
   readonly contextSwitchTicks: number;
   readonly deadlockDetectionInterval: number;
   readonly threadModel: ThreadModel;
@@ -47,6 +54,8 @@ export const DEFAULT_TUNING: KernelTuning = Object.freeze({
   thrashingSuspendInterval: 50, thrashingSuspendDuration: 100, thrashingRecoveryTicks: 100,
   thrashingControl: 'working_set', pffUpperBound: 300, pffLowerBound: 50,
   mlfqAccounting: 'per_slice',
+  progressStallLimit: 4, boundedWaitLimit: 0, spinWaitTicks: 1, storeBufferDepth: 2,
+  priorityInheritance: false, rwlockPolicy: 'writer_pref',
   contextSwitchTicks: 0, deadlockDetectionInterval: 20, threadModel: 'one_to_one',
   coreCount: 4, lwpPoolSize: 4, defaultSerialFraction: 0.25,
   degreeOfMultiprogramming: 8, checkInvariants: true,
@@ -104,6 +113,12 @@ export function resolveTuning(overrides: Partial<KernelTuning> = {}): KernelTuni
   if (!Number.isFinite(tuning.pffLowerBound) || !Number.isFinite(tuning.pffUpperBound)
     || tuning.pffLowerBound < 0 || tuning.pffUpperBound <= tuning.pffLowerBound) throw new KernelConfigError('invalid PFF bounds');
   if (!['per_slice', 'cumulative'].includes(tuning.mlfqAccounting)) throw new KernelConfigError('invalid MLFQ accounting mode');
+  integer('progressStallLimit', tuning.progressStallLimit, 1);
+  integer('boundedWaitLimit', tuning.boundedWaitLimit, 0);
+  integer('spinWaitTicks', tuning.spinWaitTicks, 1);
+  integer('storeBufferDepth', tuning.storeBufferDepth, 1);
+  if (typeof tuning.priorityInheritance !== 'boolean') throw new KernelConfigError('priorityInheritance must be boolean');
+  if (!['reader_pref', 'writer_pref', 'fair'].includes(tuning.rwlockPolicy)) throw new KernelConfigError('invalid rwlock policy');
   integer('contextSwitchTicks', tuning.contextSwitchTicks, 0);
   if (tuning.contextSwitchTicks > 2) throw new KernelConfigError('contextSwitchTicks must be <= 2');
   integer('deadlockDetectionInterval', tuning.deadlockDetectionInterval, 1);
