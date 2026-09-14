@@ -4289,7 +4289,7 @@ and registering it, with no change to phases 2 and 3. Four drivers ship:
 |---|---|---|
 | `disk0` | block | the geometry and scheduling of §10 |
 | `nvm0` | block | the NVM model of §10.5, appears after the depot upgrade |
-| `console` | character | one byte per tick, always `interrupt` mode |
+| `tty0` | character | one byte per tick, `interrupt` mode by default. (Renamed from `console` on 2026-09-14: the source scanner rejects that literal under `src/kernel` because it cannot tell a device id from the DOM global, and the driver kind is `character_output`.) |
 | `net0` | network | fixed latency, packet loss drawn from `root/io`, used by the Leg 12 adversary |
 
 `ioctl` is the escape hatch and every driver-specific behaviour goes through it,
@@ -5277,7 +5277,7 @@ every `Errno` it can produce. Argument positions are zero-based and refer to
 | `disk0` | `"crash"` | the crash simulation of §12.5; ring 0 only | `EPERM` |
 | `disk0` | `"fail_disk"` | injects a RAID member failure; ring 0 only | `EPERM`, `EINVAL` |
 | `nvm0` | `"trim"` | marks a logical page range invalid, feeding garbage collection | `EINVAL` |
-| `console` | `"flush"` | drains the output buffer | none |
+| `tty0` | `"flush"` | drains the output buffer | none |
 | `net0` | `"set_loss"` | sets the packet loss rate; ring 0 only | `EPERM`, `EINVAL` |
 | kernel pseudo-device | `"tlb_flush"` | invalidates the caller's TLB entries | none |
 | kernel pseudo-device | `"domain_switch"` | §13.4 mechanism 2 | `EPERM`, `ENOENT` |

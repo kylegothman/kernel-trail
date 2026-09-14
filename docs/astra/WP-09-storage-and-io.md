@@ -73,7 +73,7 @@ src/kernel/io/spool.ts
 src/kernel/io/drivers/DeviceDriver.ts
 src/kernel/io/drivers/disk0.ts
 src/kernel/io/drivers/nvm0.ts
-src/kernel/io/drivers/console.ts
+src/kernel/io/drivers/characterOutput.ts   (device id tty0; see amendment 9)
 src/kernel/io/drivers/net0.ts
 src/kernel/io/IoSubsystem.ts
 tests/kernel/storage/diskScheduling.test.ts
@@ -853,7 +853,7 @@ Four drivers ship:
 |---|---|---|
 | `disk0` | block | the geometry and scheduling of section 4 |
 | `nvm0` | block | the NVM model of section 5, appears after the depot upgrade |
-| `console` | character | one byte per tick, `interrupt` mode by default (the mode controls and storm fallback still apply) |
+| `tty0` | character | one byte per tick, `interrupt` mode by default (the mode controls and storm fallback still apply); driver kind `character_output`, file `characterOutput.ts` |
 | `net0` | network | fixed latency, packet loss drawn from `root/io`, used by the Leg 12 adversary |
 
 `ioctl` is the escape hatch and every driver-specific behaviour goes through it,
@@ -1326,9 +1326,9 @@ bounded-fraction check for `dmaCycleStealRatio`.
 - **S10, approved.** `IoRequest`, `IoContext` and `DeviceSnapshot` are local
   to `DeviceDriver.ts`; the frozen `Device` and the `{ kind: 'io', device }`
   instruction are unchanged, with the documented default requests (one
-  4096-byte read at LBA 0, one console byte, one 64-byte packet). The printer
+  4096-byte read at LBA 0, one tty0 byte, one 64-byte packet). The printer
   is a spool test adapter with a supplied output inode, not a fifth driver.
-  Console defaults to interrupt mode. Network loss draws once per completed
+  tty0 defaults to interrupt mode. Network loss draws once per completed
   packet from `root/io` and is represented in the owned completion result.
   Internal ownership is `(pid, tid, requestId)`; `Device.queue` projects only
   whole-process waiters (I-32); the waiting TCB is resolved through the
