@@ -105,8 +105,8 @@ describe('process construction and transitions', () => {
 describe('fork, exit, wait and exec', () => {
   it('fork copies fields, appends one apostrophe, retains descriptors and starts one thread at the continuation', () => {
     const { kernel, parent, fork } = family();
-    // The first access is now timed; fork must not race its completion.
-    kernel.run(kernel.tuning.tlbMissTicks - 1);
+    // Creation overhead precedes the timed first access; fork must not race either.
+    kernel.run(kernel.tuning.threadCreateTicks + kernel.tuning.tlbMissTicks - 1);
     const retained: FileDescriptor[] = []; kernel.installHooks({ fs: { retainDescriptor: fd => retained.push(fd) } });
     const source = live(kernel, parent); source.openFiles = [4 as FileDescriptor]; source.heldResources = [asResourceId('lock')]; source.queueLevel = 2;
     const child = fork(); const pcb = live(kernel, child);
@@ -255,7 +255,7 @@ describe('fork, exit, wait and exec', () => {
     expect(call('exec', parent, ['replacement']).ok).toBe(true); expect(pcb).toMatchObject({ ...before, queueLevel: 0, openFiles: [3] });
     expect(closed).toEqual([4]); expect(pcb.threads).toHaveLength(1); expect(pcb.threads[0]).not.toBe(oldTid);
     expect(kernel.threads.table.get(pcb.threads[0] as Tid)?.programCounter).toBe(0);
-    expect(kernel.program(parent)).toBe(replacement); kernel.run(2); expect(kernel.process(parent)?.state).toBe('zombie');
+    expect(kernel.program(parent)).toBe(replacement); kernel.run(kernel.tuning.threadCreateTicks + 2); expect(kernel.process(parent)?.state).toBe('zombie');
   });
 });
 
@@ -339,7 +339,7 @@ describe('lifecycle cleanup regressions', () => {
   });
   it('fork instruction puts the child at the next instruction and returns zero on first dispatch', () => {
     const kernel = createKernel(REFERENCE_CONFIG); const parent = kernel.spawn(WORK, { program: instructionProgram([{ kind: 'syscall', call: { name: 'fork', pid: asPid(9), args: [] } }]) });
-    kernel.step(); const child = asPid(value(kernel.lastSyscallResult(parent) ?? { ok: false, errno: 'ESRCH', message: 'missing result' }));
+    kernel.run(kernel.tuning.threadCreateTicks + 1); const child = asPid(value(kernel.lastSyscallResult(parent) ?? { ok: false, errno: 'ESRCH', message: 'missing result' }));
     const tid = kernel.process(child)?.threads[0]; expect(kernel.threads.table.get(tid as Tid)?.programCounter).toBe(1);
     kernel.blockProcess(parent, { kind: 'sleep', untilTick: asTick(10) }); kernel.step(); expect(kernel.lastSyscallResult(child)).toEqual({ ok: true, value: 0 });
   });

@@ -1,6 +1,7 @@
-import type { JsonValue, Pid, ProcessControlBlock, SchedulerContext, SchedulerId, SchedulingDecision } from '../types';
+import type { Pid, ProcessControlBlock, SchedulerContext, SchedulerId, SchedulingDecision } from '../types';
 import { KernelInvariantError } from '../errors';
 import { SchedulerBase, snapshotArray, snapshotBoolean, snapshotInteger, snapshotNumber, snapshotObject, snapshotPid } from './SchedulerBase';
+import type { SchedulerPolicyDetails } from './SchedulerBase';
 import { MinHeap } from './MinHeap';
 import { tieBreak } from './tieBreak';
 
@@ -90,11 +91,12 @@ export class SjfScheduler extends SchedulerBase {
     return this.dispatch(ctx, next, next === undefined ? 'no process is ready' : `shortest service, ${this.key(next)} ticks`);
   }
   protected refresh(): void { this.levels[0] = this.heap.toArray(); this.buildSnapshot(this.levels, 0); }
-  protected saveDetails(): JsonValue {
-    return { useEstimatedBurst: this.useEstimatedBurst,
-      estimates: [...this.estimates].sort(([a], [b]) => a - b).map(([pid, value]) => ({ pid, ...value })) };
+  protected saveDetails(): SchedulerPolicyDetails {
+    if (this.id !== 'sjf' && this.id !== 'srtf') throw new Error('invalid shortest-service persistence policy');
+    return { policy: this.id, detail: { useEstimatedBurst: this.useEstimatedBurst,
+      estimates: [...this.estimates].sort(([a], [b]) => a - b).map(([pid, value]) => ({ pid, ...value })) } };
   }
-  protected prepareRestoreDetails(detail: JsonValue, queues: readonly (readonly Pid[])[], ctx: SchedulerContext): () => void {
+  protected prepareRestoreDetails(detail: unknown, queues: readonly (readonly Pid[])[], ctx: SchedulerContext): () => void {
     const queue = queues[0];
     if (queues.length !== 1 || queue === undefined) throw new Error('shortest-service policy requires one queue');
     const record = snapshotObject(detail, 'burst estimator');

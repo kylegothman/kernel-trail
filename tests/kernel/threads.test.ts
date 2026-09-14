@@ -9,10 +9,10 @@ import type { AddressSpaceId, DomainId, Pid, ProcessControlBlock, Tid } from '@k
 
 const CORES = [1, 2, 4, 8, 16, 32];
 
-function fixture(model: ThreadModel = 'one_to_one', count = 1, cores = 4) {
+function fixture(model: ThreadModel = 'one_to_one', count = 1, cores = 4, overhead = 0) {
   const cfg: ThreadConfig = {
-    model, coreCount: cores, lwpPoolSize: cores, maxThreadsPerProcess: 16,
-    threadCreateTicks: 2,
+    model, coreCount: cores, lwpPoolSize: cores, maxThreadsPerProcess: Math.max(16, count),
+    threadCreateTicks: overhead,
   };
   const pcb: ProcessControlBlock = {
     pid: asPid(2), parent: asPid(1), name: 'thread fixture', state: 'ready',
@@ -56,13 +56,14 @@ describe('sim spec 16.4: Amdahl fixtures', () => {
     });
   });
 
-  it('AMDAHL-2: burst admission rounds the raw 100-tick burst once', () => {
+  it('AMDAHL-2: useful work uses ceil and creation debt is charged after speedup', () => {
     const actual = CORES.map(cores => {
-      const { manager, pcb } = fixture('one_to_one', cores, cores);
+      const { manager, pcb } = fixture('one_to_one', cores, cores, 2);
       manager.recompute(pcb);
+      expect(pcb.serviceRemaining).toBe(pcb.cpuBurstRemaining);
       return pcb.cpuBurstRemaining;
     });
-    expect(actual).toEqual([100, 63, 44, 34, 30, 27]);
+    expect(actual).toEqual([102, 67, 52, 51, 62, 92]);
   });
 
   it('AMDAHL-3: a fully serial program cannot gain speedup', () => {
@@ -161,14 +162,13 @@ describe('thread lifecycle and service accounting', () => {
     expect(events).toEqual([]);
   });
 
-  it('thread create cost is charged to raw service before speedup division', () => {
-    const { manager, pcb, work, cfg, events } = fixture();
+  it('thread creation adds debt without inflating useful raw service', () => {
+    const { manager, pcb, work, cfg, events } = fixture('one_to_one', 1, 4, 2);
     const originalRaw = work.rawService;
     expect(manager.create(pcb).ok).toBe(true);
-    expect(work.rawService - originalRaw).toBe(cfg.threadCreateTicks);
-    expect(pcb.serviceRemaining).toBe(Math.max(1, Math.round(
-      (originalRaw + cfg.threadCreateTicks) / amdahlSpeedup(work.serialFraction, 2),
-    )));
+    expect(work.rawService).toBe(originalRaw);
+    expect(pcb.serviceRemaining).toBe(Math.ceil(originalRaw / amdahlSpeedup(work.serialFraction, 2))
+      + cfg.threadCreateTicks * pcb.threads.length);
     expect(events).toEqual([{ type: 'thread.created', pid: pcb.pid, tid: pcb.threads[1] }]);
   });
 

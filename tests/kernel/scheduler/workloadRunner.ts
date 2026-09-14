@@ -1,4 +1,4 @@
-import { createKernel, type KernelImpl } from '@kernel/Kernel';
+import { createKernel, type KernelImpl, type KernelOptions } from '@kernel/Kernel';
 import { createRng } from '@kernel/rng';
 import { asTick } from '@kernel/types';
 import type {
@@ -20,6 +20,8 @@ export interface WorkloadResult {
   readonly contextSwitches: number;
   readonly dispatches: number;
   readonly quantumExpiries: number;
+  /** Maximum completed-process waiting time in the textbook fixture. */
+  readonly worstWait: number;
   readonly finalLevels: ReadonlyMap<string, number>;
   readonly events: readonly KernelEvent[];
 }
@@ -34,13 +36,14 @@ export function createWorkloadKernel(
   id: SchedulerId,
   params: Partial<SchedulerParams>,
   rows: readonly WorkloadRow[],
+  tuning: KernelOptions = {},
 ): { kernel: KernelImpl; pids: ReadonlyMap<string, Pid> } {
   const capacity = Math.max(64, rows.length + 2);
   const kernel = createKernel({
     ...REFERENCE_CONFIG, scheduler: id, schedulerParams: schedulerParams(params),
     enabledSubsystems: ['process', 'scheduler'],
   }, { threadCreateTicks: 0, contextSwitchTicks: 0, maxProcesses: capacity,
-    degreeOfMultiprogramming: capacity });
+    degreeOfMultiprogramming: capacity, ...tuning });
   const pids = new Map<string, Pid>();
   for (const row of rows) {
     if (pids.has(row.name)) throw new Error(`duplicate workload name: ${row.name}`);
@@ -52,25 +55,33 @@ export function createWorkloadKernel(
   return { kernel, pids };
 }
 
+export interface GanttSegment { readonly name: string; readonly start: number; readonly end: number; }
+
+/** ASCII intervals use the same boundary convention as the textbook figures. */
+export function renderGantt(segments: readonly GanttSegment[]): string {
+  return segments.map(segment => `${segment.name}[${segment.start}-${segment.end}]`).join(' ');
+}
+
 /** Run the real kernel and retain every dispatch, including adjacent slices. */
 export function runWorkload(
   id: SchedulerId,
   params: Partial<SchedulerParams>,
   rows: readonly WorkloadRow[],
   maxTicks = 10_000,
+  tuning: KernelOptions = {},
 ): WorkloadResult {
-  const { kernel, pids } = createWorkloadKernel(id, params, rows);
+  const { kernel, pids } = createWorkloadKernel(id, params, rows, tuning);
   const names = new Map([...pids].map(([name, pid]) => [pid, name]));
   const firstRuns = new Map<Pid, number>();
   const completions = new Map<Pid, number>();
   const events: KernelEvent[] = [];
-  const segments: string[] = [];
+  const segments: GanttSegment[] = [];
   let active: { pid: Pid; start: number } | null = null;
   const finishSegment = (end: number): void => {
     if (active === null) return;
     const name = names.get(active.pid);
     if (name === undefined) throw new Error('a system process entered a user workload');
-    segments.push(`${name}[${active.start}-${end}]`);
+    segments.push({ name, start: active.start, end });
     active = null;
   };
   kernel.events.onAny(event => {
@@ -111,13 +122,14 @@ export function runWorkload(
     sums.response += metrics.response;
   }
   const n = rows.length;
-  return { gantt: segments.join(' '), perProcess,
+  return { gantt: renderGantt(segments), perProcess,
     averages: { waiting: n === 0 ? 0 : sums.waiting / n,
       turnaround: n === 0 ? 0 : sums.turnaround / n,
       response: n === 0 ? 0 : sums.response / n },
     contextSwitches: events.filter(event => event.type === 'context.switch').length,
     dispatches: events.filter(event => event.type === 'context.switch' && event.to !== null).length,
     quantumExpiries: events.filter(event => event.type === 'quantum.expired').length,
+    worstWait: Math.max(0, ...[...perProcess.values()].map(row => row.waiting)),
     finalLevels, events };
 }
 

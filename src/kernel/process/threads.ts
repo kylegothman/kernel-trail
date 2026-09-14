@@ -60,6 +60,13 @@ export class ThreadManager {
   private nextId = 1;
   private readonly bindings = new Map<Tid, number>();
   private readonly lastDelivered = new Map<Pid, Tid>();
+  private readonly accounting = new Map<Pid, { overheadRemaining: number; pricedCores: number | null }>();
+
+  /** A detached view for accounting checks and the future process restore owner. */
+  accountingState(pid: Pid): Readonly<{ overheadRemaining: number; pricedCores: number | null }> | undefined {
+    const state = this.accounting.get(pid);
+    return state === undefined ? undefined : Object.freeze({ ...state });
+  }
 
   constructor(
     readonly config: ThreadConfig,
@@ -70,6 +77,7 @@ export class ThreadManager {
 
   reset(): void {
     this.table.clear(); this.bindings.clear(); this.lastDelivered.clear(); this.nextId = 1;
+    this.accounting.clear();
   }
 
   newTid(): Tid {
@@ -78,7 +86,7 @@ export class ThreadManager {
     return tid;
   }
 
-  /** Initial and fork threads are covered by process creation, without creation overhead. */
+  /** Fresh initial, fork and exec threads incur debt once, priced on admission. */
   attach(pcb: ProcessControlBlock, options: ThreadOptions = {}): void {
     if (pcb.threads.length === 0) pcb.threads.push(this.newTid());
     const count = pcb.threads.length;
@@ -94,6 +102,7 @@ export class ThreadManager {
       this.add(pcb, tid, share, options);
     }
     this.assign(pcb);
+    this.accounting.set(pcb.pid, { overheadRemaining: this.config.threadCreateTicks * count, pricedCores: null });
   }
 
   create(
@@ -116,8 +125,7 @@ export class ThreadManager {
     });
     pcb.threads.push(tid);
     this.assign(pcb);
-    // WP-02's numeric acceptance requires charging raw work before the division.
-    this.work(pcb).rawService += this.config.threadCreateTicks;
+    this.accountingFor(pcb).overheadRemaining += this.config.threadCreateTicks;
     this.emit({ type: 'thread.created', pid: pcb.pid, tid });
     this.recompute(pcb);
     return { ok: true, value: tid };
@@ -141,7 +149,7 @@ export class ThreadManager {
     if (this.lastDelivered.get(pcb.pid) === tid) this.lastDelivered.delete(pcb.pid);
     this.assign(pcb);
     this.emit({ type: 'thread.joined', pid: pcb.pid, tid });
-    if (pcb.threads.length === 0) this.onEmpty(pcb);
+    if (pcb.threads.length === 0) { this.accounting.delete(pcb.pid); this.onEmpty(pcb); }
     else this.recompute(pcb);
     return { ok: true, value: 0 };
   }
@@ -153,6 +161,7 @@ export class ThreadManager {
     }
     pcb.threads.length = 0;
     this.lastDelivered.delete(pcb.pid);
+    this.accounting.delete(pcb.pid);
   }
 
   /** The caller performs the corresponding legal PCB transition. */
@@ -195,14 +204,37 @@ export class ThreadManager {
   }
 
   recompute(pcb: ProcessControlBlock): void {
-    const work = this.work(pcb);
-    if (work.rawService === 0) return;
     const cores = this.effectiveCores(pcb, true);
     if (this.runnable(pcb, true).length === 0 || cores === 0) return;
+    this.price(pcb, cores);
+  }
+
+  /** The ability changes useful work only; blocked threads retain their state and price. */
+  halveUsefulWork(pcb: ProcessControlBlock): void {
+    const work = this.work(pcb);
+    const state = this.accountingFor(pcb);
+    const runnable = this.runnable(pcb, true).length > 0;
+    const cores = runnable ? this.effectiveCores(pcb, true) : state.pricedCores;
+    if (cores === null || cores < 1) throw new KernelInvariantError(7, 'blocked work has no cached price', { pid: pcb.pid });
+    work.rawBurst = Math.ceil(work.rawBurst / 2);
+    work.rawService = Math.ceil(work.rawService / 2);
+    this.price(pcb, cores);
+  }
+
+  private price(pcb: ProcessControlBlock, cores: number): void {
+    const work = this.work(pcb);
+    const state = this.accountingFor(pcb);
     const speedup = amdahlSpeedup(work.serialFraction, cores);
-    pcb.cpuBurstRemaining = Math.max(1, Math.round(work.rawBurst / speedup));
-    pcb.serviceRemaining = Math.max(1, Math.round(work.rawService / speedup));
+    state.pricedCores = cores;
+    pcb.cpuBurstRemaining = (work.rawService === 0 ? 0 : Math.ceil(work.rawBurst / speedup)) + state.overheadRemaining;
+    pcb.serviceRemaining = Math.ceil(work.rawService / speedup) + state.overheadRemaining;
     this.distribute(pcb);
+  }
+
+  private accountingFor(pcb: ProcessControlBlock): { overheadRemaining: number; pricedCores: number | null } {
+    const state = this.accounting.get(pcb.pid);
+    if (state === undefined) throw new KernelInvariantError(7, 'missing thread accounting', { pid: pcb.pid });
+    return state;
   }
 
   private deferService = false;
@@ -211,6 +243,8 @@ export class ThreadManager {
 
   /** A process tick is already accelerated, so precisely one thread consumes it. */
   deliver(pcb: ProcessControlBlock, execute: (thread: ThreadControlBlock) => boolean): Tid | null {
+    const accounting = this.accountingFor(pcb);
+    if (accounting.pricedCores === null) this.recompute(pcb);
     const runnable = this.runnable(pcb);
     const previous = this.lastDelivered.get(pcb.pid);
     const same = runnable.find(thread => thread.tid === previous);
@@ -222,13 +256,24 @@ export class ThreadManager {
     next.state = 'running';
     const work = this.work(pcb);
     const burst = pcb.cpuBurstRemaining; const service = pcb.serviceRemaining;
-    const threadService = next.serviceRemaining; const rawBurst = work.rawBurst; const rawService = work.rawService;
+    const rawBurst = work.rawBurst; const rawService = work.rawService;
+    const savedAccounting = { ...accounting };
+    const threadServices = pcb.threads.map(tid => this.require(pcb, tid)).map(thread => ({
+      thread, service: thread.serviceRemaining, state: thread.state,
+    }));
     this.deferService = false;
+    const overhead = accounting.overheadRemaining > 0;
     this.consume(pcb, next);
-    const advance = execute(next);
+    const advance = overhead ? false : execute(next);
     if (this.deferService) {
-      pcb.cpuBurstRemaining = burst; pcb.serviceRemaining = service; next.serviceRemaining = threadService;
+      pcb.cpuBurstRemaining = burst; pcb.serviceRemaining = service;
+      for (const saved of threadServices) {
+        if (this.table.get(saved.thread.tid) !== saved.thread) continue;
+        saved.thread.serviceRemaining = saved.service;
+        if (saved.state === 'terminated' && saved.thread.state === 'ready') saved.thread.state = 'terminated';
+      }
       work.rawBurst = rawBurst; work.rawService = rawService;
+      if (this.accounting.get(pcb.pid) === accounting) Object.assign(accounting, savedAccounting);
     }
     // Exec and exit may have removed the selected TCB during the callback.
     if (this.table.get(next.tid) === next) {
@@ -240,17 +285,33 @@ export class ThreadManager {
 
   private consume(pcb: ProcessControlBlock, thread: ThreadControlBlock): void {
     const work = this.work(pcb);
+    const state = this.accountingFor(pcb);
     const oldBurst = pcb.cpuBurstRemaining;
     const oldService = pcb.serviceRemaining;
     pcb.cpuBurstRemaining = Math.max(0, oldBurst - 1);
     pcb.serviceRemaining = Math.max(0, oldService - 1);
     pcb.totalCpuUsed += 1;
     thread.serviceRemaining = Math.max(0, thread.serviceRemaining - 1);
-    // Keep raw progress integral; recomputation must never restore work already run.
-    work.rawBurst = oldBurst === 0 ? 0
-      : Math.round(work.rawBurst * pcb.cpuBurstRemaining / oldBurst);
-    work.rawService = oldService === 0 ? 0
-      : Math.round(work.rawService * pcb.serviceRemaining / oldService);
+    if (state.overheadRemaining > 0) {
+      state.overheadRemaining -= 1;
+      return;
+    }
+    if (state.pricedCores === null) throw new KernelInvariantError(7, 'delivered work has no cached price', { pid: pcb.pid });
+    const speedup = amdahlSpeedup(work.serialFraction, state.pricedCores);
+    work.rawBurst = this.rawRemainder(work.rawBurst, pcb.cpuBurstRemaining, speedup);
+    work.rawService = this.rawRemainder(work.rawService, pcb.serviceRemaining, speedup);
+  }
+
+  /** Invert the exact ceiling used to price work, without fractional raw progress. */
+  private rawRemainder(raw: number, budget: number, speedup: number): number {
+    let low = 0;
+    let high = raw;
+    while (low < high) {
+      const middle = low + Math.ceil((high - low) / 2);
+      if (Math.ceil(middle / speedup) <= budget) low = middle;
+      else high = middle - 1;
+    }
+    return low;
   }
 
   private distribute(pcb: ProcessControlBlock): void {

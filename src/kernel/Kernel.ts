@@ -47,7 +47,7 @@ import type {
   SchedulerParams,
   SchedulerPolicy,
   SchedulingMetrics,
-  SubsystemId, SubsystemEnvelope, SubsystemSnapshots,
+  SubsystemId, SchedulerSnapshotState, SubsystemSnapshots,
   SyncPrimitive,
   SyscallRequest,
   SyscallResult,
@@ -442,9 +442,12 @@ export class KernelImpl implements Kernel {
     switch (request.name) {
       case 'getpid': return { ok: true, value: pcb.pid };
       case 'fork': return this.lifecycle.fork(pcb);
-      case 'exec':
+      case 'exec': {
         if (pcb.state === 'waiting') return failure('EBUSY', 'cannot exec a blocked process');
-        return typeof arg === 'string' ? this.lifecycle.exec(pcb, arg) : failure('EINVAL', 'exec requires a program name');
+        const result = typeof arg === 'string' ? this.lifecycle.exec(pcb, arg) : failure('EINVAL', 'exec requires a program name');
+        if (result.ok) this.threads.recompute(pcb);
+        return result;
+      }
       case 'exit': return typeof arg === 'number' && Number.isSafeInteger(arg)
         ? this.exitProcess(pcb, arg) : failure('EINVAL', 'exit requires an integer code');
       case 'wait': {
@@ -542,18 +545,7 @@ export class KernelImpl implements Kernel {
   halveRemainingBurst(pid: Pid): void {
     const pcb = this.table.get(pid); const raw = this.table.raw.get(pid);
     if (pcb === undefined || raw === undefined || ['zombie', 'terminated'].includes(pcb.state)) throw new RangeError('process has no remaining work');
-    raw.rawBurst = Math.ceil(raw.rawBurst / 2); raw.rawService = Math.ceil(raw.rawService / 2);
-    if (this.threads.runnable(pcb, true).length > 0) this.threads.recompute(pcb);
-    else {
-      const priorService = pcb.serviceRemaining;
-      pcb.cpuBurstRemaining = Math.ceil(pcb.cpuBurstRemaining / 2); pcb.serviceRemaining = Math.ceil(priorService / 2);
-      const threads = pcb.threads.map(tid => this.threads.table.get(tid)).filter((thread): thread is ThreadControlBlock => thread !== undefined);
-      const shares = threads.map(thread => ({ thread, exact: priorService === 0 ? 0 : pcb.serviceRemaining * thread.serviceRemaining / priorService }));
-      for (const share of shares) share.thread.serviceRemaining = Math.floor(share.exact);
-      shares.sort((a, b) => (b.exact % 1) - (a.exact % 1) || a.thread.tid - b.thread.tid);
-      const remainder = pcb.serviceRemaining - shares.reduce((sum, share) => sum + share.thread.serviceRemaining, 0);
-      for (const share of shares.slice(0, remainder)) share.thread.serviceRemaining += 1;
-    }
+    this.threads.halveUsefulWork(pcb);
   }
   prefetchNextFaults(pid: Pid, count: number): void { this.memorySubsystem.prefetchNextFaults(pid, count); }
   remapOptimalLocality(pid: Pid): void { this.memorySubsystem.remapOptimalLocality(pid); }
@@ -577,7 +569,7 @@ export class KernelImpl implements Kernel {
   }
 
   /** WP-11 restores the process tables before applying this independent contribution. */
-  saveSchedulerState(): SubsystemEnvelope {
+  saveSchedulerState(): SchedulerSnapshotState {
     this.syncSchedulerView();
     return saveSchedulerEnvelope(this.scheduler, this.schedulingAccounting, {
       tick: this.tick, readyQueue: [...this.readyQueue], running: this.running,
@@ -585,18 +577,20 @@ export class KernelImpl implements Kernel {
       contextSwitches: this.contextSwitches, params: saveSchedulerParams(this.schedulerParams),
     });
   }
-  restoreSchedulerState(envelope: SubsystemEnvelope): void {
+  restoreSchedulerState(envelope: unknown): void {
     const saved = prepareSchedulerRestore(envelope, {
       ...this.schedulerContext(),
       readyQueue: this.processes.filter(pcb => pcb.pid > 1 && pcb.state === 'ready').map(pcb => pcb.pid),
       running: this.processes.find(pcb => pcb.pid > 1 && pcb.state === 'running')?.pid ?? null,
-    }, this.schedulingAccounting, pid => this.burstSizes.get(pid));
+    }, this.schedulingAccounting, pid => this.burstSizes.get(pid), {
+      maxProcesses: this.tuning.maxProcesses, mlfqAccounting: this.tuning.mlfqAccounting, emit: event => this.publish(event),
+    });
     saved.commitAccounting();
     this.scheduler = saved.policy; this.schedulerParams = saved.params; this.requestedScheduler = saved.policy.id;
     this.readyQueue.length = 0; this.readyQueue.push(...saved.readyQueue);
     this.running = saved.running; this.lastCpuOwner = saved.lastCpuOwner;
     this.sliceElapsed = saved.sliceElapsed; this.switchDebt = saved.switchDebt; this.contextSwitches = saved.contextSwitches;
-    this.schedulingMetrics = this.scheduler.snapshot().metrics;
+    this.schedulingMetrics = this.metricsHooks.scheduler(this.tick);
     this.syncSchedulerView();
   }
 
@@ -632,7 +626,9 @@ export class KernelImpl implements Kernel {
     if (snapshot.subsystems?.scheduler !== undefined) prepareSchedulerRestore(snapshot.subsystems.scheduler, {
       ...this.schedulerContext(), tick: snapshot.tick, running: null, readyQueue: [],
       process: pid => snapshot.processes.find(pcb => pcb.pid === pid),
-    }, this.schedulingAccounting, pid => this.burstSizes.get(pid), snapshot.config);
+    }, this.schedulingAccounting, pid => this.burstSizes.get(pid), {
+      maxProcesses: this.tuning.maxProcesses, mlfqAccounting: this.tuning.mlfqAccounting, emit: event => this.publish(event),
+    }, snapshot.config);
     const restoreContributions = this.snapshotHooks.map(hooks => hooks.restoreState(snapshot));
     this.currentConfig = cloneConfig(snapshot.config); this.enabled = new Set(this.config.enabledSubsystems);
     this.schedulerParams = { ...snapshot.config.schedulerParams }; this.requestedScheduler = this.config.scheduler;
@@ -890,7 +886,9 @@ export class KernelImpl implements Kernel {
     return tid === undefined ? 0 : this.threads.table.get(tid)?.programCounter ?? 0;
   }
   private makeScheduler(id: SchedulerId, params: SchedulerParams = this.schedulerParams): SchedulerPolicy {
-    const policy = createScheduler(id, params);
+    const policy = createScheduler(id, params, {
+      maxProcesses: this.tuning.maxProcesses, mlfqAccounting: this.tuning.mlfqAccounting, emit: event => this.publish(event),
+    });
     configureSchedulerWorkload(policy, pid => this.burstSizes.get(pid));
     return policy;
   }

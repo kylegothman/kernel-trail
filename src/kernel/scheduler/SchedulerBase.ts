@@ -1,9 +1,17 @@
 import { asPid } from '../types';
 import type {
-  JsonValue, SubsystemEnvelope, Pid, ProcessControlBlock, SchedulerContext, SchedulerId, SchedulerParams,
+  Pid, ProcessControlBlock, SchedulerContext, SchedulerId, SchedulerParams,
+  SchedulerPolicySnapshotState, SchedulerPolicySnapshotBase, SchedulerSnapshotParameters,
   SchedulerPolicy, SchedulerSnapshot, SchedulingDecision, SchedulingMetrics,
 } from '../types';
 import { DEFAULT_SCHEDULER_PARAMS, EMPTY_METRICS } from './common';
+
+type PolicyDetails<State> = State extends SchedulerPolicySnapshotBase
+  ? Omit<State, keyof SchedulerPolicySnapshotBase> : never;
+export type SchedulerPolicyDetails = PolicyDetails<SchedulerPolicySnapshotState>;
+export type SchedulerPolicySaveState = {
+  readonly owner: 'scheduler'; readonly version: 2; readonly payload: SchedulerPolicySnapshotState;
+};
 
 /** Shared lifecycle and a stable presentation view, independent of queue policy. */
 export abstract class SchedulerBase implements SchedulerPolicy {
@@ -78,21 +86,23 @@ export abstract class SchedulerBase implements SchedulerPolicy {
     return this.view;
   }
 
-  protected abstract saveDetails(): JsonValue;
-  protected abstract prepareRestoreDetails(detail: JsonValue, queues: readonly (readonly Pid[])[], ctx: SchedulerContext): () => void;
+  protected abstract saveDetails(): SchedulerPolicyDetails;
+  protected abstract prepareRestoreDetails(detail: unknown, queues: readonly (readonly Pid[])[], ctx: SchedulerContext, quantumRemaining: number): () => void;
 
   /** A detached save contribution. The live snapshot remains allocation-free. */
-  saveState(): SubsystemEnvelope {
-    return { owner: 'scheduler', version: 1, payload: {
-      policy: this.id, params: saveSchedulerParams(this.params),
+  saveState(): SchedulerPolicySaveState {
+    this.snapshot();
+    return { owner: 'scheduler', version: 2, payload: {
+      params: saveSchedulerParams(this.params),
       queues: this.queues.map(queue => [...queue]), running: this.running,
-      quantumRemaining: this.quantumRemaining, metrics: { ...this.metrics }, detail: this.saveDetails(),
+      quantumRemaining: this.quantumRemaining, ...this.saveDetails(),
     } };
   }
 
-  restoreState(envelope: SubsystemEnvelope, ctx: SchedulerContext): void {
-    if (envelope.owner !== 'scheduler' || envelope.version !== 1) throw new Error('invalid scheduler envelope owner or version');
-    const payload = snapshotObject(envelope.payload, 'policy payload');
+  restoreState(envelope: unknown, ctx: SchedulerContext): void {
+    const source = snapshotObject(envelope, 'policy envelope');
+    if (source['owner'] !== 'scheduler' || source['version'] !== 2) throw new Error('invalid scheduler envelope owner or version');
+    const payload = snapshotObject(source['payload'], 'policy payload');
     if (payload['policy'] !== this.id) throw new Error('scheduler snapshot policy mismatch');
     const params = restoreSchedulerParams(payload['params']);
     const queues = snapshotArray(payload['queues'], 'queues').map(value =>
@@ -107,45 +117,45 @@ export abstract class SchedulerBase implements SchedulerPolicy {
       throw new Error('scheduler snapshot running process mismatch');
     }
     const quantum = snapshotInteger(payload['quantumRemaining'], 'quantum remaining');
-    const metrics = restoreSchedulingMetrics(payload['metrics']);
+    if (this.id !== 'rr' && this.id !== 'mlfq' && quantum !== 0) throw new Error('non-quantum policy has remaining quantum');
     const detail = payload['detail'];
     if (detail === undefined) throw new Error('missing scheduler detail');
-    const commit = this.prepareRestoreDetails(detail, queues, ctx);
+    const commit = this.prepareRestoreDetails(detail, queues, { ...ctx, params }, quantum);
     this.configure(params);
     commit();
     this.running = running;
-    this.buildSnapshot(queues, quantum, metrics);
+    this.buildSnapshot(queues, quantum);
   }
 }
 
-function isSnapshotObject(value: JsonValue | undefined): value is { readonly [key: string]: JsonValue } {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
+export function snapshotObject(value: unknown, label: string): Readonly<Record<string, unknown>> {
+  if (value === null || typeof value !== 'object' || Array.isArray(value)
+    || (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null)) {
+    throw new Error(`invalid scheduler ${label}`);
+  }
+  return value as Readonly<Record<string, unknown>>;
 }
-export function snapshotObject(value: JsonValue | undefined, label: string): { readonly [key: string]: JsonValue } {
-  if (!isSnapshotObject(value)) throw new Error(`invalid scheduler ${label}`);
-  return value;
-}
-export function snapshotArray(value: JsonValue | undefined, label: string): readonly JsonValue[] {
+export function snapshotArray(value: unknown, label: string): readonly unknown[] {
   if (!Array.isArray(value)) throw new Error(`invalid scheduler ${label}`);
   return value;
 }
-export function snapshotInteger(value: JsonValue | undefined, label: string, min = 0): number {
-  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < min) throw new Error(`invalid scheduler ${label}`);
+export function snapshotInteger(value: unknown, label: string, min = 0): number {
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || Object.is(value, -0) || value < min) throw new Error(`invalid scheduler ${label}`);
   return value;
 }
-export function snapshotNumber(value: JsonValue | undefined, label: string): number {
-  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) throw new Error(`invalid scheduler ${label}`);
+export function snapshotNumber(value: unknown, label: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value) || Object.is(value, -0) || value < 0) throw new Error(`invalid scheduler ${label}`);
   return value;
 }
-export function snapshotBoolean(value: JsonValue | undefined, label: string): boolean {
+export function snapshotBoolean(value: unknown, label: string): boolean {
   if (typeof value !== 'boolean') throw new Error(`invalid scheduler ${label}`);
   return value;
 }
-export function snapshotPid(value: JsonValue | undefined, label: string): Pid { return asPid(snapshotInteger(value, label, 2)); }
-export function saveSchedulerParams(params: Readonly<SchedulerParams>): JsonValue {
+export function snapshotPid(value: unknown, label: string): Pid { return asPid(snapshotInteger(value, label, 2)); }
+export function saveSchedulerParams(params: Readonly<SchedulerParams>): SchedulerSnapshotParameters {
   return { ...params, ...(params.levelQuanta === undefined ? {} : { levelQuanta: [...params.levelQuanta] }) };
 }
-export function restoreSchedulerParams(value: JsonValue | undefined): SchedulerParams {
+export function restoreSchedulerParams(value: unknown): SchedulerParams {
   const params = snapshotObject(value, 'params');
   return {
     quantum: snapshotInteger(params['quantum'], 'quantum', 1),
@@ -156,18 +166,5 @@ export function restoreSchedulerParams(value: JsonValue | undefined): SchedulerP
     ...(params['levelQuanta'] === undefined ? {} : {
       levelQuanta: snapshotArray(params['levelQuanta'], 'level quanta').map(item => snapshotInteger(item, 'level quantum', 1)),
     }),
-  };
-}
-function restoreSchedulingMetrics(value: JsonValue | undefined): SchedulingMetrics {
-  const metrics = snapshotObject(value, 'metrics');
-  const cpuUtilisation = snapshotNumber(metrics['cpuUtilisation'], 'CPU utilisation');
-  if (cpuUtilisation > 1) throw new Error('invalid scheduler CPU utilisation');
-  return {
-    averageWaitingTime: snapshotNumber(metrics['averageWaitingTime'], 'average waiting'),
-    averageTurnaroundTime: snapshotNumber(metrics['averageTurnaroundTime'], 'average turnaround'),
-    averageResponseTime: snapshotNumber(metrics['averageResponseTime'], 'average response'),
-    throughput: snapshotNumber(metrics['throughput'], 'throughput'), cpuUtilisation,
-    contextSwitches: snapshotInteger(metrics['contextSwitches'], 'context switches'),
-    worstWait: snapshotInteger(metrics['worstWait'], 'worst wait'),
   };
 }

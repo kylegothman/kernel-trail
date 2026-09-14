@@ -299,7 +299,7 @@ describe('memory access event ownership and hit metrics', () => {
 
 describe('kernel TLB integration', () => {
   function kernelFixture(instructions: readonly Instruction[], options: KernelOptions = {}) {
-    const kernel = createKernel({ ...REFERENCE_CONFIG, enabledSubsystems: ['process', 'scheduler', 'memory'] }, options);
+    const kernel = createKernel({ ...REFERENCE_CONFIG, enabledSubsystems: ['process', 'scheduler', 'memory'] }, { threadCreateTicks: 0, ...options });
     const pid = kernel.spawn({ name: 'memory work', priority: 10, arrival: 0, burst: 40, service: 40, pages: 1 },
       { program: instructionProgram(instructions) });
     const pcb = kernel.process(pid);

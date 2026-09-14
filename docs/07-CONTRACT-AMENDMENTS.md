@@ -350,6 +350,57 @@ package takes amendment 5 first.
 
 ---
 
+## Amendment 6, 2026-09-13: typed scheduler continuation
+
+**Status:** applied on wp-04 after explicit human review of the exact patch and
+approval of hash regeneration. Number provisional against WP-07 and WP-09 merge
+order. The WP-04 pre-flight approval is recorded in commit 7d53860.
+
+### What was an envelope
+
+Amendment 3 introduced `SubsystemSnapshots.scheduler` as `SubsystemEnvelope`.
+WP-03 filled version 1 for four policies, including ordered queues, policy detail
+and integer scheduling accounting. Its policy payload also copied computed HUD
+metrics, which are not an authority for rebuilding execution history.
+
+### What changed
+
+The slot is now `SchedulerSnapshotState`, version 2, with explicit discriminants
+for fcfs, sjf, srtf, priority, priority_aging, rr and mlfq. The reviewed change
+leaves the memory, vm and process contributions and the policy/HUD contracts
+untouched. It preserves FCFS insertion metadata, SJF estimator history, runtime
+ready order, CPU owner, slice and switch debt, and integer busy/first-dispatch/
+completion records. It adds aging clocks, logical RR slice position and MLFQ
+level queues, accounting mode, CPU baselines and demotion counters.
+
+### Why this shape
+
+The payload contains plain JSON values with explicit versioned parameter fields,
+not a mapped copy of a future interface. It contains no computed averages,
+callbacks, Map or Set. Ordered queues represent ring position; unused buffer cells
+and physical head indices need not survive normalization. A CPU baseline renews
+a same-owner quantum without a false context switch. PCB readySince and priority
+remain process-owned; together with the saved aging clock they retain starvation
+and promotion timing. Runtime requested params and normalized policy params have
+distinct meanings and are both retained.
+
+### Consequences
+
+WP-04 rejects explicit v1 contributions and missing accounting and recomputes HUD
+metrics through the installed hook after restoration. Stable per-tick
+`SchedulerSnapshot` objects remain distinct from detached persistence values.
+The scheduler contribution is tested against equivalent staged process state.
+Full fresh-kernel workload reconstruction stays with WP-11, including its process
+schema gaps and the ThreadManager `overheadRemaining` and `pricedCores` side
+state. Neither removing its guard nor replaying a prefix qualifies as restore.
+
+The exact frozen-file patch and guard regeneration were human-approved before
+application. This amendment and the regenerated lock are committed separately
+from implementation.
+
+---
+
+
 # Package scope corrections
 
 Not contract changes, so no hash moves and no amendment number. Recorded here

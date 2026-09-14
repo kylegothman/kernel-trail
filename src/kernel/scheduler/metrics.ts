@@ -1,7 +1,7 @@
 import { SjfScheduler } from './sjf';
 import { snapshotArray, snapshotInteger, snapshotObject, snapshotPid } from './SchedulerBase';
 import { asTick } from '../types';
-import type { JsonValue, Pid, ProcessControlBlock, SchedulerPolicy, SchedulingMetrics, Tick } from '../types';
+import type { Pid, ProcessControlBlock, SchedulerPolicy, SchedulingMetrics, SchedulerSnapshotState, Tick } from '../types';
 
 /** Fixed at completion, so computing metrics never needs the event history. */
 export interface CompletedRecord {
@@ -91,16 +91,16 @@ export class SchedulingAccounting {
     });
   }
 
-  saveState(): JsonValue {
+  saveState(): SchedulerSnapshotState['payload']['accounting'] {
     return {
       busyTicks: this.busyTicks,
-      firstRuns: [...this.firstRuns].sort(([a], [b]) => a - b).map(([pid, tick]) => [pid, tick]),
+      firstRuns: [...this.firstRuns].sort(([a], [b]) => a - b).map(([pid, tick]) => [pid, tick] as const),
       completed: [...this.completed].sort(([a], [b]) => a - b).map(([pid, record]) => ({ pid, ...record })),
     };
   }
 
   /** Parse the entire contribution before allowing the caller to commit it. */
-  prepareRestore(state: JsonValue): () => void {
+  prepareRestore(state: unknown): () => void {
     const source = snapshotObject(state, 'scheduler accounting');
     const busyTicks = snapshotInteger(source['busyTicks'], 'scheduler accounting busy ticks');
     const firstRuns = new Map<Pid, Tick>();
@@ -141,7 +141,7 @@ export class SchedulingAccounting {
     };
   }
 
-  restoreState(state: JsonValue): void { this.prepareRestore(state)(); }
+  restoreState(state: unknown): void { this.prepareRestore(state)(); }
 
   reset(): void {
     this.completed.clear();
