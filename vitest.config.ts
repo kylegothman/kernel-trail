@@ -18,6 +18,8 @@ export default defineConfig({
       '@game': r('./src/game'),
       '@legs': r('./src/legs'),
       '@design': r('./src/design'),
+      '@platform': r('./src/platform'),
+      '@render': r('./src/render'),
     },
   },
 });

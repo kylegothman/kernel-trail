@@ -1,22 +1,5 @@
-/**
- * KERNEL TRAIL: the three quality profiles.
- *
- * Transcribed from 01-ARCHITECTURE sections 6.1 and 6.2.
- *
- * SCAFFOLD NOTE. This file was not on the scaffold list, but `RendererBackend`,
- * `postChain` and any consumer of `QualityGovernor` all need `RenderQualityProfile`
- * and none of them may own it. Three private copies of a table this specific
- * would disagree within a week, so it lives here, which is where 01-ARCHITECTURE
- * 6.1 puts it.
- *
- * A profile is data, not behaviour. Nothing in this module reads the DOM, the
- * renderer or the clock, so it is importable from a test with no browser.
- */
-
-import type { QualityTier } from './capabilities';
-
-export type { QualityTier } from './capabilities';
-
+import { BLOOM } from '@design';
+export type QualityTier = 'low' | 'medium' | 'high';
 export type InstanceClass =
   | 'page_frames'
   | 'queue_entries'
@@ -26,190 +9,166 @@ export type InstanceClass =
   | 'domain_rings'
   | 'labels';
 
-export interface RenderQualityProfile {
+export type FloorReflectionMode = 'light-pools' | 'mirrored-proxy' | 'planar-rt';
+
+export interface VisualQualityProfile {
   readonly tier: QualityTier;
 
   /* framebuffer */
-  /** Backing buffer size as a multiple of the CSS size. */
   readonly renderScale: number;
-  readonly maxPixelRatio: number;
-  /** 0 means no MSAA. Distinct from `Capabilities.maxSamples`, which is a ceiling. */
-  readonly msaaSamples: 0 | 2 | 4;
-  readonly antialiasMode: 'none' | 'fxaa' | 'taa';
+  readonly antialiasing: 'none' | 'smaa' | 'msaa4';
 
   /* bloom */
-  readonly bloomEnabled: boolean;
-  /** Resolution of the bloom pyramid base relative to the main target. */
+  readonly bloomLevels: number;
+  /** Resolution of the pyramid base relative to the main target. */
   readonly bloomScale: number;
-  readonly bloomMips: number;
+  /** Low tier tints only level 0; the wide levels take the flat white tint. */
+  readonly bloomTintPerLevel: boolean;
 
-  /* volumetrics */
-  readonly volumetricEnabled: boolean;
-  readonly volumetricSteps: number;
-  readonly volumetricScale: number;
+  /* optional stages */
+  readonly depthOfField: boolean;
+  readonly volumetricScattering: boolean;
+  /** Maximum channel offset at the frame corner, in device pixels. 0 disables. */
+  readonly aberrationMaxPx: number;
+  /** Grain amplitude. Above 0.02 it reads as noise and destroys the hairlines. */
+  readonly grainAmplitude: number;
 
-  /* shadows */
-  readonly shadowPolicy: 'none' | 'blob' | 'shadowmap';
-  readonly shadowMapSize: number;
-
-  /* geometry and instances */
-  readonly maxInstances: Readonly<Record<InstanceClass, number>>;
-  readonly maxParticles: number;
-  readonly maxLiveEffects: number;
-  readonly labelBudget: number;
-
-  /* misc */
-  readonly depthPrepass: boolean;
-  readonly gradeLut: boolean;
-  readonly aberration: boolean;
-  readonly softParticles: boolean;
-  readonly anisotropy: number;
+  /* world-side settings the chain must agree with */
+  readonly floorReflection: FloorReflectionMode;
+  readonly beamRadialSegments: number;
+  /** Resolution of the depth copy the beam soft-clip samples. */
+  readonly beamDepthScale: number;
+  /** Real transmission is capped; beyond this the factory returns the fresnel fallback. */
+  readonly transmissiveCap: number;
+  readonly derezzCubeCap: number;
+  readonly concurrentDerezz: number;
+  readonly concurrentBeams: number;
+  readonly animatedElements: number;
+  readonly sdfGlyphSize: number;
+  readonly distantColumns: number;
+  readonly floorLightPools: number;
+  /** Metres beyond which the minor grid is not drawn. Infinity means always. */
+  readonly gridMinorRangeM: number;
 }
 
-/**
- * Notes on the choices that look wrong until you know why:
- *
- * - **Bloom is never disabled, at any tier.** The art direction is emissive
- *   geometry in a black void; without bloom the game does not read at all. It
- *   degrades in resolution and mip count, never in existence.
- * - **Volumetrics are off at low.** The single most expensive stage and the most
- *   optional. Their absence changes the mood, not the readability.
- * - **`renderScale` 0.75 with `maxPixelRatio` 1 at low.** On a Retina display
- *   that is a large win, and with FXAA plus the grain pass it holds up because
- *   the art has few high-frequency details.
- * - **TAA only at high.** TAA needs motion vectors, and motion vectors on
- *   instanced geometry require a second matrix buffer per batch. That memory is
- *   only paid at high.
- */
-export const PROFILES: Readonly<Record<QualityTier, RenderQualityProfile>> = {
+const LOOK: Readonly<Record<QualityTier, VisualQualityProfile>> = {
   low: {
     tier: 'low',
     renderScale: 0.75,
-    maxPixelRatio: 1,
-    msaaSamples: 0,
-    antialiasMode: 'fxaa',
-    bloomEnabled: true,
+    antialiasing: 'none',
+    bloomLevels: 4,
     bloomScale: 0.25,
-    bloomMips: 3,
-    volumetricEnabled: false,
-    volumetricSteps: 0,
-    volumetricScale: 0,
-    shadowPolicy: 'none',
-    shadowMapSize: 0,
-    maxInstances: {
-      page_frames: 1024,
-      queue_entries: 128,
-      disk_sectors: 2048,
-      beams: 128,
-      archive_blocks: 1024,
-      domain_rings: 32,
-      labels: 48,
-    },
-    maxParticles: 2000,
-    maxLiveEffects: 96,
-    labelBudget: 48,
-    depthPrepass: false,
-    gradeLut: false,
-    aberration: false,
-    softParticles: false,
-    anisotropy: 1,
+    bloomTintPerLevel: false,
+    depthOfField: false,
+    volumetricScattering: false,
+    aberrationMaxPx: 0,
+    grainAmplitude: 0.008,
+    floorReflection: 'light-pools',
+    beamRadialSegments: 6,
+    beamDepthScale: 0.25,
+    transmissiveCap: 0,
+    derezzCubeCap: 600,
+    concurrentDerezz: 2,
+    concurrentBeams: 16,
+    animatedElements: 48,
+    sdfGlyphSize: 48,
+    distantColumns: 120,
+    floorLightPools: 8,
+    gridMinorRangeM: 30,
   },
   medium: {
     tier: 'medium',
     renderScale: 1,
-    maxPixelRatio: 1.5,
-    msaaSamples: 2,
-    antialiasMode: 'fxaa',
-    bloomEnabled: true,
+    antialiasing: 'smaa',
+    bloomLevels: 5,
     bloomScale: 0.5,
-    bloomMips: 5,
-    volumetricEnabled: true,
-    volumetricSteps: 24,
-    volumetricScale: 0.25,
-    shadowPolicy: 'blob',
-    shadowMapSize: 0,
-    maxInstances: {
-      page_frames: 2048,
-      queue_entries: 256,
-      disk_sectors: 4096,
-      beams: 256,
-      archive_blocks: 2048,
-      domain_rings: 64,
-      labels: 96,
-    },
-    maxParticles: 8000,
-    maxLiveEffects: 256,
-    labelBudget: 96,
-    depthPrepass: true,
-    gradeLut: true,
-    aberration: false,
-    softParticles: true,
-    anisotropy: 4,
+    bloomTintPerLevel: true,
+    depthOfField: false,
+    volumetricScattering: false,
+    aberrationMaxPx: 1.0,
+    grainAmplitude: 0.012,
+    floorReflection: 'mirrored-proxy',
+    beamRadialSegments: 10,
+    beamDepthScale: 0.5,
+    transmissiveCap: 0,
+    derezzCubeCap: 1800,
+    concurrentDerezz: 6,
+    concurrentBeams: 32,
+    animatedElements: 160,
+    sdfGlyphSize: 64,
+    distantColumns: 260,
+    floorLightPools: 16,
+    gridMinorRangeM: Number.POSITIVE_INFINITY,
   },
   high: {
     tier: 'high',
     renderScale: 1,
-    maxPixelRatio: 2,
-    msaaSamples: 4,
-    antialiasMode: 'taa',
-    bloomEnabled: true,
+    antialiasing: 'msaa4',
+    bloomLevels: 6,
     bloomScale: 0.5,
-    bloomMips: 6,
-    volumetricEnabled: true,
-    volumetricSteps: 48,
-    volumetricScale: 0.5,
-    shadowPolicy: 'shadowmap',
-    shadowMapSize: 1024,
-    maxInstances: {
-      page_frames: 4096,
-      queue_entries: 512,
-      disk_sectors: 8192,
-      beams: 512,
-      archive_blocks: 4096,
-      domain_rings: 128,
-      labels: 192,
-    },
-    maxParticles: 20000,
-    maxLiveEffects: 512,
-    labelBudget: 192,
-    depthPrepass: true,
-    gradeLut: true,
-    aberration: true,
-    softParticles: true,
-    anisotropy: 8,
+    bloomTintPerLevel: true,
+    depthOfField: true,
+    volumetricScattering: true,
+    aberrationMaxPx: 1.6,
+    grainAmplitude: 0.012,
+    floorReflection: 'planar-rt',
+    beamRadialSegments: 16,
+    beamDepthScale: 1,
+    transmissiveCap: 8,
+    derezzCubeCap: 4096,
+    concurrentDerezz: 16,
+    concurrentBeams: 64,
+    animatedElements: 400,
+    sdfGlyphSize: 64,
+    distantColumns: 400,
+    floorLightPools: 24,
+    gridMinorRangeM: Number.POSITIVE_INFINITY,
   },
 };
-
-/**
- * Draw-call and triangle ceilings (03-VISUAL-BIBLE 12.1). Sampled from the
- * renderer's own counters every 30 frames and asserted in the leg smoke tests.
- * A leg that exceeds its budget does not ship, which is why these are here and
- * not a comment in a test file.
- */
-export const DRAW_BUDGET: Readonly<Record<QualityTier, { readonly calls: number; readonly triangles: number }>> = {
+export interface RenderQualityProfile extends VisualQualityProfile {
+  readonly maxPixelRatio: number;
+  readonly msaaSamples: 0 | 2 | 4;
+  readonly bloomEnabled: true;
+  readonly bloomMips: number;
+  readonly bloomThreshold: number;
+  readonly bloomStrength: number;
+  readonly hdr: true;
+  readonly shadowPolicy: 'none';
+  readonly shadowMapSize: 0;
+  readonly volumetricEnabled: boolean;
+  readonly volumetricSteps: number;
+  readonly volumetricScale: number;
+  readonly maxInstances: Readonly<Record<InstanceClass, number>>;
+  readonly maxParticles: number;
+  readonly maxLiveEffects: number;
+  readonly labelBudget: number;
+  readonly depthPrepass: boolean;
+  readonly drawCalls: number;
+  readonly triangles: number;
+}
+export const DRAW_BUDGET = {
   low: { calls: 220, triangles: 180_000 },
   medium: { calls: 450, triangles: 450_000 },
   high: { calls: 900, triangles: 1_100_000 },
+} as const;
+function profile(tier: QualityTier, multiplier: number, maxPixelRatio: number, maxParticles: number, maxLiveEffects: number): RenderQualityProfile {
+  const look = LOOK[tier];
+  return Object.freeze({ ...look, maxPixelRatio, msaaSamples: tier === 'high' ? 4 : 0,
+    bloomEnabled: true, bloomMips: look.bloomLevels, bloomThreshold: BLOOM.threshold,
+    bloomStrength: BLOOM.strength, hdr: true, shadowPolicy: 'none', shadowMapSize: 0,
+    volumetricEnabled: look.volumetricScattering, volumetricSteps: tier === 'high' ? 48 : 0,
+    volumetricScale: look.volumetricScattering ? 0.25 : 0,
+    maxInstances: Object.freeze({ page_frames: 1024 * multiplier, queue_entries: 128 * multiplier,
+      disk_sectors: 2048 * multiplier, beams: 128 * multiplier, archive_blocks: 1024 * multiplier,
+      domain_rings: 32 * multiplier, labels: 48 * multiplier }),
+    maxParticles, maxLiveEffects, labelBudget: 48 * multiplier, depthPrepass: tier !== 'low',
+    drawCalls: DRAW_BUDGET[tier].calls, triangles: DRAW_BUDGET[tier].triangles,
+  });
+}
+export const PROFILES: Readonly<Record<QualityTier, RenderQualityProfile>> = {
+  low: profile('low', 1, 1, 2000, 96), medium: profile('medium', 2, 1.5, 8000, 256),
+  high: profile('high', 4, 2, 20000, 512),
 };
-
-/**
- * Clamp a requested instance count to the tier ceiling. Above the ceiling the
- * world layer aggregates (8 frames per instance, contiguous sectors per arc, and
- * so on, per 01-ARCHITECTURE 7.3); it never silently draws fewer entities than
- * the simulation contains without saying so.
- */
-export function assertCeiling(
-  cls: InstanceClass,
-  requested: number,
-  profile: RenderQualityProfile,
-): number {
-  const max = profile.maxInstances[cls];
-  if (requested <= max) return requested;
-  if (import.meta.env.DEV) {
-    console.warn(
-      `[kt] ${cls} requested ${requested} > tier ${profile.tier} ceiling ${max}. ` +
-        'Aggregation will apply. See 01-ARCHITECTURE section 7.3.',
-    );
-  }
-  return max;
+export function assertCeiling(cls: InstanceClass, requested: number, p: RenderQualityProfile): number {
+  return Math.min(requested, p.maxInstances[cls]);
 }
