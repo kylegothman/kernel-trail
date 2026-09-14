@@ -742,12 +742,735 @@ export interface SubsystemSnapshots {
   readonly sync?: SyncSnapshotState;
   /** Amendment 8. Deadlock continuation: requests, recovery, dependencies and detection history. */
   readonly deadlock?: DeadlockSnapshotState;
-  readonly storage?: SubsystemEnvelope;
-  /** Amendment 3. In-flight requests, interrupt queue, and DMA transfers. */
-  readonly io?: SubsystemEnvelope;
+  /** Amendment 9. Disk queues, media, RAID rebuild and opt-in paging continuation. */
+  readonly storage?: StorageSnapshotState;
+  /** Amendment 9. Device requests, interrupts, CPU charges, buffers, cache and spools. */
+  readonly io?: IoSnapshotState;
   readonly fs?: SubsystemEnvelope;
   readonly security?: SubsystemEnvelope;
 }
+
+/** Read data is bytes; successful writes acknowledge with an empty array. */
+export type StorageResultSnapshot =
+  | { readonly kind: 'ok'; readonly data: readonly number[] }
+  | {
+      readonly kind: 'failed';
+      readonly reason: 'io_timeout' | 'storage_corruption' | 'cancelled' | 'device_failed';
+    };
+
+/** LBA means 512-byte sector index; data bytes are integers in [0, 255]. */
+export type StorageTransferSnapshot =
+  | { readonly kind: 'read'; readonly lba: BlockId; readonly bytes: number }
+  | { readonly kind: 'write'; readonly lba: BlockId; readonly data: readonly number[] };
+
+/**
+ * A live consumer owns pid/tid, cache generation or pager waiter. After explicit
+ * cancellation this is correlation history; consumer teardown may remove it.
+ */
+export type StorageConsumerSnapshot =
+  | { readonly kind: 'io'; readonly requestId: number }
+  | { readonly kind: 'cache'; readonly flushId: number }
+  | { readonly kind: 'paging'; readonly vmRequestId: number; readonly operation: 'read' | 'write' }
+  | { readonly kind: 'direct' };
+
+/**
+ * Accepted logical work, retained until the consumer accepts its result or all
+ * cancelled physical work drains. ID is storage-owned, independent of Io IDs.
+ * A result has exactly one owner: this record until consumed, then Io/cache/
+ * paging. Consumed records are removed; readyRequestIds is the delivery order.
+ */
+export type StorageRequestSnapshot = {
+  readonly id: number;
+  readonly consumer: StorageConsumerSnapshot;
+  readonly pid: Pid | null;
+  readonly transfer: StorageTransferSnapshot;
+  readonly queuedAtTick: Tick;
+  /** Live media work only; cleared after its result is accepted into completion. */
+  readonly target:
+    | { readonly kind: 'disk'; readonly driveId: string; readonly physicalOperationId: number }
+    | { readonly kind: 'nvm'; readonly deviceId: DeviceId }
+    | { readonly kind: 'raid'; readonly arrayId: string; readonly transactionId: number }
+    | null;
+  /** Cancellation suppresses waiter delivery; an already committed write may drain. */
+  readonly cancelledAtTick: Tick | null;
+  readonly completion: {
+    readonly completedAtTick: Tick;
+    readonly result: StorageResultSnapshot;
+  } | null;
+};
+
+export type StorageDiskGeometrySnapshot = {
+  readonly cylinders: number;
+  readonly headsPerCylinder: number;
+  readonly sectorsPerTrack: number;
+  readonly bytesPerSector: number;
+  readonly rpm: number;
+  readonly seekOverheadMs: number;
+  readonly seekPerCylinderMs: number;
+  readonly transferMbPerSec: number;
+};
+
+/**
+ * One real issued physical operation. RAID's unissued dependency plans live in
+ * its own alias; they acquire this global ID only when dispatched to a drive.
+ * Foreground DiskRequest projection uses id/pid/cylinder/write/queuedAtTick/
+ * servedAtTick from here (write is derived from transfer.kind). Virtual route
+ * endpoints never create operations. Null pid denotes ownerless kernel work;
+ * it cannot produce process.starving or a user waiter. A shared pure helper over
+ * {id,cylinder,queuedAtTick} serves both frozen-policy wrappers for real actor
+ * DiskRequests and these physical queues. No null-pid/fake DiskRequest is made.
+ */
+export type StorageDiskOperationSnapshot = {
+  readonly id: number;
+  readonly driveId: string;
+  readonly owner:
+    | { readonly kind: 'request'; readonly requestId: number }
+    | {
+        readonly kind: 'raid'; readonly arrayId: string;
+        readonly transactionId: number; readonly operationId: number;
+      };
+  readonly pid: Pid | null;
+  readonly cylinder: number;
+  readonly transfer: StorageTransferSnapshot;
+  readonly queuedAtTick: Tick;
+  readonly servedAtTick: Tick | null;
+  readonly starvationNotified: boolean;
+  readonly result: StorageResultSnapshot | null;
+};
+
+/**
+ * Committed service is never recalculated after a policy/multiplier change.
+ * A leg is head travel only: one disk.seek event when that leg is committed.
+ * Absolute leg deadlines preserve the event/head cursor without requiring a
+ * mutable cost model at restore. Several legs may share a tick. The request's
+ * completeAtTick is based on ONE overhead + all leg travel + ONE rotation and
+ * transfer, rounded ONCE; it is not the sum of rounded leg service times.
+ */
+export type StorageCommittedRouteSnapshot = {
+  readonly physicalOperationId: number;
+  readonly policy: DiskSchedulingId;
+  readonly startedAtTick: Tick;
+  readonly completeAtTick: Tick;
+  readonly directionAfter: 'up' | 'down';
+  readonly legs: readonly {
+    readonly from: number;
+    readonly to: number;
+    readonly completeAtTick: Tick;
+  }[];
+  /** Prefix already moved/emitted; 0 <= nextLegIndex <= legs.length. */
+  readonly nextLegIndex: number;
+};
+
+/**
+ * Exactly one queue and durable byte store per physical disk, including RAID
+ * members/spares. Private driveId is not a fifth kernel-visible Device.
+ * Head.totalCylinders is projected from geometry.cylinders. Shared top-level
+ * diskQueue/diskHead project disk0's real actor requests/head; they are not a
+ * second persistence authority. A projected DiskRequest's pid remains Pid.
+ */
+export type StorageDiskDriveSnapshot = {
+  readonly driveId: string;
+  readonly geometry: StorageDiskGeometrySnapshot;
+  readonly head: { readonly cylinder: number; readonly direction: 'up' | 'down' };
+  /** Arrival order of issued, service-eligible operations; excludes active. */
+  readonly queue: readonly number[];
+  readonly active: StorageCommittedRouteSnapshot | null;
+  /** Canonical ascending LBA; exactly bytesPerSector bytes; absent sectors=zero. */
+  readonly sectors: readonly { readonly lba: BlockId; readonly data: readonly number[] }[];
+  readonly statistics: {
+    readonly totalHeadMovement: number;
+    /** Successful real disk services, including ones whose consumer exited. */
+    readonly completedRequests: number;
+    /** Welford moments over servedAtTick - queuedAtTick, no unbounded history. */
+    readonly meanWaitTicks: number;
+    readonly waitM2TicksSquared: number;
+  };
+};
+
+/**
+ * Attached only by attachPagingStorage(); never inferred from storage.enabled.
+ * A nonnull saved adapter restores prior explicit attachment. The original VM
+ * slot still owns its requests, phase, frame reservations and final dueTick.
+ */
+export type StoragePagingAdapterSnapshot = {
+  readonly target:
+    | { readonly kind: 'disk'; readonly driveId: string }
+    | { readonly kind: 'nvm'; readonly deviceId: DeviceId }
+    | { readonly kind: 'raid'; readonly arrayId: string };
+  /** Address allocation is local to this configured backing extent. */
+  readonly firstSector: BlockId;
+  readonly sectorCount: number;
+  readonly pageBytes: number;
+  /**
+   * Canonical (space,page) order. Slots are lowest available aligned page spans
+   * inside the extent. Each span occupies ceil(pageBytes/512) sectors. A mapping
+   * cannot be reused while a cancelled in-flight operation can still touch it.
+   */
+  readonly mappings: readonly {
+    readonly space: AddressSpaceId;
+    readonly page: PageId;
+    readonly firstSector: BlockId;
+  }[];
+  /** Submission order; global storage ID distinguishes write-back then read. */
+  readonly transfers: readonly StoragePagingTransferSnapshot[];
+};
+
+export type StoragePagingTransferSnapshot = {
+  /** Live reference while pending/cancelling; historical correlation after ACK. */
+  readonly storageRequestId: number;
+  readonly vmRequestId: number;
+  readonly operation: 'read' | 'write';
+  readonly pid: Pid;
+  /** Actual backing ASID/page; dirty writes name the victim, never the faulting page. */
+  readonly backing: { readonly space: AddressSpaceId; readonly page: PageId };
+  readonly frame: FrameId;
+  /**
+   * Original WP-06 floor for THIS stage: write uses serviceBase+majorFaultTicks;
+   * read uses the existing dueTick. A media ACK can delay, never shorten it.
+   */
+  readonly notBeforeTick: Tick;
+  readonly state:
+    | { readonly kind: 'pending' }
+    | {
+        readonly kind: 'acknowledged';
+        readonly completedAtTick: Tick;
+        readonly result: StorageResultSnapshot;
+      }
+    | { readonly kind: 'cancelled'; readonly cancelledAtTick: Tick };
+};
+
+/** Exact proposed storage envelope; payload and every compound child are literals. */
+export interface StorageSnapshotState {
+  readonly owner: 'storage';
+  readonly version: 1;
+  readonly payload: {
+    readonly tick: Tick;
+    readonly settings: {
+      readonly msPerTick: number;
+      readonly diskStarvationThreshold: number;
+      readonly rebuildBlocksPerTick: number;
+      readonly rebuildProgressInterval: number;
+    };
+    readonly policy: DiskSchedulingId;
+    readonly costMultiplier: number;
+    readonly nextRequestId: number;
+    readonly nextPhysicalOperationId: number;
+    /** Canonical ID order; counters never reuse acknowledged IDs. */
+    readonly requests: readonly StorageRequestSnapshot[];
+    readonly physicalOperations: readonly StorageDiskOperationSnapshot[];
+    /** Exact production order awaiting consumer acceptance, not recomputed by ID. */
+    readonly readyRequestIds: readonly number[];
+    readonly readyPhysicalOperationIds: readonly number[];
+    /** Canonical private driveId order; includes replacement members. */
+    readonly drives: readonly StorageDiskDriveSnapshot[];
+    readonly nvm: readonly StorageNvmSnapshot[];
+    readonly raid: readonly StorageRaidSnapshot[];
+    readonly paging: StoragePagingAdapterSnapshot | null;
+  };
+}
+
+/** References one page-sized portion of an owned global storage request. */
+export type StorageNvmPartRefSnapshot = {
+  readonly requestId: number;
+  readonly partIndex: number;
+};
+
+export type StorageNvmSnapshot = {
+  readonly deviceId: DeviceId;
+  readonly geometry: {
+    readonly pages: number;
+    readonly logicalPages: number;
+    readonly pagesPerBlock: number;
+    readonly readUs: number;
+    readonly writeUs: number;
+    readonly eraseUs: number;
+    readonly overProvisionRatio: number;
+  };
+  /** Installed capacity, checked against the owning storage configuration. */
+  readonly writeBufferPages: number;
+  /**
+   * Ascending physical page index. Each byte image is exactly 4096 bytes.
+   * Non-null logicalPage is the authoritative logical-to-physical mapping;
+   * null means programmed but invalid. No second map/free/invalid list is saved.
+   * An absent physical page is erased/free unless reserved by active foreground
+   * programming or the unfinished destinations in gc.relocations.
+   */
+  readonly programmedPages: readonly {
+    readonly physicalPage: number;
+    readonly logicalPage: number | null;
+    readonly data: readonly number[];
+  }[];
+  /** Dense erase-block-index order; lifetime wear survives measurement resets. */
+  readonly eraseCounts: readonly number[];
+  /** Monotonic generation identity shared by buffers and detached flush images. */
+  readonly nextGeneration: number;
+  /**
+   * Buffer order is the live eviction order. Each image contains the complete
+   * current 4096-byte page, including untouched bytes. Parts are acknowledged
+   * only after this generation has been physically programmed.
+   */
+  readonly buffers: readonly {
+    readonly logicalPage: number;
+    readonly generation: number;
+    readonly data: readonly number[];
+    readonly parts: readonly StorageNvmPartRefSnapshot[];
+  }[];
+  /**
+   * FIFO detached flush images, including any generation being programmed.
+   * A newer buffer for the same page may coexist; its bytes cannot replace an
+   * older in-flight image. An image leaves this list at durable completion.
+   */
+  readonly programs: readonly {
+    readonly logicalPage: number;
+    readonly generation: number;
+    readonly data: readonly number[];
+    readonly parts: readonly StorageNvmPartRefSnapshot[];
+  }[];
+  /**
+   * Original request address, operation and write bytes remain in the global
+   * storage request table. These records preserve page splitting, partial read
+   * results and durability fan-in. Completed writes have ok/data:[]; reads have
+   * exactly byteCount result bytes. Completed logical requests leave this list.
+   */
+  readonly requests: readonly {
+    readonly requestId: number;
+    readonly parts: readonly {
+      readonly logicalPage: number;
+      readonly pageOffset: number;
+      readonly byteCount: number;
+      readonly result: StorageResultSnapshot | null;
+    }[];
+  }[];
+  /** Ordered not-yet-accepted portions; active reads leave this list on start. */
+  readonly pendingParts: readonly StorageNvmPartRefSnapshot[];
+  /**
+   * The controller has one serial media engine, independent of HDD policy.
+   * Timing is absolute, so a restore neither repeats nor loses elapsed work.
+   * The foreground program destination is reserved until its atomic commit.
+   */
+  readonly active: {
+    readonly startedAtTick: Tick;
+    readonly completeAtTick: Tick;
+    readonly operation:
+      | {
+          readonly kind: 'read'; readonly part: StorageNvmPartRefSnapshot;
+          /** Stable read image selected at start, before later buffered writes. */
+          readonly data: readonly number[];
+        }
+      | { readonly kind: 'program'; readonly generation: number; readonly physicalPage: number }
+      | { readonly kind: 'gc' };
+  } | null;
+  /**
+   * The complete destination reservation is made before copying starts. Sources
+   * are in ascending page order. GC excludes foreground media mutation while
+   * this plan is live; an unfinished source therefore retains the bytes needed
+   * for its program phase, without a redundant copy buffer. Each completed
+   * relocation atomically remaps its page and advances nextRelocation. Erasure
+   * follows all copies. Phase plus active deadline retains read/program work.
+   * Mutating controls such as trim return EBUSY while this plan is active;
+   * rejected controls enqueue no deferred work or hidden continuation.
+   */
+  readonly gc: {
+    readonly victimBlock: number;
+    readonly relocations: readonly {
+      readonly sourcePage: number;
+      readonly destinationPage: number;
+    }[];
+    readonly nextRelocation: number;
+    readonly phase: 'read' | 'program' | 'erase';
+  } | null;
+  /**
+   * Measurement counters may reset after preconditioning; page state and wear
+   * do not. WA = 4096 * (foregroundPrograms + relocationPrograms) /
+   * logicalBytesWritten, with a defined zero-denominator presentation policy.
+   * Count bytes accepted by host writes, not the number of small-write calls.
+   */
+  readonly counters: {
+    readonly logicalBytesWritten: number;
+    readonly logicalBytesRead: number;
+    readonly foregroundPrograms: number;
+    readonly relocationPrograms: number;
+    readonly pageReads: number;
+    readonly blockErases: number;
+  };
+};
+
+/**
+ * RAID plans contain all physical operations, including dependency-blocked ones.
+ * These plans are included when deriving the pre-service member queue lengths.
+ * On issue, the disk subsystem owns the physical request, deadline, route and
+ * write bytes. After acknowledgement its result is retained here only while a
+ * dependent operation or the logical completion still needs it.
+ */
+export type StorageRaidOperationSnapshot = {
+  readonly id: number;
+  readonly memberIndex: number;
+  /** A rebuild can target a spare rather than the member's current drive. */
+  readonly driveId: string;
+  readonly sectorLba: BlockId;
+  readonly dependsOn: readonly number[];
+  readonly operation:
+    | { readonly kind: 'read' }
+    | {
+        readonly kind: 'write';
+        /**
+         * Every physical write is one 512-byte sector. Computed sources are
+         * derived from the transaction's retained read results and original
+         * global request input when dependencies are satisfied. There are no
+         * separately saved parity caches or duplicate durable member bytes.
+         */
+        readonly source:
+          | { readonly kind: 'request'; readonly byteOffset: number }
+          | { readonly kind: 'p'; readonly stripe: number }
+          | { readonly kind: 'q'; readonly stripe: number }
+          | { readonly kind: 'reconstructed'; readonly stripe: number; readonly memberIndex: number }
+          | { readonly kind: 'mirror'; readonly readOperationId: number };
+      };
+  readonly state:
+    | { readonly kind: 'planned' }
+    | { readonly kind: 'submitted'; readonly physicalOperationId: number }
+    | { readonly kind: 'settled'; readonly result: StorageResultSnapshot };
+};
+
+export type StorageRaidTransactionSnapshot = {
+  readonly id: number;
+  readonly purpose:
+    | { readonly kind: 'request'; readonly requestId: number }
+    | {
+        readonly kind: 'rebuild';
+        readonly memberIndex: number;
+        readonly sectorLba: BlockId;
+      };
+  /**
+   * ID order is the deterministic issuance tie-break. Dependencies retain
+   * read-before-write ordering. Full-stripe writes are represented by plans
+   * containing only their data/P/Q writes; alignment and stripe width derive
+   * from the original request and array level, with no independent flag.
+   */
+  readonly operations: readonly StorageRaidOperationSnapshot[];
+};
+
+export type StorageRaidSnapshot = {
+  readonly arrayId: string;
+  readonly level: RaidLevel;
+  readonly blocksPerMember: number;
+  /** Fatal loss is latched; draining rebuild work cannot resurrect this array. */
+  readonly dataLost: boolean;
+  /**
+   * Array order is physical member index. Mirror pairs are adjacent. Version 1
+   * fixes RAID-5/6 P=(n-1-(stripe%n)); RAID-6 Q=(P-1+n)%n, with remaining data
+   * members in ascending index order. P is bytewise XOR; Q is bytewise GF(256)
+   * with primitive polynomial 0x11d and coefficients 2^dataOrdinal. RAID 6
+   * requires 2 <= n-2 <= 255, so these coefficients are distinct and nonzero.
+   * Durable data and P/Q bytes live only in the referenced
+   * StorageDiskDriveSnapshot sector maps, including spares.
+   * dataLost dominates availability; otherwise member failures determine it.
+   */
+  readonly members: readonly {
+    readonly driveId: string;
+    readonly failed: boolean;
+  }[];
+  /**
+   * Authoritative available-spare pool in deterministic selection order. Each
+   * available drive belongs to one array's pool and appears in no member table
+   * or active rebuild row. Selection removes the first ID and transfers
+   * ownership to that member's rebuild row;
+   * no constructor-only spare inventory or ordering is needed after restore.
+   */
+  readonly spareDriveIds: readonly string[];
+  readonly nextTransactionId: number;
+  readonly nextOperationId: number;
+  /** Ordered transactions own foreground and rebuild plans through completion. */
+  readonly transactions: readonly StorageRaidTransactionSnapshot[];
+  /** Pause stops new rebuild issuance; already-issued physical work continues. */
+  readonly rebuildPaused: boolean;
+  /**
+   * One row per failed member being repaired; RAID 6 may have two. Source reads
+   * and spare writes are ordinary transactions through the shared disk queues.
+   * Spare identities come from spareDriveIds, not constructor-only configuration.
+   * Issuance cap and progress interval are persisted in storage.settings as
+   * rebuildBlocksPerTick and rebuildProgressInterval; there is no per-array copy.
+   */
+  readonly rebuilds: readonly {
+    readonly memberIndex: number;
+    readonly spareDriveId: string;
+    /** Count/cursor, including the one-past-end value blocksPerMember. */
+    readonly nextSectorToIssue: number;
+    /** All sectors below this index have completed; no dense bitmap is needed. */
+    readonly completedPrefix: number;
+    /** Sorted completed sectors beyond the prefix support out-of-order I/O. */
+    readonly completedBeyondPrefix: readonly BlockId[];
+    readonly nextProgressAtTick: Tick;
+  }[];
+  /**
+   * Lifetime counters remain after completed plans are retired. Throughput is
+   * measured from completed logical work, never inferred from the issuance cap.
+   * The shared issuance budget resets in phase 1; only completed ticks are saved.
+   */
+  readonly counters: {
+    readonly completedReadBlocks: number;
+    readonly completedWriteBlocks: number;
+    readonly completedRebuildBlocks: number;
+    readonly issuedPhysicalReads: number;
+    readonly issuedPhysicalWrites: number;
+    readonly completedPhysicalReads: number;
+    readonly completedPhysicalWrites: number;
+  };
+};
+
+/** WP-09 I/O continuation at a completed-tick boundary. Plain versioned data. */
+export interface IoSnapshotState {
+  readonly owner: 'io';
+  readonly version: 1;
+  readonly payload: {
+    readonly tick: Tick;
+    readonly settings: {
+      readonly interruptServiceTicks: number;
+      readonly maxInterruptsPerTick: number;
+      readonly interruptStormThreshold: number;
+      readonly interruptStormWindow: number;
+      readonly maxPendingInterrupts: number;
+      readonly dmaCycleStealRatio: number;
+      readonly blockCacheEntries: number;
+    };
+    readonly nextRequestId: number;
+    readonly nextInterruptTokenId: number;
+    readonly nextFlushId: number;
+    readonly nextSyncId: number;
+    readonly nextSpoolJobId: number;
+    readonly lastTimerTick: Tick | null;
+    readonly lastCompletionTick: Tick | null;
+    /** Included in scheduler.runtime.switchDebt, not added again on restore. */
+    readonly kernelDebt: number;
+    /** Work recorded outside phase 3; excluded from kernelDebt until posted there. */
+    readonly pendingKernelCharges: readonly {
+      readonly kind: 'interrupt' | 'copy';
+      readonly device: DeviceId;
+      /** Provenance may name a completed/cancelled request below nextRequestId. */
+      readonly requestId: number | null;
+      readonly ticks: number;
+    }[];
+    readonly cpuCharges: {
+      readonly issueTicks: number;
+      readonly interruptTicks: number;
+      readonly copyTicks: number;
+      readonly dmaStealTicks: number;
+    };
+    /** Includes historical pids so cleanup does not erase charged polling time. */
+    readonly pollTicks: readonly { readonly pid: Pid; readonly ticks: number }[];
+    readonly devices: readonly IoSnapshotDevice[];
+    readonly requests: readonly IoSnapshotRequest[];
+    readonly interrupts: {
+      readonly lines: readonly {
+        readonly device: DeviceId;
+        readonly priority: number;
+        readonly maskable: boolean;
+        /** FIFO tokens are authoritative; pending is this array's length. */
+        readonly pending: readonly IoSnapshotInterruptToken[];
+        readonly panicEmitted: boolean;
+      }[];
+      readonly masks: readonly DeviceId[];
+      /** Bottom to top; must be empty at a completed-tick snapshot boundary. */
+      readonly serviceStack: readonly { readonly device: DeviceId; readonly token: IoSnapshotInterruptToken }[];
+      readonly budgetTick: Tick | null;
+      readonly deliveredThisTick: number;
+      readonly lastStormSampleTick: Tick | null;
+      readonly storm: null | {
+        readonly device: DeviceId;
+        readonly sourcePid: Pid | null;
+        readonly beganAtTick: Tick;
+        readonly ticksHeld: number;
+        readonly stage: 'observed' | 'afflicted' | 'masked' | 'terminated';
+      };
+    };
+    readonly buffers: readonly IoSnapshotBuffer[];
+    readonly cache: {
+      readonly policy: 'write_through' | 'write_back';
+      /** Global, never reused after eviction; capacity is global across devices. */
+      readonly nextGeneration: number;
+      readonly hits: number;
+      readonly misses: number;
+      /** Identity (device, block); eviction order is (recency, block, device). */
+      readonly entries: readonly {
+        readonly device: DeviceId;
+        readonly block: BlockId;
+        readonly contents: readonly number[];
+        readonly loadedAtTick: Tick;
+        readonly lastAccessTick: Tick | null;
+        readonly generation: number;
+        readonly durableGeneration: number;
+      }[];
+      /** A newer generation stays dirty when an older captured flush completes. */
+      readonly flushes: readonly {
+        readonly id: number;
+        readonly device: DeviceId;
+        readonly block: BlockId;
+        readonly generation: number;
+        readonly contents: readonly number[];
+        readonly reason: 'write_through' | 'eviction' | 'sync';
+        readonly progress:
+          | { readonly kind: 'queued' }
+          /** Exactly one delivery owner: this I/O request OR direct storage below. */
+          | { readonly kind: 'io'; readonly requestId: number }
+          | { readonly kind: 'storage'; readonly storageRequestId: number }
+          | { readonly kind: 'completed'; readonly result: IoSnapshotMediaResult };
+      }[];
+      /** The incoming request cannot replace a dirty victim before its flush. */
+      readonly admissions: readonly {
+        readonly requestId: number;
+        readonly device: DeviceId;
+        readonly block: BlockId;
+        readonly evictionFlushId: number | null;
+      }[];
+      readonly syncs: readonly {
+        readonly id: number;
+        readonly actor: IoSnapshotActor;
+        readonly requestedAtTick: Tick;
+        readonly flushIds: readonly number[];
+        readonly completed: boolean;
+      }[];
+    };
+    readonly spools: readonly {
+      readonly device: DeviceId;
+      readonly enabled: boolean;
+      /** Whole jobs in FCFS order; unspooled jobs retain individual offsets. */
+      readonly jobs: readonly {
+        readonly id: number;
+        readonly owner: { readonly kind: 'actor'; readonly actor: IoSnapshotActor } | { readonly kind: 'fixture' };
+        readonly outputInode: InodeId;
+        readonly submittedAtTick: Tick;
+        readonly contents: readonly number[];
+        readonly offset: number;
+        readonly requestId: number | null;
+        readonly corruptionEmitted: boolean;
+      }[];
+      readonly activeJobId: number | null;
+      readonly lastWriterJobId: number | null;
+    }[];
+  };
+}
+
+export type IoSnapshotActor = { readonly pid: Pid; readonly tid: Tid };
+
+export type IoSnapshotMediaResult =
+  | { readonly kind: 'ok'; readonly data: readonly number[] }
+  | { readonly kind: 'failed'; readonly reason: 'io_timeout' | 'storage_corruption' | 'cancelled' | 'device_failed' };
+
+export type IoSnapshotResult = IoSnapshotMediaResult | { readonly kind: 'lost' };
+
+export type IoSnapshotRequest = {
+  readonly id: number;
+  readonly owner:
+    | { readonly kind: 'actor'; readonly actor: IoSnapshotActor }
+    | { readonly kind: 'cache'; readonly flushId: number }
+    | { readonly kind: 'spool'; readonly jobId: number }
+    | { readonly kind: 'kernel'; readonly purpose: 'console_flush' | 'fixture' };
+  readonly device: DeviceId;
+  readonly submittedAtTick: Tick;
+  readonly startedAtTick: Tick | null;
+  readonly wordSize: number;
+  /** BlockId/LBAs are 512-byte sector addresses; filesystem conversion is WP-10's. */
+  readonly command:
+    | { readonly kind: 'read'; readonly lba: BlockId; readonly bytes: number }
+    | { readonly kind: 'write'; readonly lba: BlockId; readonly contents: readonly number[] }
+    | { readonly kind: 'character'; readonly contents: readonly number[] }
+    | { readonly kind: 'packet'; readonly contents: readonly number[] };
+  /** Storage owns media progress until acknowledgment transfers its result here. */
+  readonly service:
+    | { readonly kind: 'queued' }
+    | { readonly kind: 'timer'; readonly remainingTicks: number }
+    | { readonly kind: 'storage'; readonly storageRequestId: number }
+    | { readonly kind: 'completed'; readonly atTick: Tick; readonly result: IoSnapshotResult };
+  readonly continuation:
+    | {
+        readonly mode: 'polling';
+        readonly setupTicksRemaining: number;
+        readonly copiedWords: number;
+        readonly wastedPolls: number;
+        readonly wastedEventEmitted: boolean;
+      }
+    | {
+        readonly mode: 'interrupt';
+        readonly setupTicksRemaining: number;
+        readonly copyDebt: 'not_due' | 'pending' | 'charged';
+      }
+    | {
+        readonly mode: 'dma';
+        readonly setupTicksRemaining: number;
+        readonly transferTicks: number;
+        readonly elapsedTransferTicks: number;
+        readonly stealBudget: number;
+        readonly stealsCharged: number;
+        readonly stealAccumulator: number;
+        readonly dmaEventEmitted: boolean;
+      };
+  /** Distinguishes a pending instruction from its already-retired blocking issue. */
+  readonly instructionRetired: boolean;
+  readonly wakeable: boolean;
+};
+
+export type IoSnapshotInterruptToken = {
+  readonly id: number;
+  readonly raisedAtTick: Tick;
+} & (
+  | { readonly kind: 'completion'; readonly requestId: number }
+  | { readonly kind: 'signal'; readonly sourcePid: Pid | null }
+  | { readonly kind: 'timer' }
+  | { readonly kind: 'panic'; readonly message: string }
+);
+
+export type IoSnapshotDevice = {
+  readonly id: DeviceId;
+  readonly displayName: string;
+  readonly defaultMode: IoMode;
+  readonly mode: IoMode;
+  readonly latency: number;
+  readonly wordSize: number;
+  /** Requests awaiting device service; excludes activeRequestId. */
+  readonly requestOrder: readonly number[];
+  readonly activeRequestId: number | null;
+  /** Pending completion tokens moved out of a masked interrupt line, in order. */
+  readonly pollingTokens: readonly IoSnapshotInterruptToken[];
+  readonly mitigation: null | {
+    readonly priorMode: IoMode;
+    readonly wasMasked: boolean;
+    readonly healthyTicks: number;
+    readonly nextPollAtTick: Tick;
+  };
+  readonly driver:
+    | {
+        readonly kind: 'disk0';
+        /** Null is unavailable storage, never an implicit timer fallback. */
+        readonly backing:
+          | { readonly kind: 'disk'; readonly driveId: string }
+          | { readonly kind: 'raid'; readonly arrayId: string }
+          | null;
+      }
+    | { readonly kind: 'nvm0'; readonly backing: { readonly deviceId: DeviceId } | null }
+    | { readonly kind: 'character_output'; readonly output: readonly number[] }
+    | { readonly kind: 'net0'; readonly lossProbability: number }
+    /** Explicit test adapters; neither is an additional shipped driver module. */
+    | { readonly kind: 'timer_fixture' }
+    | { readonly kind: 'printer_fixture'; readonly output: readonly number[] };
+};
+
+export type IoSnapshotBuffer = {
+  readonly device: DeviceId;
+  readonly scheme:
+    | { readonly kind: 'single' }
+    | { readonly kind: 'double' }
+    | { readonly kind: 'circular'; readonly capacity: number };
+  readonly producerTicks: number;
+  readonly consumerTicks: number;
+  /** FIFO order; fill/drain records below also occupy buffers. */
+  readonly ready: readonly { readonly requestId: number; readonly contents: readonly number[] }[];
+  readonly filling: null | { readonly requestId: number; readonly contents: readonly number[]; readonly remainingTicks: number };
+  readonly draining: null | { readonly requestId: number; readonly contents: readonly number[]; readonly remainingTicks: number };
+  readonly producerWaiters: readonly number[];
+  readonly consumerWaiters: readonly number[];
+  readonly occupancySamples: readonly { readonly tick: Tick; readonly occupancy: number }[];
+  readonly stalls: number;
+};
 
 /** WP-08 deadlock continuation. Plain versioned data, not a live graph view. */
 export interface DeadlockSnapshotState {
