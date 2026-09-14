@@ -54,7 +54,9 @@ every piece of content you generate: `SafetyTraceStep.explanation` strings,
 | `DeadlockReport.cycle` | 8.3.2 | **8.7.1** | 8.3.2 is the resource-allocation graph. The wait-for graph and its cycle test are 8.7.1. |
 
 Do not correct the comments in `types.ts`. Do not cite 8.6.2 or 8.3.2 in anything
-you write.
+you write. (As of amendment 3 the frozen comments at `SafetyCheckResult.sequence`
+and `DeadlockReport.cycle` already read 8.6.1 and 8.7.1; the table above is kept
+so the grep test's purpose stays documented.)
 
 ## Files you will create
 
@@ -203,9 +205,14 @@ state.
 `DeadlockReport.conditions` is built by testing each predicate against the edges
 of the discovered cycle and including the ones that hold. For a genuine deadlock
 all four are present. The array exists so the codex can highlight which edge
-demonstrates which, and so a **near-deadlock** with three of four can be shown as
-a warning. Expose `nearDeadlocks()` returning the three-of-four cases separately;
-do not emit `deadlock.detected` for them.
+demonstrates which. For a discovered cycle all four always hold: `no_preemption`
+means no holder on the cycle will give its resource up voluntarily, which is
+true of every blocked holder, and a resource being marked `preemptible` is a
+recovery property (it lets recovery choose `preempt` or `rollback`), not a
+reason to withhold detection. The **near-deadlock** a warning can show is the
+three-of-four case without a cycle: a hold-and-wait chain over exclusive
+resources that has not closed. Expose `nearDeadlocks()` returning those chains;
+do not emit `deadlock.detected` for them. (Corrected 2026-09-14.)
 
 `no_preemption` is the condition SABLE's shield attacks: it flips `preemptible`
 to true on one resource for 20 ticks. The kernel must not know the Program's
@@ -412,9 +419,10 @@ Leg 6's opening condition.
 every `deadlockDetectionInterval` ticks and recovery runs on a positive result.
 
 **`'avoid'`.** The `request` syscall runs the Banker's resource-request
-algorithm. Every process declares `Max` at admission, taken from `ProcessSpec`. A
-process requesting beyond its declared max gets `EINVAL` and is terminated with
-`protection_fault`. **Phase 9 does no detection work at all** under this
+algorithm. Every process declares `Max` before admission through
+`declareClaims(pid, claims)` on the kernel (undeclared means zero; `ProcessSpec`
+has no such field and is not changed). A process requesting beyond its declared
+max gets `EINVAL` and is terminated with `protection_fault`. **Phase 9 does no detection work at all** under this
 strategy.
 
 **`'prevent'`.** Circular wait prevention by total resource ordering, Ch. 8.5.4,
@@ -502,12 +510,12 @@ Expose the per-strategy comparison the Leg 6 debrief card needs:
 | `adjacency sorted` | every adjacency list is strictly ascending |
 | `edge from requestedResources` | a process waiting on a resource held by two others gets edges to both |
 | `edge from mutex` | a process blocked on a mutex gets an edge to its holder and not to itself |
-| `edge from semaphore` | a process blocked on a semaphore gets edges to every holder |
+| `edge from semaphore` | a process blocked on a binary semaphore declared as a lock role by its scenario gets an edge to that lock's holder; a wait on a generic counting semaphore gets edges only to the signallers its scenario declares, never to permit holders |
 | `edge from child_wait` | `blockedOn: { kind: 'child_wait', child: 7 }` gives an edge to pid 7; `child: null` gives no edge |
 | `mailbox rendezvous cycle` | two processes that each `send` first on a capacity-0 mailbox produce a two-node cycle through the synthetic `mbox:` ids |
 | `non-waiting process` | a `ready` process appears as a node with an empty adjacency list |
 | `iterative dfs depth` | a 100,000-node chain does not overflow the stack |
-| `deterministic choice` | a graph containing two disjoint cycles always reports the one containing the lowest pid |
+| `deterministic choice` | ascending-start DFS reports the first cycle it discovers; with two disjoint cycles whose members are their own only entry points, that is the one containing the lowest pid, and the fixture is built that way |
 
 ### `tests/kernel/deadlock/bankers.test.ts`
 
@@ -558,8 +566,8 @@ Expose the per-strategy comparison the Leg 6 debrief card needs:
 | `termination reason` | every victim carries `terminationReason: 'deadlock_victim'` |
 | `preempt preferred` | with a preemptible resource on the cycle, recovery uses `method: 'preempt'` and terminates nobody |
 | `preempt fallback` | with no preemptible resource, recovery falls back to `method: 'terminate'` |
-| `rollback restores` | with a checkpoint 12 ticks old, the holder's `serviceRemaining` is restored to the checkpoint value and the method is `'rollback'` |
-| `checkpoint interval` | checkpoints are taken on ticks 25, 50, 75 and store exactly three fields |
+| `rollback restores` | with a resource-free checkpoint 12 ticks old, the holder's program counter returns to the checkpoint, its request is cancelled, its held instances are returned, it becomes ready, and the method is `'rollback'`; service budgets and CPU used are not rewound |
+| `checkpoint interval` | checkpoints are refreshed on ticks 25, 50, 75 while the process holds nothing, and store exactly `{ pid, tid, tick, programCounter }` |
 | `preemption guard` | a process preempted 3 times becomes ineligible and the fourth recovery terminates instead |
 | `shield converts` | `setPreemptible(r, true, tick + 20)` turns a termination into a preemption, and after 20 ticks the resource is non-preemptible again |
 | `I-5 holds` | across a 5000-tick randomised run, `availableInstances + sum(allocation column) === totalInstances` for every resource on every tick |
@@ -698,4 +706,142 @@ What sync exposes to you, from the WP-07 report:
   `process/ipc.ts`; the wait-for graph must see them.
 - Every WP-07 module keeps state in side tables keyed by actor; there is no
   new PCB or TCB field, and there must be none from you either.
+
+## Pre-flight decisions 2026-09-14
+
+The WP-08 agent's pre-flight mapped all twenty-two acceptance criteria,
+requested seven grants and proposed thirteen decision groups. Every code and
+spec claim in it was checked at df6dcaa before this section was written. All
+are approved as below, with one override (S7) and the qualifications noted.
+The spec and package corrections in S13 were applied in the same commit.
+
+### Grants G1 to G7, approved
+
+- **G1.** Three additions to `src/kernel/sync/SyncSubsystem.ts` and nothing
+  else in `src/kernel/sync/**`: `installDeadlockHooks({ onDeclare,
+  beforeAcquire })` and `allScenarios()`, with the exact surface the
+  pre-flight proposed. `beforeAcquire` runs after the primitive is identified
+  and before any mutation, queue change or RNG draw; a rejection returns
+  without blocking. No sync algorithm changes, and `tests/kernel/sync/**`
+  stays untouched.
+- **G2.** Constructor host callbacks for resource blocking, completion and
+  rollback, and resource readiness routing in the private `isSatisfied`
+  helper. `BlockReason` has no resource kind, so a resource-table wait blocks
+  with `{ kind: 'semaphore', resource }`; the helper checks the deadlock
+  subsystem's ownership of that id after the IPC match and before delegating
+  to sync. Resource-table ids, sync ids and synthetic mailbox ids must never
+  collide, and the subsystem rejects a declaration that would.
+- **G3.** Compose deadlock cleanup at the lifecycle callbacks
+  (`releaseResources`, `removeFromWaitQueues`, `detachIpc`) so instances are
+  returned before the PCB arrays are cleared and exec invalidates
+  checkpoints. Composition wraps the existing callback bodies; it does not
+  edit `lifecycle.ts`.
+- **G4.** Constructor registration of per-tick bookkeeping through the
+  existing `onPhase` probe (phase 1 expiry, phase 9 observation and
+  checkpoints, phase 11 statistics), and composition of the existing
+  invariant hook by wrapping, the way WP-07 wrapped the scheduler hook. The
+  probe runs at phase start, is deterministic, never runs DFS or
+  multi-instance detection outside the gated `maybeDetect`, and leaves all
+  eleven phase bodies and the phase 9 gate unchanged. `MetricsHooks` is not
+  extended; deadlock statistics are read through the subsystem.
+- **G5.** Four tuning keys in `config.ts`, exactly: `rollbackCheckpointInterval`
+  (25, integer >= 1), `maxPreemptionsPerProcess` (3, integer >= 1),
+  `preventionMode` (`'ordering'` | `'all_or_nothing'`), `deadlockRecovery`
+  (`'none'` | `'abort_one'` | `'abort_all'` | `'preempt'`, default
+  `'abort_one'`).
+- **G6.** Additive exports in `src/kernel/index.ts` for the resource,
+  recovery and report APIs.
+- **G7.** The protected assertion at `tests/kernel/stepOrder.test.ts:101` is
+  replaced with exactly the three lines the pre-flight quoted. WP-09 will
+  need the same line for `setDiskPolicy`; whichever branch lands second
+  rebases and keeps both halves.
+
+### Decisions S1 to S13
+
+- **S1, approved.** `declareClaims(pid, claims)` before admission; undeclared
+  is zero; fork starts at zero; exec clears claims and invalidates
+  checkpoints; switching into `avoid` over an unsafe allocation is rejected
+  without changing strategy. `evaluateBankers` on an invalid or unavailable
+  preview returns `{ safe: false, sequence: null }` with a terminal precheck
+  explanation and emits only `bankers.evaluated`.
+- **S2, approved.** Atomic vector request and preview helpers with scalar
+  wrappers; a vector never commits as separate scalars; events expand in
+  lexicographic resource order; one `bankers.evaluated` per batch naming the
+  first nonzero resource (a contract limitation WP-L06 must know). Pending
+  requests keep actor, generation and the full vector; grants reserve the
+  vector before phase 4 wakes the actor; readiness is non-consuming; a
+  request that would block a non-running caller is EBUSY.
+- **S3, approved.** Exclusive edges from scenario-declared lock roles (the
+  bounded buffer's `mutex`, the chopsticks) as well as mutex, monitor-lock and
+  rwlock-writer ownership; generic permit provenance stays out. `empty` and
+  `full` depend on all eligible signallers, and detection must prove them all
+  trapped before choosing the deterministic two-process witness. On exit or
+  exec, WP-08 posts scenario-declared lock permits through the public sync
+  release path before sync anonymises them; generic counting permits keep
+  WP-07's anonymise-without-post rule.
+- **S4, approved.** Deadlock-owned mailbox endpoint declarations, persisted in
+  the deadlock slot, combined with actual IPC blocking state; peers are never
+  inferred from queue co-membership; the rendezvous fixture declares its
+  closed two-process protocol.
+- **S5, approved.** Close the dependency at actor level first, then project to
+  pids; a genuine intra-process thread cycle projects to `[pid]` with a
+  justified self-edge. Reader-only acquisition is nonexclusive; reader
+  upgrades and mixed reader/writer deadlocks are a recorded limitation.
+- **S6, approved.** I-24 is scoped to rank-governed resource-table requests,
+  `mutex_lock` and `sem_wait` (spec 15 corrected). Ranks follow declaration
+  order. All-or-nothing accepts a complete atomic claim only while holding no
+  governed resource; incremental attempts return EDEADLK. Prevention clients
+  in your tests use syscalls and handle rejection; WP-07 scenario code is not
+  rewritten.
+- **S7, overridden.** Keep the four-condition rule, but resolve it the other
+  way: for a discovered cycle all four conditions always hold, because
+  `no_preemption` means no blocked holder will release voluntarily, which is
+  true of every blocked holder. A resource's `preemptible` flag is a recovery
+  property that selects `preempt` or `rollback`; it never suppresses
+  `deadlock.detected`. So the `preempt preferred` test emits both
+  `deadlock.detected` and `deadlock.resolved { method: 'preempt' | 'rollback' }`
+  and terminates nobody. `nearDeadlocks()` returns the three-of-four case
+  without a cycle: an unclosed hold-and-wait chain over exclusive resources.
+  There is no silent recovery of anything. `hold_and_wait` is evaluated over
+  effective resource, sync and signalling dependencies, not over a nonempty
+  `requestedResources` array. The package text above was corrected to match.
+- **S8, approved** as written, and now in spec 9.6 and the test table:
+  checkpoints `{ pid, tid, tick, programCounter }`, resource-free only,
+  initial checkpoint before first acquisition, refresh on the cadence;
+  rollback restores the PC, cancels the request, returns every held instance,
+  clears the waiting TCB and readies the process; nothing else is rewound;
+  ineligible cases fall back to termination; temporary preemptibility
+  overrides expire back to the declared value; preemption counts survive
+  exec.
+- **S9, approved.** Observation records dependency formation times only;
+  latency is the formation tick of the reported witness (17 for the fixture);
+  utilisation is integer occupied-instance ticks over capacity-instance ticks
+  including instances held by blocked processes; `deadlocks` counts
+  detector-confirmed episodes, so `ignore` reports zero and the fixture
+  diagnoses the stall separately; the O(n^2 m) sentence is complexity, not a
+  tick charge. WP-L06 may display a cost derived from n^2 m in the HUD; the
+  kernel charges nothing.
+- **S10, approved.** Test-only `Max = (7, 2, 6)` for every detection row of
+  the Request-versus-Need fixture; the strategy-table workload and the
+  all-or-nothing contention fixture exactly as proposed, pinned at the
+  reference seed with unfinished runs reported explicitly and no seed change.
+- **S11, approved.** Compose with the invariant hook: I-5 conservation,
+  scoped I-24, I-25 after avoidance grants, I-26 on the captured graph
+  before recovery. `invariants.ts` is untouched; WP-11 asserts I-26 against
+  the captured evidence.
+- **S12, approved** as the payload scope. Amendment 8 waits for the exact
+  patch and its own written approval.
+- **S13, approved.** Every listed correction was applied: I-24 at spec 15's
+  prevention paragraph, the convoy rule as first comparator key, the
+  unsafe-only terminal trace step, the DFS first-discovered wording, the
+  rollback rows, the semaphore-edge row, the stale citation warning, and the
+  `declareClaims` replacement for the `ProcessSpec` claim in spec and package.
+
+### Not granted
+
+- No edit to `src/kernel/sync/**` beyond G1's three additions, and none to
+  `tests/kernel/sync/**`, `lifecycle.ts`, `ipc.ts`, `invariants.ts`,
+  scheduler sources, or any phase body.
+- No `BlockReason` kind, PCB field, TCB field or other frozen change.
+- No tick charge for detection.
 

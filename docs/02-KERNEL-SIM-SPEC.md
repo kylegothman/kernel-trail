@@ -3334,6 +3334,9 @@ SAFETY(Available, Max, Allocation):
      Record a final SafetyTraceStep { work, candidate: null, admitted: false, explanation }
 ```
 
+The terminal `candidate: null` step is recorded only for an unsafe result; a
+safe trace ends with its last admission.
+
 **The ascending-first-match rule at step 2 is normative.** The textbook says
 "find an *i* such that", leaving the choice open, and different choices give
 different safe sequences that are all correct. The simulator must produce one
@@ -3602,16 +3605,17 @@ latency so the trade is visible.
 **Victim selection.** Ordered comparison, first difference wins, so the choice is
 total and deterministic:
 
-1. **Lowest priority number wins survival**, so prefer terminating the process
-   with the numerically *largest* `priority`.
-2. Prefer the process with the least `totalCpuUsed`, so the least work is lost.
-3. Prefer the process holding the most resources, so one termination frees the
-   most.
-4. Prefer the process with the most `serviceRemaining`, so the survivors are
-   closest to finishing.
-5. **Never select a convoy Program if a non-convoy process is on the cycle.**
+1. **Never select a convoy Program if a non-convoy process is on the cycle.**
    This is a game rule, not an OS rule, and it is stated here because the
-   simulator implements it: `convoyMemberId !== null` sorts last unconditionally.
+   simulator implements it: `convoyMemberId !== null` sorts last
+   unconditionally, so it is the first comparator key.
+2. **Lowest priority number wins survival**, so prefer terminating the process
+   with the numerically *largest* `priority`.
+3. Prefer the process with the least `totalCpuUsed`, so the least work is lost.
+4. Prefer the process holding the most resources, so one termination frees the
+   most.
+5. Prefer the process with the most `serviceRemaining`, so the survivors are
+   closest to finishing.
 6. Tie-break on highest pid.
 
 ```ts
@@ -3644,12 +3648,20 @@ Termination sets `terminationReason: 'deadlock_victim'` and emits
    to termination.
 2. Take the resource from its holder: remove it from `heldResources`, increment
    `availableInstances`.
-3. **Roll back the holder.** The holder's `serviceRemaining` is restored to the
-   value it held at the last checkpoint, and it is moved to `ready` with
-   `blockedOn = null` and the preempted resource moved from `heldResources` back
-   to `requestedResources`. Checkpoints are taken every
-   `rollbackCheckpointInterval` ticks (default 25) and store only
-   `serviceRemaining`, `cpuBurstRemaining` and the program counter.
+3. **Roll back the holder.** The holder's program counter is restored to its
+   last resource-free checkpoint, its pending request is cancelled, every
+   resource-table instance it holds is returned so replay begins resource-free,
+   its waiting TCB is cleared and it moves to `ready` through the ordinary
+   scheduler-aware transition. Checkpoints hold `{ pid, tid, tick,
+   programCounter }`: one is recorded before the first acquisition and then
+   refreshed every `rollbackCheckpointInterval` ticks (default 25) while the
+   process holds nothing. Rollback does not rewind service budgets, CPU used,
+   creation debt, scheduler accounting, time, RNG, memory, IPC, sync state or
+   events; replayed instructions spend the remaining current budget and raise
+   fresh requests. A process with no valid checkpoint, with sync ownership, or
+   holding a non-preemptible instance is not rolled back; recovery falls back
+   to termination. (Corrected 2026-09-14: whole-kernel restore is WP-11's, so
+   rollback is scoped to what the process and resource tables can express.)
 4. Emit `deadlock.resolved { victims: [holder], method: 'preempt' }` or
    `method: 'rollback'` when a checkpoint was actually restored.
 5. **Starvation guard.** A process preempted `maxPreemptionsPerProcess` times
@@ -3678,9 +3690,11 @@ Costs CPU proportional to `n² m` per detection and costs whatever the victim wa
 worth.
 
 **`'avoid'`.** The `request` syscall runs the Banker's resource-request algorithm
-of §9.4.2. Requires that every process declares `Max` at admission; the sim takes
-it from `ProcessSpec` and a process that requests beyond its declared max gets
-`EINVAL` and is terminated with `protection_fault`. Phase 9 does no work. Costs
+of §9.4.2. Requires that every process declares `Max` before admission through
+the kernel's `declareClaims(pid, claims)` (undeclared claims are zero; fork starts
+at zero; exec clears them). A process that requests beyond its declared max gets
+`EINVAL` and is terminated with `protection_fault`. `ProcessSpec` carries no
+claim field and is not changed for this. Phase 9 does no work. Costs
 throughput, because safe-but-refused requests idle resources.
 
 **`'prevent'`.** Attacks the Coffman conditions structurally. The sim implements
@@ -3693,8 +3707,9 @@ only one of the four that is practical:
    `rank(r) > rank(h)` for every `h` in `heldResources`.
 3. A violation returns `EDEADLK` immediately and does not block.
 
-Under `'prevent'`, invariant I-17 asserts that `buildWaitForGraph` is acyclic on
-every tick, and a failure of that assertion is a genuine bug in the ordering
+Under `'prevent'`, invariant I-24 asserts that the rank-governed part of the
+wait-for graph (resource-table requests, `mutex_lock` and `sem_wait`) is acyclic
+on every tick, and a failure of that assertion is a genuine bug in the ordering
 implementation. Hold-and-wait prevention (request everything at once) is offered
 as `preventionMode: 'all_or_nothing'` for comparison and is visibly worse for
 utilisation, which is the Ch. 8.5.2 point.
