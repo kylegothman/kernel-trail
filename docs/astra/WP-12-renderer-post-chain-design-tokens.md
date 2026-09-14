@@ -637,7 +637,7 @@ against. It is not a leg and it must not import anything from `src/world/` or
 State:
 
 1. Pass or fail for each of the twenty-two acceptance criteria, by number.
-2. The three verification command outcomes.
+2. The four verification command outcomes, including the contract guard.
 3. Which of the five scaffold files existed, whether each matched the
    specification, and every line you changed in them.
 4. Every path where you kept the scaffold's naming instead of this package's
@@ -647,3 +647,54 @@ State:
 6. The measured GPU milliseconds per pass for `createProbeScene()` at high tier,
    next to the visual bible 4.2 budget table.
 7. Every `// TODO(astra):` left in the tree, with file and line.
+
+## Scope correction 2026-09-14
+
+Written before WP-12 starts, after nine kernel packages merged. The package
+above was written against the scaffold; where this section disagrees with
+the text above, this section wins.
+
+- **Verification is four gates.** `npm run check:contracts` precedes
+  typecheck, test and build (`npm run verify` runs all four). The guard
+  enforces frozen-file hashes, a single source scanner, a zero skip budget,
+  zero em dashes anywhere in the tree, and an IP-term scan with
+  `docs/03-VISUAL-BIBLE.md` on the allowlist. Nothing under `src/` is on that
+  allowlist: no name from the film franchise appears in code, comments,
+  shader names or test names.
+- **Freezing `src/design/tokens.ts`** is a contract change and follows the
+  amendment procedure: when the file is final, send its exact content, stop
+  for written approval, then in one contract-only commit add it to the
+  `frozen` map in `contracts.lock.json` with `node scripts/check-contracts.mjs
+  --update`, set `amendment` (provisionally 10, after WP-09's) and
+  `amendmentNote` by hand, and record it in
+  `docs/07-CONTRACT-AMENDMENTS.md`. Never before approval.
+- **The scaffold's paths win**, as the package says: `src/platform/
+  qualityGovernor.ts`, `src/render/RendererBackend.ts` and
+  `src/render/postChain.ts` stay where they are; do not create the
+  `backend/` or `post/` twins the file list suggests. Report every kept path.
+- **Exact Three pin.** `package.json` currently says `"three": "^0.185.0"`.
+  Acceptance 4 requires `"0.185.0"` with no caret; changing that line and
+  regenerating `package-lock.json` is granted. `@webgpu/types` may keep its
+  range. No other dependency changes without listing them in the pre-flight.
+- **GPU-dependent tests.** CI runs `npm test` under Node with
+  `environment: 'node'` and no WebGL or WebGPU context, and the skip budget
+  is zero, so no test may `skip` when a context is missing. Assertions that
+  need a real context (acceptance 19's `renderer.info` counts, the GPU
+  millisecond table in report item 6, device-loss behaviour) go in a
+  separate vitest project or script (`npm run test:gpu`, run in a browser
+  through Playwright's bundled Chromium) that `npm test` does not include.
+  Everything that can be asserted without a context (pass lists, target
+  types, token values, contrast, tier selection, cache identity, budgets
+  computed from the probe scene's declared geometry, import boundaries) stays
+  in `npm test`. Propose the exact split in the pre-flight.
+- **Vitest config** may gain the `tests/design`, `tests/platform` and
+  `tests/render` paths and the separate GPU project. Do not change the Node
+  environment, the timeouts or the kernel coverage settings.
+- **Shared files.** `package.json`, `package-lock.json`, `tsconfig.json`,
+  `vite.config.ts` and `vitest.config.ts` are shared with the kernel track.
+  Keep edits minimal and report exact line ranges. `src/kernel/**`,
+  `src/game/**`, `tests/kernel/**`, `contracts.lock.json` (outside the
+  approved amendment commit) and `scripts/**` are untouched.
+- **`src/world/`** already holds scaffold for `EffectPool.ts` and
+  `WorldEventRouter.ts`; they are WP-13's and WP-14's, not yours.
+
