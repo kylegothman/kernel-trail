@@ -150,7 +150,7 @@ describe('synchronisation and deadlock', () => {
     for (const pid of [a, b]) kernel.table.get(pid)?.heldResources.push(asResourceId('r'));
     expectViolation(() => checkInvariants(kernel.invariantState()), 25);
   });
-  it('I-26: a reported cycle that is not the witness (delegated evidence check)', () => {
+  it('I-26 (delivery only): a reported cycle that is not the witness, delivered through the composed deadlock check', () => {
     const { view } = healthy();
     // The captured detection evidence is private to the deadlock subsystem, so the violation is delivered through its composed check.
     expectViolation(() => checkInvariants({ ...view, subsystems: { ...NOOP_SUBSYSTEMS, deadlock: () => { throw new KernelInvariantError(26, 'report differs from its actor witness'); } } }), 26);

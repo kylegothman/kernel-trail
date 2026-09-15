@@ -3,6 +3,11 @@
  * every disk policy, each run for SWEEP_TICKS under the reference workload with
  * the harness on, zero violations; and each combination run twice hashes the same.
  * Budgeted on its own (pre-flight D10); the wall time is printed for the report.
+ *
+ * Committed form: 252 combinations by 1000 ticks by 2 runs, 54 s on the authoring
+ * machine. The fixture's 2000-tick form was run once at 6379ffc and passed in 103 s,
+ * above the 120 s line once the CI runner's factor is applied, which is why D10
+ * halves the ticks here.
  */
 import { describe, expect, it } from 'vitest';
 import type { DiskSchedulingId, KernelConfig, PageReplacementId, SchedulerId } from '@kernel/types';
