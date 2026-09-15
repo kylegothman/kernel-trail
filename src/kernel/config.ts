@@ -50,6 +50,13 @@ export interface KernelTuning {
   readonly rebuildBlocksPerTick: number;
   readonly rebuildProgressInterval: number;
   readonly blockCacheEntries: number;
+  readonly maxSymlinkDepth: number;
+  readonly dentryCacheEntries: number;
+  readonly fragmentationWarnExtents: number;
+  readonly freeSpaceMethod: 'bitmap' | 'linked_list' | 'grouping' | 'counting';
+  readonly linkedVariant: 'in_block' | 'fat';
+  readonly journalMode: 'metadata' | 'full' | 'off';
+  readonly accessModel: 'acl' | 'capability';
   readonly threadModel: ThreadModel;
   readonly coreCount: number;
   readonly lwpPoolSize: number;
@@ -79,6 +86,8 @@ export const DEFAULT_TUNING: KernelTuning = Object.freeze({
   maxPendingInterrupts: 256, dmaCycleStealRatio: 0.1, nvmWriteBufferPages: 8,
   // Report rebuild progress once per ten ticks without changing its issuance cap.
   rebuildBlocksPerTick: 4, rebuildProgressInterval: 10, blockCacheEntries: 64,
+  maxSymlinkDepth: 8, dentryCacheEntries: 128, fragmentationWarnExtents: 4,
+  freeSpaceMethod: 'bitmap', linkedVariant: 'in_block', journalMode: 'metadata', accessModel: 'acl',
   contextSwitchTicks: 0, deadlockDetectionInterval: 20, threadModel: 'one_to_one',
   coreCount: 4, lwpPoolSize: 4, defaultSerialFraction: 0.25,
   degreeOfMultiprogramming: 8, checkInvariants: true,
@@ -160,6 +169,13 @@ export function resolveTuning(overrides: Partial<KernelTuning> = {}): KernelTuni
   integer('rebuildBlocksPerTick', tuning.rebuildBlocksPerTick, 1);
   integer('rebuildProgressInterval', tuning.rebuildProgressInterval, 1);
   integer('blockCacheEntries', tuning.blockCacheEntries, 1);
+  integer('maxSymlinkDepth', tuning.maxSymlinkDepth, 1);
+  integer('dentryCacheEntries', tuning.dentryCacheEntries, 1);
+  integer('fragmentationWarnExtents', tuning.fragmentationWarnExtents, 0);
+  if (!['bitmap', 'linked_list', 'grouping', 'counting'].includes(tuning.freeSpaceMethod)) throw new KernelConfigError('invalid free space method');
+  if (!['in_block', 'fat'].includes(tuning.linkedVariant)) throw new KernelConfigError('invalid linked variant');
+  if (!['metadata', 'full', 'off'].includes(tuning.journalMode)) throw new KernelConfigError('invalid journal mode');
+  if (!['acl', 'capability'].includes(tuning.accessModel)) throw new KernelConfigError('invalid access model');
   integer('coreCount', tuning.coreCount, 1);
   integer('lwpPoolSize', tuning.lwpPoolSize, 1);
   integer('degreeOfMultiprogramming', tuning.degreeOfMultiprogramming, 1);

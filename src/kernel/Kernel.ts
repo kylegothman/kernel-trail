@@ -18,6 +18,8 @@ import { SyncSubsystem } from './sync/SyncSubsystem';
 import { DeadlockSubsystem, deadlockSettings, decodeResourceVector, type DeadlockStrategy } from './deadlock/DeadlockSubsystem';
 import { StorageSubsystem } from './storage/StorageSubsystem';
 import { IoSubsystem } from './io/IoSubsystem';
+import { FileSystemSubsystem } from './fs/FileSystemSubsystem';
+import { SecuritySubsystem, inodeObject } from './security/SecuritySubsystem';
 import type { ResourceDeclaration, ResourceVector } from './deadlock/resources';
 import type { SuspendedProcess } from './memory/demandPaging';
 import type {
@@ -142,6 +144,10 @@ export interface FsHooks {
   retainDescriptor(fd: FileDescriptor): void;
   closeDescriptor(pcb: ProcessControlBlock, fd: FileDescriptor): void;
   closeOnExec(pcb: ProcessControlBlock, fd: FileDescriptor): boolean;
+  ownsWait(pid: Pid, tid: Tid, reason: BlockReason): boolean;
+  isSatisfied(pid: Pid, tid: Tid): boolean;
+  instructionOutcome(actor: { readonly pid: Pid; readonly tid: Tid }): { readonly advance: boolean; readonly deferService: boolean } | null;
+  removeProcess(pid: Pid): void;
 }
 export interface SecurityHooks { rights(pid: Pid, resource: ResourceId): readonly AccessRight[] }
 export interface DeadlockHooks { maybeDetect(tick: Tick): void }
@@ -179,6 +185,8 @@ export class KernelImpl implements Kernel {
   readonly deadlockSubsystem: DeadlockSubsystem;
   readonly storageSubsystem: StorageSubsystem;
   readonly ioSubsystem: IoSubsystem;
+  readonly fileSystemSubsystem: FileSystemSubsystem;
+  readonly securitySubsystem: SecuritySubsystem;
   private readonly snapshotHooks: SnapshotHooks[] = [];
   readonly pageTables = new Map<AddressSpaceId, PageTableEntry[]>();
   private currentTick = asTick(0);
@@ -226,9 +234,8 @@ export class KernelImpl implements Kernel {
   private io: IoHooks = { expireTimers: noop, serviceCompletions: noop, deliverInterrupts: noop,
     isSatisfied: () => false, request: noop, removeWaiter: noop };
   private storage: StorageHooks = { expireTimers: noop };
-  // TODO(astra): WP-10 supplies journal timers and descriptor reference counts.
-  private fs: FsHooks = { expireTimers: noop, retainDescriptor: noop, closeDescriptor: noop, closeOnExec: () => false };
-  // TODO(astra): WP-10 supplies shared-region access rights from protection domains.
+  private fs: FsHooks = { expireTimers: noop, retainDescriptor: noop, closeDescriptor: noop, closeOnExec: () => false,
+    ownsWait: () => false, isSatisfied: () => false, instructionOutcome: () => null, removeProcess: noop };
   private security: SecurityHooks = { rights: () => [] };
   private deadlock: DeadlockHooks = { maybeDetect: noop };
   private schedulerHooks: SchedulerHooks = createSchedulerHooks(() => this.scheduler, {
@@ -328,6 +335,8 @@ export class KernelImpl implements Kernel {
         const program = this.programs.get(parent.pid);
         if (program !== undefined) this.programs.set(child.pid, program);
         this.burstSizes.set(child.pid, this.burstSizes.get(parent.pid) ?? parent.cpuBurstRemaining);
+        if (this.enabled.has('fs')) this.fileSystemSubsystem.fork(parent, child);
+        if (this.enabled.has('security')) this.securitySubsystem.fork(parent, child);
       },
       retainDescriptor: fd => this.fs.retainDescriptor(fd),
       closeDescriptor: (pcb, fd) => this.fs.closeDescriptor(pcb, fd),
@@ -345,8 +354,9 @@ export class KernelImpl implements Kernel {
       pageTable: space => { let table = this.pageTables.get(space); if (table === undefined) { table = []; this.pageTables.set(space, table); } return table; },
       frame: id => this.frames[id], rights: (pid, id) => this.security.rights(pid, id),
       block: (pid, reason) => this.blockProcess(pid, reason),
-      onSharedMap: (pid, mapping) => memory.sharedMapped(pid, mapping),
-      onSharedUnmap: (pid, mapping) => memory.sharedUnmapped(pid, mapping),
+      onSharedMap: (pid, mapping) => { memory.sharedMapped(pid, mapping); this.securitySubsystem.sharedMapped(pid, mapping); },
+      onSharedUnmap: (pid, mapping) => { memory.sharedUnmapped(pid, mapping); this.securitySubsystem.sharedUnmapped(pid, mapping); },
+      onAccessDenied: (pid, resource, right) => this.securitySubsystem.mappingDenied(pid, resource, right),
     });
     const syncRng = this.rng.streams.get('sync');
     if (syncRng === undefined) throw new Error('sync RNG stream missing');
@@ -440,6 +450,12 @@ export class KernelImpl implements Kernel {
       process: pid => this.table.get(pid), thread: tid => this.threads.table.get(tid), actor: ioActor,
       block: (actor, device) => this.blockProcess(actor.pid, { kind: 'io', device }, actor.tid),
       emit: event => this.publish(event), chargeKernelDebt: ticks => this.chargeKernelDebt(ticks),
+      abortStorage: () => {
+        for (const device of new Set([...storage.drives.keys(), ...storage.nvm.keys(), ...storage.raid.keys()])) storage.control(device as DeviceId, 'crash', []);
+      },
+      onRequestSubmitted: request => this.securitySubsystem?.onRequestSubmitted(request),
+      onRequestRemoved: request => this.securitySubsystem?.onRequestRemoved(request),
+      onRequestCompleted: (request, result) => this.securitySubsystem?.onRequestCompleted(request, result),
       terminate: (pid, reason) => { const pcb = this.table.get(pid); if (pcb !== undefined) this.exitProcess(pcb, -1, reason); },
       settings: () => ({ interruptServiceTicks: this.tuning.interruptServiceTicks, maxInterruptsPerTick: this.tuning.maxInterruptsPerTick,
         interruptStormThreshold: this.tuning.interruptStormThreshold, interruptStormWindow: this.tuning.interruptStormWindow,
@@ -478,9 +494,58 @@ export class KernelImpl implements Kernel {
       if (ioDebt < 0 || ioDebt > combinedDebt) throw new Error('I/O debt exceeds combined kernel debt');
       return () => { commitStorage(); commitIo(); this.bindPagingStorage(true); };
     } } });
+    const securityRng = this.rng.streams.get('security');
+    if (securityRng === undefined) throw new Error('security RNG stream missing');
+    this.securitySubsystem = new SecuritySubsystem({ tick: () => this.tick, enabled: () => this.enabled.has('security'),
+      process: pid => this.table.get(pid), processes: () => this.table.processes, pages: space => this.pageTables.get(space) ?? [],
+      pageSize: () => this.config.pageSize, actor: ioActor, emit: event => this.publish(event),
+      terminate: (pid, reason) => { const pcb = this.table.get(pid); if (pcb !== undefined) this.exitProcess(pcb, -1, reason); },
+      publishResult: (pid, result) => { this.syscallResults.set(pid, result); },
+      registerProgram: (name, program) => this.registerProgram(name, program), io, ipc: this.ipc, fs: () => this.fileSystemSubsystem,
+    }, securityRng, this.tuning.accessModel);
+    const security = this.securitySubsystem;
+    this.security = { rights: (pid, resource) => security.rights(pid, resource) };
+    this.fileSystemSubsystem = new FileSystemSubsystem({ tick: () => this.tick, enabled: () => this.enabled.has('fs'),
+      process: pid => this.table.get(pid), actor: ioActor, domain: pid => this.enabled.has('security') ? security.callerDomain(pid) : this.table.get(pid)?.domain ?? 'kernel' as DomainId,
+      block: (actor, device) => { if (this.table.get(actor.pid)?.state === 'running') this.blockProcess(actor.pid, { kind: 'io', device }, actor.tid); },
+      publishResult: (pid, result, request) => {
+        this.syscallResults.set(pid, result);
+        if (request !== undefined) this.publish({ type: 'syscall.invoked', request, result });
+        if (!result.ok && result.message.startsWith('storage_corruption:')) {
+          const pcb = this.table.get(pid); if (pcb !== undefined) this.exitProcess(pcb, -1, 'storage_corruption');
+        }
+        if (result.ok && this.enabled.has('security')) {
+          const actor = ioActor(pid), operation = actor === undefined ? undefined : this.fileSystemSubsystem.pending(actor);
+          if (operation?.inode !== null && operation?.inode !== undefined) {
+            const rights: AccessRight[] = operation.call.name === 'open' ? operation.call.mode === 'rw' ? ['read', 'write']
+              : [operation.call.mode === 'r' ? 'read' : 'write'] : operation.call.name === 'read' || operation.call.name === 'write' ? [operation.call.name] : [];
+            for (const right of rights) security.use(pid, inodeObject(operation.inode), right);
+          }
+        }
+      }, emit: event => this.publish(event), check: (domain, inode, right) => security.checkFile(domain, inode, right),
+      inodeCreated: inode => security.inodeCreated(inode), storage, io,
+    }, { defaultAllocation: this.config.fileAllocation, maxSymlinkDepth: this.tuning.maxSymlinkDepth,
+      dentryCacheEntries: this.tuning.dentryCacheEntries, fragmentationWarnExtents: this.tuning.fragmentationWarnExtents,
+      freeSpaceMethod: this.tuning.freeSpaceMethod, linkedVariant: this.tuning.linkedVariant, journalMode: this.config.journalingEnabled ? this.tuning.journalMode : 'off' });
+    const fs = this.fileSystemSubsystem;
+    this.fs = { expireTimers: tick => fs.expireTimers(tick), retainDescriptor: fd => fs.retainDescriptor(fd),
+      closeDescriptor: (pcb, fd) => fs.closeDescriptor(pcb, fd), closeOnExec: (pcb, fd) => fs.closeOnExec(pcb, fd),
+      ownsWait: (pid, tid, reason) => fs.ownsWait(pid, tid, reason), isSatisfied: (pid, tid) => fs.isSatisfied(pid, tid),
+      instructionOutcome: actor => fs.instructionOutcome(actor), removeProcess: pid => fs.removeProcess(pid) };
+    io.registerControl((device, command, args, actor) => security.control(device, command, args, actor));
+    this.events.onAny(event => { security.observe(event); if (event.type === 'process.exited' && this.enabled.has('fs')) fs.removeProcess(event.pid); });
+    this.onPhase(phase => security.onPhase(phase));
+    this.snapshotHooks.push({ saveState: () => ({ ...(this.enabled.has('fs') ? { fs: fs.saveState() } : {}),
+      ...(this.enabled.has('security') ? { security: security.saveState() } : {}) }), restoreState: snapshot => {
+      const restoreFs = snapshot.config.enabledSubsystems.includes('fs') ? fs.prepareKernelRestore(snapshot) : noop;
+      const restoreSecurity = snapshot.config.enabledSubsystems.includes('security') ? security.prepareKernelRestore(snapshot) : noop;
+      return () => { restoreFs(); restoreSecurity(); };
+    } });
     const invariants = this.invariants;
     this.invariants = { check: kernel => { invariants.check(kernel); deadlock.assertInvariants();
       if (this.enabled.has('storage')) storage.assertInvariants();
+      if (this.enabled.has('fs')) fs.checkInvariants(this.tick % this.invariantSlowInterval === 0);
+      if (this.enabled.has('security')) security.assertInvariants();
       if (this.enabled.has('io')) { io.assertInvariants(); this.assert(io.debt >= 0 && io.debt <= this.switchDebt, 33, 'I/O debt exceeds combined kernel debt'); }
     } };
     this.initialiseFrameTable();
@@ -572,11 +637,15 @@ export class KernelImpl implements Kernel {
   }
   syscall(request: SyscallRequest): SyscallResult {
     const pcb = this.table.get(request.pid);
-    const result = pcb === undefined || pcb.state === 'zombie' || pcb.state === 'terminated'
-      ? failure('ESRCH', 'process not found') : this.dispatchSyscall(pcb, request);
-    this.syscallResults.set(request.pid, result);
-    this.publish({ type: 'syscall.invoked', request, result });
-    return result;
+    const live = pcb !== undefined && pcb.state !== 'zombie' && pcb.state !== 'terminated';
+    const trap = live && this.enabled.has('security') ? this.securitySubsystem.enterTrap(pcb.pid) : null;
+    try {
+      const result = !live ? failure('ESRCH', 'process not found') : this.dispatchSyscall(pcb, request);
+      this.syscallResults.set(request.pid, result);
+      const actor = live ? this.ioActor(pcb) : undefined;
+      if (actor === undefined || !this.enabled.has('fs') || this.fileSystemSubsystem.pending(actor) === undefined) this.publish({ type: 'syscall.invoked', request, result });
+      return result;
+    } finally { if (live && this.enabled.has('security')) this.securitySubsystem.returnTrap(pcb.pid, trap); }
   }
   private dispatchSyscall(pcb: ProcessControlBlock, request: SyscallRequest): SyscallResult {
     const arg = request.args[0];
@@ -585,8 +654,11 @@ export class KernelImpl implements Kernel {
       case 'fork': return this.lifecycle.fork(pcb);
       case 'exec': {
         if (pcb.state === 'waiting') return failure('EBUSY', 'cannot exec a blocked process');
-        const result = typeof arg === 'string' ? this.lifecycle.exec(pcb, arg) : failure('EINVAL', 'exec requires a program name');
-        if (result.ok) this.threads.recompute(pcb);
+        const target = typeof arg === 'string' && this.enabled.has('fs') && this.fileSystemSubsystem.mounted && !this.namedPrograms.has(arg)
+          ? this.fileSystemSubsystem.execTarget(pcb.pid, arg) : undefined;
+        if (target !== undefined && !target.result.ok) return target.result;
+        const result = typeof arg === 'string' ? this.lifecycle.exec(pcb, target?.programName ?? arg) : failure('EINVAL', 'exec requires a program name');
+        if (result.ok) { this.threads.recompute(pcb); this.securitySubsystem.commitExec(pcb.pid, target?.inode); }
         return result;
       }
       case 'exit': return typeof arg === 'number' && Number.isSafeInteger(arg)
@@ -618,8 +690,17 @@ export class KernelImpl implements Kernel {
         this.memorySubsystem.flush(); return { ok: true, value: null };
       case 'sync':
         // TODO(astra): WP-11 validates sync arguments.
-        // TODO(astra): WP-10 flushes the journal.
+        if (this.enabled.has('fs') && this.fileSystemSubsystem.mounted) return this.fileSystemSubsystem.syscall(request);
         return this.enabled.has('io') ? this.ioSubsystem.sync(this.ioActor(pcb)) : failure('EINVAL', 'I/O is disabled');
+      case 'read': case 'write': {
+        // TODO(astra): WP-11 validates read and write arguments; the byte-count bound below is the SEC-ARG-1 check it takes over.
+        const invalid = this.securitySubsystem.validateByteCount(pcb.pid, request.args[1]);
+        if (invalid !== null) return invalid;
+        return this.fileSystemSubsystem.syscall(request);
+      }
+      case 'open': case 'close': case 'seek': case 'stat': case 'unlink': case 'mkdir': case 'chmod':
+        // TODO(astra): WP-11 validates open, close, seek, stat, unlink, mkdir and chmod arguments.
+        return this.fileSystemSubsystem.syscall(request);
       case 'sem_wait':
         // TODO(astra): WP-11 validates sem_wait arguments.
         return typeof arg === 'string' && request.args.length === 1 ? this.syncSubsystem.syscall(pcb.pid, 'sem_wait', arg as ResourceId) : failure('EINVAL', 'expected a synchronization resource');
@@ -921,7 +1002,11 @@ export class KernelImpl implements Kernel {
     switch (reason.kind) {
       case 'sleep': return reason.untilTick <= this.tick;
       case 'child_wait': return this.lifecycle.hasExitedChild(pcb.pid, reason.child);
-      case 'io': return this.enabled.has('io') && this.io.isSatisfied(pcb.pid, reason);
+      case 'io': {
+        const thread = pcb.threads.map(tid => this.threads.table.get(tid)).find(row => row?.state === 'waiting' && row.blockedOn === reason);
+        if (thread !== undefined && this.enabled.has('fs') && this.fs.ownsWait(pcb.pid, thread.tid, reason)) return this.fs.isSatisfied(pcb.pid, thread.tid);
+        return this.enabled.has('io') && this.io.isSatisfied(pcb.pid, reason);
+      }
       case 'page_fault': return (this.enabled.has('memory') || this.enabled.has('vm')) && this.memory.isSatisfied(pcb.pid, reason);
       case 'semaphore': case 'mutex': case 'condition':
         if (this.ipc.matchesWait(pcb.pid, reason)) return this.ipc.hasCompletion(pcb.pid);
@@ -1015,6 +1100,7 @@ export class KernelImpl implements Kernel {
       }
       case 'compute': return true;
       case 'access': {
+        if (!this.securitySubsystem.pageAllowed(pcb.pid, instruction.page, instruction.write)) { this.threads.deferServiceCharge(); return false; }
         if (!this.enabled.has('memory') && !this.enabled.has('vm')) return true;
         const page = this.memorySubsystem.resolvePage(pcb.pid, instruction.page);
         const cow = instruction.write ? this.lifecycle.resolveCow(pcb, page) : null;
@@ -1037,7 +1123,11 @@ export class KernelImpl implements Kernel {
         return result.hit;
       }
       case 'syscall': {
+        const actor = { pid: pcb.pid, tid: thread.tid }, pending = this.enabled.has('fs') ? this.fs.instructionOutcome(actor) : null;
+        if (pending !== null) { if (pending.deferService) this.threads.deferServiceCharge(); return pending.advance; }
         const result = this.syscall({ ...instruction.call, pid: pcb.pid });
+        const completion = this.enabled.has('fs') ? this.fs.instructionOutcome(actor) : null;
+        if (completion !== null) { if (completion.deferService) this.threads.deferServiceCharge(); return completion.advance; }
         return !(instruction.call.name === 'exec' && result.ok);
       }
       case 'io': {
@@ -1155,6 +1245,9 @@ export class KernelImpl implements Kernel {
     this.diskQueue = this.storageSubsystem.diskQueue;
     this.diskHead = this.storageSubsystem.diskHead;
     this.devices = this.ioSubsystem.devices;
+    this.inodes = this.fileSystemSubsystem.inodes;
+    this.journal = this.fileSystemSubsystem.journalEntries;
+    this.domains = this.securitySubsystem.domains;
     this.frames = this.memorySubsystem.frameTable.frames;
     this.tlb = this.memorySubsystem.tlb.entries;
     this.rebuildFreeList();
