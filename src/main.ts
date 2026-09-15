@@ -1,3 +1,4 @@
+import { VOID, CYAN, SLATE, cssColor } from '@design';
 /**
  * KERNEL TRAIL - the bootstrap.
  *
@@ -242,13 +243,13 @@ export class PlaceholderRenderer {
     const h = this.cssHeight;
 
     ctx.setTransform(this.pixelRatio, 0, 0, this.pixelRatio, 0, 0);
-    ctx.fillStyle = '#05070c';
+    ctx.fillStyle = cssColor(VOID.base);
     ctx.fillRect(0, 0, w, h);
 
     // A drifting grid, so the alpha and the wall-clock advance are both visible.
     const spacing = 48;
     const drift = (this.elapsedSeconds * 18) % spacing;
-    ctx.strokeStyle = 'rgba(64, 214, 255, 0.14)';
+    ctx.strokeStyle = cssColor(CYAN.core, 0.14);
     ctx.lineWidth = 1;
     ctx.beginPath();
     for (let x = -spacing + drift; x < w + spacing; x += spacing) {
@@ -266,17 +267,17 @@ export class PlaceholderRenderer {
     const barW = Math.min(420, w - 96);
     const barX = (w - barW) / 2;
     const barY = h / 2 + 56;
-    ctx.strokeStyle = 'rgba(64, 214, 255, 0.55)';
+    ctx.strokeStyle = cssColor(CYAN.core, 0.55);
     ctx.strokeRect(barX + 0.5, barY + 0.5, barW, 10);
-    ctx.fillStyle = 'rgba(64, 214, 255, 0.85)';
+    ctx.fillStyle = cssColor(CYAN.core, 0.85);
     ctx.fillRect(barX + 1, barY + 1, Math.max(0, (barW - 1) * alpha), 9);
 
-    ctx.fillStyle = '#e8f4ff';
+    ctx.fillStyle = cssColor(SLATE.primary);
     ctx.textAlign = 'center';
     ctx.font = '600 34px ui-monospace, SFMono-Regular, Menlo, monospace';
     ctx.fillText(scene.title, w / 2, h / 2 - 18);
     ctx.font = '14px ui-monospace, SFMono-Regular, Menlo, monospace';
-    ctx.fillStyle = 'rgba(232, 244, 255, 0.62)';
+    ctx.fillStyle = cssColor(SLATE.primary, 0.62);
     ctx.fillText(scene.subtitle, w / 2, h / 2 + 12);
     ctx.fillText(
       `tick ${tick}   alpha ${alpha.toFixed(3)}   ${this.caps.backend}   tier ${this.tier}`,

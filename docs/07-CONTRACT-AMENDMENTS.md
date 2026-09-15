@@ -1,7 +1,7 @@
 # Frozen contract amendments
 
-`src/kernel/types.ts` and `src/game/types.ts` are frozen. A work package may not
-edit them; it escalates instead, and a human decides. This file is the record of
+`src/kernel/types.ts`, `src/game/types.ts` and `src/design/tokens.ts` are frozen.
+A work package may not edit them; it escalates instead, and a human decides. This file is the record of
 every decision. It exists so that an agent joining at WP-09 can see what moved
 and why without reading the whole conversation.
 
@@ -717,3 +717,43 @@ conservation and I-22, I-23 scoped to exclusive primitives and internal actors,
 the readers-writers workload and throughput wording, the room solution's
 Coffman condition, and three scenario rows added to 16.7. Amendment 7 is
 reserved for the typed `SyncSnapshotState`, pending its own exact-patch review.
+
+
+## Amendment 10, 2026-09-15: WP-12 design tokens freeze
+
+**Raised by:** the WP-12 implementing agent after the accepted GPU run.
+**Approved by:** Kyle, for the exact content and this one hash addition.
+**Status:** applied. Number 10 is provisional against WP-10's merge order;
+WP-10's fs and security promotion becomes amendment 11.
+
+No existing contract was unfrozen. `src/design/tokens.ts` was previously an
+unfrozen scaffold and is now frozen as the single source of colour, gain,
+motion and type. Its reviewed SHA-256 is:
+
+`f9bc27ef0bb2a84b47bcb683006ca027de3da9e71729e5c68d654024b01b17c2`
+
+Hash regeneration was human-approved on 2026-09-15 for this addition only.
+The two existing hashes for `src/kernel/types.ts` and `src/game/types.ts`
+remain unchanged. No source file changes accompany this amendment.
+
+The frozen content carries the approved corrections to the original scaffold:
+
+- Contrast floors use the computed WCAG ratios truncated to one decimal, with
+  Node assertions against the corrected table.
+- The backing plate is rgba(4, 6, 10, 0.92), composed after tone mapping. Its
+  worst-case contrast assertion requires the stated underlying display
+  luminance bound of 0.15; it is not an unconditional contrast guarantee.
+- Micro type is 0.8125rem, preserving the 13-device-pixel floor at DPR 1.
+- Semantic layers follow architecture 5.6: ENV through LIGHTS occupy 1 to 8;
+  WORLD is the mask of layers 1 to 6, replacing the scaffold's 0/1/2 scheme.
+- The sixth gain state, `off`, is explicitly retained and ratified at 0.0.
+
+No file under `src/` other than `src/design/tokens.ts` may hold a colour
+literal. Consumers derive colours from this frozen source, including CSS
+values. Further edits to the frozen file require a separately reviewed
+contract amendment rather than routine hash regeneration.
+
+Kyle accepted the actual WebGPU and forced-WebGL2 run as WP-12 runtime
+evidence. Image-based reflection and SDF checks, a no-float-colour-extension
+device, reduced-motion visuals and the 60 fps benchmark remain open for
+WP-13 and the smoke harness; they are not recorded as passes.

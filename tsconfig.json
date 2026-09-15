@@ -17,6 +17,9 @@
     "skipLibCheck": true,
     "noEmit": true,
     "paths": {
+      "@design": ["./src/design/index.ts"],
+      "@platform": ["./src/platform/index.ts"],
+      "@render": ["./src/render/index.ts"],
       "@app/*": ["./src/app/*"],
       "@kernel/*": ["./src/kernel/*"],
       "@render/*": ["./src/render/*"],

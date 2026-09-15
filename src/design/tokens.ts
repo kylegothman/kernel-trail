@@ -18,14 +18,16 @@
  * in linear. `THREE.ColorManagement.enabled = true` must be set before this
  * module is first imported or `Color.setHex(hex, SRGBColorSpace)` silently
  * no-ops and every emissive value in the game ends up roughly 2.2 gamma too
- * bright. The boot sequence in `src/app` owns that assignment.
+ * bright. This module enables colour management before building its cache.
  *
  * LAYERING. `src/design` may import only `src/design` (01-ARCHITECTURE section
  * 1.3), plus the third-party maths types it needs. That is why `Pace` is
  * redeclared here rather than imported from `@game/types`; see TICK_MS.
  */
 
-import { Color, SRGBColorSpace } from 'three';
+import { Color, ColorManagement, SRGBColorSpace } from 'three';
+
+ColorManagement.enabled = true;
 
 /* ------------------------------------------------------------------------- */
 /* 1. The void (visual bible 2.1)                                             */
@@ -130,7 +132,7 @@ export function linearColor(hex: number): Color {
 /**
  * Relative luminance of an sRGB hex in LINEAR space, using Rec. 709 weights.
  * Used by the gain-compensation reasoning below and by
- * `scripts/verify-contrast.ts`, which recomputes the section 2.6 table at build
+ * `tests/design/contrast.test.ts`, which recomputes the section 2.6 table at test
  * time and fails the build when a text token drops below its stated floor.
  */
 export function linearLuminance(hex: number): number {
@@ -145,9 +147,10 @@ export function linearLuminance(hex: number): number {
 /**
  * Multipliers applied to a linear emissive colour before it is written to the
  * RGBA16F target. The bloom bright-pass threshold sits at 1.15, deliberately
- * between `dim` and `active`, so that idle structure never halos and working
- * structure always does. Changing BLOOM.threshold without changing these is a
- * visual regression, and the reverse is equally true.
+ * between the nominal `dim` and `active` gains. The bright pass measures the
+ * luminance of the complete linear RGB radiance, including the authored colour,
+ * pulse and pattern terms. Gain alone does not determine whether a pixel blooms.
+ * Changing EMISSIVE_GAIN without revisiting the threshold breaks the whole image.
  *
  * RECONCILED. Section 2.3 lists five levels. The semantic table in section 2.4
  * then assigns a gain of `0` to `terminated` and `page_absent`, which cannot be
@@ -161,9 +164,9 @@ export function linearLuminance(hex: number): number {
 export const EMISSIVE_GAIN = {
   /** Not emitting at all. Matte, wireframe, or an empty socket. */
   off: 0.0,
-  /** Visible, never blooms. Structural hairlines, grid, inert edges. */
+  /** Low emission for structural hairlines, grid and inert edges. */
   ambient: 0.45,
-  /** Visible, never blooms. Ready, resident, idle. */
+  /** Low emission for ready, resident and idle states. */
   dim: 1.1,
   /** Blooms with a small halo. The default for anything actively doing work. */
   active: 1.85,
@@ -198,10 +201,10 @@ export const gainFor = (family: ColourFamily, level: GainLevel): number =>
 /**
  * These live in the token module rather than in the post chain because they are
  * only meaningful against EMISSIVE_GAIN, and a reviewer changing one must see
- * the other. `ambient` (0.45) and `dim` (1.10) sit below the threshold and never
- * bloom; `active` (1.85) sits comfortably above and produces a tight halo;
- * `hot` and `critical` produce the flares. That relationship is the entire
- * reason the grid floor stays crisp while working structure glows.
+ * the other. Bright-pass luminance depends on colour times gain and all shader
+ * modulation terms, not on the gain number alone. The soft knee also admits a
+ * small contribution below the threshold. These values preserve the authored
+ * separation between idle structure and active emitters.
  */
 export const BLOOM = {
   /** Bright-pass threshold, in linear luminance. Tier-independent (13.2 rule 6). */
@@ -360,11 +363,6 @@ export const DASH: Readonly<Record<DashPattern, DashGeometry>> = {
  * has no branch for `noise`, which section 2.4's corrupted row needs. Id 5 is
  * assigned here so the table is total.
  */
-// TODO(astra): add the `uHatch == 5.0` branch to the emissive panel fragment
-// shader in src/render/materials/index.ts. It must call the same `hash31(cell)`
-// used by corrupt.glsl.ts on `floor(vLocalPos / 0.06)` so the panel hatch and the
-// corruption shader agree cell-for-cell on the same object, then threshold at
-// 0.18 to match the dropout term. Do not introduce a second noise function.
 export const HATCH_ID: Readonly<Record<HatchPattern, number>> = {
   none: 0,
   diagonal: 1,
@@ -836,7 +834,7 @@ export const TYPE_SCALE: Readonly<Record<TypeScaleId, TypeStyle>> = {
   body: { sizeRem: 0.9375, lineHeight: 1.55, tracking: 0.0, family: 'sans', weight: 400, uppercase: false },
   data: { sizeRem: 0.8125, lineHeight: 1.4, tracking: 0.02, family: 'mono', weight: 400, uppercase: false },
   dataEmphasis: { sizeRem: 0.8125, lineHeight: 1.4, tracking: 0.02, family: 'mono', weight: 700, uppercase: false },
-  micro: { sizeRem: 0.6875, lineHeight: 1.3, tracking: 0.06, family: 'mono', weight: 400, uppercase: true },
+  micro: { sizeRem: 0.8125, lineHeight: 1.3, tracking: 0.06, family: 'mono', weight: 400, uppercase: true },
 };
 
 export type WorldLabelClass =
@@ -868,10 +866,10 @@ export const WORLD_CAP_HEIGHT_M: Readonly<Record<WorldLabelClass, number>> = {
  */
 export const MIN_GLYPH_PX = 13;
 
-/** The label backing plate. Holds local background luminance below 0.012. */
+/** The label backing plate. Bounds the background below 0.014 when the underlying display luminance is at most 0.15. */
 export const LABEL_PLATE = {
   hex: VOID.base,
-  opacity: 0.72,
+  opacity: 0.92,
   /** Padding around the measured text bounds, metres. */
   paddingM: 0.06,
   /** Emissive hairline along the plate's bottom edge, metres, at gain `dim`. */
@@ -883,8 +881,8 @@ export const LABEL_PLATE = {
 export const SDF_GLYPH_SIZE = { low: 48, medium: 64, high: 64 } as const;
 
 /**
- * Contrast floors against VOID.base, WCAG 2.1, recomputed at build time by
- * `scripts/verify-contrast.ts`. `never` means the token may be used as fill or
+ * Contrast floors against VOID.base, WCAG 2.1, recomputed in the Node test gate by
+ * `tests/design/contrast.test.ts`. `never` means the token may be used as fill or
  * outline but not as text at any size.
  */
 export type TextPermission = 'any-size' | 'body-14px-and-above' | 'never';
@@ -894,16 +892,16 @@ export const TEXT_CONTRAST: readonly {
   readonly ratio: number;
   readonly permitted: TextPermission;
 }[] = [
-  { hex: SLATE.primary, ratio: 17.4, permitted: 'any-size' },
-  { hex: CYAN.white, ratio: 18.0, permitted: 'any-size' },
-  { hex: AMBER.white, ratio: 16.0, permitted: 'any-size' },
-  { hex: CYAN.core, ratio: 12.1, permitted: 'any-size' },
-  { hex: AMBER.core, ratio: 9.6, permitted: 'any-size' },
-  { hex: SLATE.protected, ratio: 9.5, permitted: 'any-size' },
+  { hex: SLATE.primary, ratio: 18.1, permitted: 'any-size' },
+  { hex: CYAN.white, ratio: 17.9, permitted: 'any-size' },
+  { hex: AMBER.white, ratio: 15.9, permitted: 'any-size' },
+  { hex: CYAN.core, ratio: 12.0, permitted: 'any-size' },
+  { hex: AMBER.core, ratio: 9.5, permitted: 'any-size' },
+  { hex: SLATE.protected, ratio: 9.4, permitted: 'any-size' },
   { hex: SLATE.secondary, ratio: 4.6, permitted: 'body-14px-and-above' },
   { hex: CYAN.dim, ratio: 5.4, permitted: 'body-14px-and-above' },
-  { hex: AMBER.dim, ratio: 1.9, permitted: 'never' },
-  { hex: SLATE.outline, ratio: 1.6, permitted: 'never' },
+  { hex: AMBER.dim, ratio: 2.3, permitted: 'never' },
+  { hex: SLATE.outline, ratio: 2.0, permitted: 'never' },
 ];
 
 /* ------------------------------------------------------------------------- */
@@ -1244,25 +1242,25 @@ export const LIGHTS = {
   read: { intensity: 0.35, penumbra: 0.9 },
 } as const;
 
-/**
- * Layer assignments. Text renders after tone mapping (pass 13) so no glyph is
- * ever an input to the bright pass, which removes the whole class of problem
- * where a bright label smears into an unreadable blob.
- *
- * DERIVED. The visual bible references `LAYER.WORLD` and `LAYER.TEXT` in five
- * places (3.6, 3.7, 4.1, 7.4) but never declares the enum. The numbering here is
- * the minimal set those references require, plus REFLECTION for the high-tier
- * planar pass in 3.7, which needs a layer of its own to render emissive geometry
- * and beams without the matte bodies.
- */
+/** Architecture 5.6 semantic layers. WORLD is the bit mask of the six world layers. */
 export const LAYER = {
-  /** Everything that renders before tone mapping. */
-  WORLD: 0,
-  /** World-space SDF text. Rendered in pass 13, after the output transform. */
-  TEXT: 1,
-  /** Objects flagged `castsReflection`, drawn into the mirrored target. */
-  REFLECTION: 2,
+  ENV: 1, TERRAIN: 2, STRUCTURES: 3, ACTORS: 4,
+  BEAMS: 5, EFFECTS: 6, TEXT: 7, LIGHTS: 8,
+  WORLD: (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) | (1 << 6),
 } as const;
+
+/** Output black and neutral light are palette entries, never literals in render code. */
+export const NEUTRAL = { black: 0x000000, white: 0xffffff } as const;
+
+/** CSS uses authored sRGB, never the cached linear components. */
+export function cssColor(hex: number, opacity = 1): string {
+  return `rgba(${(hex >> 16) & 255}, ${(hex >> 8) & 255}, ${hex & 255}, ${opacity})`;
+}
+
+// Warm every palette entry once; frame-time token reads reuse these objects.
+for (const palette of [VOID, CYAN, AMBER, SLATE, NEUTRAL]) {
+  for (const hex of Object.values(palette)) linearColor(hex);
+}
 
 /* ------------------------------------------------------------------------- */
 /* 13. The frozen aggregate                                                   */
@@ -1275,11 +1273,12 @@ export const LAYER = {
  * This exists so that a debug overlay, the diagnostics bundle, and the token
  * documentation generator can enumerate everything without a manual list.
  *
- * `Object.freeze` is shallow, which is enough: every member is already `as const`
- * or a `Readonly<Record<...>>`, so the type system refuses mutation at compile
- * time and the freeze catches the `any`-cast case at runtime in development.
+ * `Object.freeze` protects the aggregate itself. Nested records are compile-time
+ * readonly; this is not a recursive runtime freeze. Cached Color objects must
+ * be treated as borrowed immutable values by consumers.
  */
 export const tokens = Object.freeze({
+  NEUTRAL,
   VOID,
   CYAN,
   AMBER,
