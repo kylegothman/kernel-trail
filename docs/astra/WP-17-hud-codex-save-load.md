@@ -640,3 +640,289 @@ State:
 7. The measured boundary and provisional save sizes for a mid-journey fixture.
 8. Every `// TODO(astra):` left in the tree, with file and line, including the
    scoring placeholders.
+
+---
+
+## Scope correction against the shipped tree
+
+Written 2026-09-15, after WP-14 and WP-16 merged and before WP-17 starts. Main
+is at `d8df0b0`. Where this section disagrees with the text above, this section
+wins. Each numbered item is a decision, not a suggestion; report against them by
+number.
+
+### S1. WP-11 has not merged. Order the work so it does not matter until the end
+
+WP-11 is on branch `wp-11` with the amendment 14 contract commit, the DiskQueue
+fix and the process snapshot channel committed, and the syscall table and the
+invariant harness still ahead of it. On main, `Kernel.restore` still rejects any
+snapshot that is not the init-only shape (`src/kernel/Kernel.ts` around line
+903), so a provisional resume of a mid-leg kernel cannot be tested on main today.
+
+Branch `wp-17` from main now. Build in this order, one commit each: HUD and
+`DomBatch`; codex; `CommandBus` and `scoring`; save and load last. Immediately
+before starting the save and load commit, run `git fetch origin && git merge
+origin/main`. If WP-11 has landed by then (look for `src/kernel/syscall/` and
+`src/kernel/snapshot.ts` on main), write the provisional fixtures against a live
+workload kernel as the package intends. If it has not, write them against the
+init-only kernel, mark each such case with `// TODO(astra): WP-11 landed: switch
+to a live workload fixture`, list them in the report, and stop after the commit
+so the reviewer can decide whether to wait. Do not build any part of the save
+layer against files that only exist on `wp-11`.
+
+### S2. Two dev dependencies are missing and one is granted in advance
+
+The package says `fake-indexeddb` is already a dev dependency. It is not; the
+dev dependencies on main are `@types/node`, `@types/three`, `@webgpu/types`,
+`eslint`, `playwright`, `typescript`, `vite` and `vitest`, and no DOM
+implementation is installed. Two additions are granted, exact versions to be
+quoted in the pre-flight:
+
+- `fake-indexeddb`, imported as `fake-indexeddb/auto` at the top of
+  `tests/game/save.test.ts` and `save-migration.test.ts` only.
+- `happy-dom`, selected per file with the `// @vitest-environment happy-dom`
+  directive at the top of each `tests/ui/*.test.ts` file. The global
+  `environment: 'node'` in `vitest.config.ts` does not change.
+
+Neither package may be imported from `src/`. No other dependency is granted.
+
+### S3. `vitest.config.ts` needs the missing aliases
+
+`vite.config.ts` aliases `@ui`, `@world`, `@audio`, `@app` and `@terminal`;
+`vitest.config.ts` only aliases `@kernel`, `@game`, `@legs`, `@design`,
+`@platform` and `@render`. Add `@ui`, `@world`, `@audio` and `@app` to the
+`resolve.alias` block of `vitest.config.ts` with the same `r('./src/<name>')`
+form as the existing entries. Nothing else in that file changes. This is the
+only edit outside the create list and the two files you may modify; quote the
+diff in the pre-flight.
+
+### S4. Paths: the scaffold's files stay where they are and the new ones move
+
+`src/game/save.ts` and `src/game/store.ts` exist as files, so the package's
+`src/game/save/` and `src/game/store/` directories would sit beside a module of
+the same name. Do not create either directory. Instead:
+
+| Package path | Use this path |
+|---|---|
+| `src/game/save/Database.ts` | stays inside `src/game/save.ts` (the `Database` class is already there) |
+| `src/game/save/checksum.ts` | stays inside `src/game/save.ts` (`canonicalise`, `fnv1a64`, `checksumOf`, `verify`, `CHECKSUM_SALT` are already there) |
+| `src/game/save/SaveService.ts` | `src/game/persist/SaveService.ts` |
+| `src/game/save/LoadService.ts` | `src/game/persist/LoadService.ts` |
+| `src/game/save/migrations.ts` | `src/game/persist/migrations.ts` |
+| `src/game/store/runStore.ts` | `src/game/runStore.ts` |
+
+`src/game/persist/index.ts` re-exports the three. `save.ts` keeps every export
+it has today with the same names and signatures.
+
+### S5. What `src/game/save.ts` already has, and what it is missing
+
+Already there and correct in shape: `DB_NAME`, `DB_VERSION`, `StoreName`,
+`StoredSave` (with `kind: 'boundary' | 'provisional' | 'export'`), `RunSummary`
+(with `integrity: 'ok' | 'checksum_failed' | 'unreadable' | 'repaired'`),
+`ReplayRecord`, `CHECKSUM_SALT`, `canonicalise`, `fnv1a64`, `checksumOf`,
+`verify`, `SaveFileInput`, `buildSaveFile`, `checksumSafeSnapshot`, the
+`Database` class with `open`, `close`, `get`, `put`, `delete` and `list`, all six
+object stores with the documented key paths and indices, `onblocked` rejecting
+with a message naming another tab, `onversionchange` closing the connection, and
+`saveGame`, `loadGame`, `listSaves`, `deleteSave` for the `saves` store.
+
+Missing, and yours to add:
+
+- `LoadOutcome`. The file exports `LoadResult { file: SaveFile | null; integrity }`
+  with four integrity values. Keep `LoadResult` and `loadGame` unchanged. Add in
+  `persist/LoadService.ts` the discriminated union
+  `LoadOutcome = { kind: 'ok' | 'repaired' | 'checksum_failed'; file: SaveFile } | { kind: 'unreadable'; message: string } | { kind: 'not_found' }`
+  and `loadOutcome(db, id): Promise<LoadOutcome>` built over `loadGame`.
+  `not_found` is the fifth variant the package asks for and the only one
+  `loadGame` cannot express today.
+- `SAVE_SCHEMA_VERSION`. Absent everywhere. Define it in
+  `persist/migrations.ts` as `1` and have `buildSaveFile` keep writing the
+  literal `1`; the migration registry is keyed by the version a file carries.
+- The diagnostics cap. The store exists with `autoIncrement` and `byCreatedAt`,
+  but nothing deletes old records. Implement the 20-record cap in
+  `persist/SaveService.ts` as `writeDiagnostics(db, bundle)`, oldest deleted on
+  write, and test it there. Do not change `Database`.
+- Read and write helpers for `codex` (the `CodexProfileState` record) and
+  `settings` (see S10). Put them in `SaveService.ts`; `Database.get` and `put`
+  are enough underneath.
+- `checksumOf(file, salt = CHECKSUM_SALT)`. Add the optional second parameter
+  so the `build id salt` test can pass two salts without touching globals. The
+  default keeps every existing caller unchanged.
+
+`__BUILD_ID__` is declared in `save.ts` with a `'dev'` fallback and is never
+defined anywhere, so every real build salts with `'dev'`. Leave that as it is
+and list it under follow-ups; wiring the Vite `define` belongs to the build
+package, not this one.
+
+### S6. `canonicalise` and `tests/kernel/canonical.ts` disagree by design
+
+`save.ts` rejects `Map` and `Set`, which is what the package specifies.
+`tests/kernel/canonical.ts` encodes both as sorted arrays, and its `hash` is a
+32-bit FNV-1a (8 hex characters) used only to compare test fixtures. The
+`consistent with kernel canonical` case asserts equal output on a shared fixture
+containing no `Map` or `Set`, and a comment in `save.ts` beside `canonicalise`
+records the two deliberate differences. Do not change `tests/kernel/canonical.ts`.
+
+### S7. `store.ts` is complete; use `watch`, not `subscribe`, for selectors
+
+`Store<T>` has `get`, `version`, `mutate`, `watch(select, on, eq?)`,
+`subscribe(on)` and `flush`. The selector subscription with custom equality the
+package describes is `watch`; `subscribe` is the plain every-commit callback.
+`mutate` throws during `flush`. `src/game/runStore.ts` is a thin factory
+`createRunStore(initial: RunState): Store<RunState>` plus the selectors the HUD
+regions need; it adds no new store class. `store.ts` should need no change;
+acceptance 33 stands.
+
+### S8. Codex shapes go in a new game file, not the frozen one
+
+`CodexEntry`, `CodexUnlock`, `CodexWorkedExample`, `CodexCounterfactual` and
+`CodexProfileState` do not exist anywhere in `src`. `src/game/types.ts` is
+frozen, so create `src/game/codexTypes.ts` carrying exactly the five shapes
+printed under "Frozen contracts" above, with `AfflictionId`, `AfflictionRemedy`,
+`ChapterRef`, `LegId` and `Tick` imported as types from `@game/types` and
+`@kernel/types`, and `TerminationReason` from `@kernel/types` (it is not defined
+in the game types). The file is not frozen by this package; it will be frozen by
+a contract amendment once the first leg package authors entries against it.
+`src/ui/codex/entries.ts` holds the empty registry and the `register` function,
+never content.
+
+### S9. The fanout exists; the "is it on screen" question does not
+
+`src/world/FrameEventQueue.ts` is the real queue. `EventConsumer` is
+`{ name; beginFrame?(); consume(event, aggregates?); endFrame?(aggregates) }`,
+registration is `registerCodex(consumer)` and `registerHud(consumer)` (single
+occupancy per slot, a second call replaces the first), the order is the literal
+`['world', 'audio', 'codex', 'hud']` at line 110, and a consumer that throws is
+recorded in `queue.failures` and disabled for the rest of the session. The
+`consumer order` case asserts against that literal by registering four spies.
+
+`WorldEventRouter` exposes no visibility query, so the codex cannot ask the
+world whether a pathology is on screen. Define in `src/ui/codex/Codex.ts`
+`type OnScreen = (structureId: string) => boolean`, take it in the constructor,
+default it to `() => true`, and mark the default
+`// TODO(astra): WP-19 wires OnScreen to the focus registry`. The trigger tests
+inject a stub and assert that an entry whose structure is off screen is held,
+not offered.
+
+WP-16 also shipped a local `FrameEventQueue` copy under `src/audio/events/` with
+three `TODO(astra)` markers for switching to the world's queue. That switch is
+the first commit of this package: change the imports named in the markers to
+`@world/FrameEventQueue`, delete `src/audio/events/FrameEventQueue.ts`, and run
+the audio suite. It is the only edit under `src/audio/` you may make, and it
+goes in its own commit titled `WP-17: audio consumer moves to the world queue`.
+
+### S10. Settings and the audio handoff
+
+`src/audio/settings.ts` exports `AudioSettings` (`master`, `score`, `world`,
+`ui`, `alerts`, `reducedMotion`, `mono`, `mute`), `DEFAULT_AUDIO_SETTINGS`,
+`AUDIO_SETTINGS_KEY = 'audio'` (a key into the IndexedDB `settings` store, not a
+localStorage key), `normaliseAudioSettings(value, fallback?)` and
+`AudioSettingsStore` with `get`, `update(patch)` and `subscribe`. The engine
+subscribes to its own store, so persistence is: on boot, `get('settings',
+'audio')`, pass the value through `normaliseAudioSettings`, call
+`engine.settingsStore.update(result)`; on every store change, `put('settings',
+{ key: 'audio', value })`. Never call `engine.applySettings` yourself.
+
+The HUD does not import `@audio`. It receives an optional `UiSounds` interface
+(`unlock()`, plus the six UI cue methods, all `() => void`) by constructor
+injection and calls `unlock()` from its first pointer or key handler. The host
+passes `engine.ui` and `engine.unlock` in; the fixtures pass spies.
+
+### S11. `src/ui` boundary, stated precisely
+
+`src/ui` may hold value imports only from `@design` and from inside `src/ui`.
+Every import from `@kernel`, `@game`, `@world`, `@audio` and `@render` is
+`import type`. Instances (the run store, the queue, the focus state, the sounds)
+arrive by constructor injection. No `three`, no hex colour literal, no
+`localStorage`, no `innerHTML`, no `Math.random`, no `Date.now`. Write
+`tests/ui/boundaries.test.ts` in the pattern of
+`tests/kernel/boundaries.test.ts`, collecting `src/ui` recursively and using
+`stripComments` from `tests/kernel/sourceScan.ts`. `tests/kernel/boundaries.test.ts`
+scans only `src/kernel` and is not modified.
+
+### S12. Tokens carry no HUD variables and no contrast helper
+
+The six `--hud-*` values do not exist in `src/design/tokens.ts` and that file is
+frozen. Define them as TypeScript constants in `src/ui/hud/layout.ts`
+(`HUD_SAFE = 'max(24px, 2.5vh)'`, `HUD_GUTTER_PX = 16`, `HUD_REST = 0.72`,
+`HUD_ACTIVE = 1`, `HUD_FOCUSED = 0.25`, `HUD_RADIUS_PX = 2`) and emit the CSS
+custom properties from `hud.css.ts` using them. Colours come from `CYAN`,
+`AMBER` and the semantic tokens; the alert glyph prefixes come from the
+`glyph` fields in the tokens' state table, never retyped.
+
+No contrast function exists; `TEXT_CONTRAST` in tokens is a hand-tabulated
+list. Write `src/ui/hud/contrast.ts` with `contrastRatio(fgHex, bgHex, fgAlpha)`
+per WCAG 2.x relative luminance, compositing the foreground over the void at the
+given alpha first. The `contrast` case computes every HUD text pair at 0.72 and
+also reproduces the `TEXT_CONTRAST` table entries at alpha 1 within 0.1, which
+cross-checks the function against numbers the visual bible already prints.
+
+### S13. Coverage, safe area and layout need a browser; the Node suite gets the rest
+
+`happy-dom` does not lay out, so bounding boxes are zero there. Acceptance 6 and
+7 are measured in the GPU runner, which already opens pages at 1440 by 900:
+
+- `tests/render/gpu/hud.html` and `tests/render/gpu/hud.gpu.ts` mount the HUD
+  with the worst-case fixture (five Programs alive, four non-zero resources,
+  three alerts, longest policy names), read every HUD element's
+  `getBoundingClientRect`, compute the union area over the viewport area, and
+  assert under 0.11, printing the percentage. They also assert every rect is at
+  least `max(24, 0.025 * 900)` from each edge.
+- `tests/render/gpu/run.mjs`: add `hud.html` to the rolldown input list on line
+  16 and one fixture block immediately after the audio block, in the pattern of
+  the derezz block (one page, one `api.run()`, results pushed, page errors
+  asserted empty). `harness.ts` is untouched. This edit is granted now; quote it
+  in the pre-flight.
+
+Kyle runs `npm run test:gpu` on the M3 and pastes the output; that run is the
+evidence for 6 and 7. `tests/ui/hud-coverage.test.ts` still exists and asserts
+the layout model: each region declares its maximum width and height in
+`layout.ts`, and the sum of declared areas at 1440 by 900 is under 11 percent.
+Print the percentage in both places.
+
+### S14. Things the HUD must not read from modules it cannot import
+
+- Leg name and index: `LEG_ORDER` has 14 ids (`boot_sector` plus 13 legs) and
+  `Leg.title` exists on the `Leg` interface, but no leg module exists yet. The
+  HUD takes `{ title: string; index: number; count: number }` from the host; the
+  rail prints `index` of `count`, with `boot_sector` shown as index 0 titled by
+  the host. Fixtures supply titles.
+- Derezz hide (acceptance 9): the beat table lives in
+  `src/render/derezz/variants.ts` as `DEREZZ_BEATS` and `DEREZZ_TIMING`, which
+  are values, so the HUD cannot import them. The HUD exposes
+  `hud.derezz.begin()` and `hud.derezz.tombstone()`; the host calls them from the
+  world's pre-roll and tombstone callbacks. The test drives a fake clock across
+  the full 3.9 s and asserts hidden throughout.
+- Focus (acceptance 8): `FocusCameraState.mode` from
+  `src/render/camera/focusContract.ts` is `'free' | 'engaging' | 'locked' |
+  'releasing'`, and `FocusTarget.id` is the anchor string. The HUD watches a
+  host-supplied `() => FocusCameraState` (type-only import) and treats `locked`
+  as the 0.25 state and `engaging` and `releasing` as transitions at the
+  resting opacity.
+- The tick counter, CPU utilisation and fault rate: `Kernel.tick`,
+  `SchedulingMetrics.cpuUtilisation` and `MemoryMetrics.faultRate` all exist on
+  `KernelSnapshot.metrics`; the host copies them into the run store's HUD slice
+  once per frame, so the HUD never holds a kernel reference.
+
+### S15. Workers are out of scope here
+
+No worker file exists in `src`, and `src/game/workers/` belongs to WP-18.
+Expose the pure functions (`canonicalise`, `checksumOf`, `buildSaveFile`,
+`buildIndex`) and nothing that references `Worker`, `postMessage` or
+`importScripts`. WP-18 adds `persist.worker.ts` and the protocol and calls these.
+
+### S16. Restore is void and throws
+
+`Kernel.restore(snapshot)` returns `void` and throws on a version mismatch or a
+rejected snapshot; it does not return a completeness result. `LoadService`
+wraps the call, converts a throw into `{ kind: 'unreadable', message }`, and the
+`resume order` case uses ordering probes on `populate` and `restore` as the
+package describes.
+
+### S17. Pre-flight before writing
+
+As with WP-11 and WP-16: read this section, then send a pre-flight listing the
+exact `package.json` diff (S2), the `vitest.config.ts` diff (S3), the
+`run.mjs` diff (S13), the audio import switch (S9), every path from S4, and any
+finding of yours that needs a ruling, each numbered. Wait for the reply before
+the first commit. Every commit passes all four gates on its own and ends with
+both attribution lines.
