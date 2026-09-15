@@ -13,7 +13,7 @@ const machine = { hostname: os.hostname(), cpu: os.cpus()[0]?.model, platform: o
 console.log('GPU test machine:', JSON.stringify(machine));
 await build({ plugins: [allocationProbe], build: {
   outDir: '/private/tmp/kt-wp12-gpu-build', emptyOutDir: true,
-  rolldownOptions: { input: [resolve('tests/render/gpu/probe.html'),resolve('tests/render/gpu/focus.html')] },
+  rolldownOptions: { input: [resolve('tests/render/gpu/probe.html'),resolve('tests/render/gpu/focus.html'),resolve('tests/render/gpu/derezz.html'),resolve('tests/render/gpu/audio.html')] },
 } });
 if (process.argv.includes('--build-only')) process.exit(0);
 
@@ -121,6 +121,29 @@ try {
       console.error(`GPU test failed on ${path}:`,error.stack||String(error));
       console.error(formatPageDiagnostics(diagnostics));failures.push(`${path}: ${error.stack||String(error)}`);
     } finally {await page.close();}
+  }
+  for (const force of webgpuAvailable ? [false, true] : [true]) for (const tier of ['low', 'medium', 'high']) {
+    const path = `wp14-derezz-${force ? 'webgl2' : 'webgpu'}-${tier}`;
+    const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+    const diagnostics = capturePageDiagnostics(page);
+    await page.addInitScript(installWebGPUDiagnostics);
+    try {
+      console.log(`Starting ${path}`);
+      await navigateAndWaitForProbe(page, `http://127.0.0.1:${address.port}/tests/render/gpu/derezz.html?tier=${tier}${force ? '&webgl' : ''}`, diagnostics);
+      const info = await page.evaluate(() => globalThis.__kernelTrailProbe.api.info());
+      assert.equal(info.backend, force ? 'webgl2' : 'webgpu');
+      const result = await page.evaluate(() => globalThis.__kernelTrailProbe.api.run());
+      console.log(`${path}:`, JSON.stringify(result));
+      assert.equal(result.drawCalls, 2, `${path}: anonymous batch plus convoy batch`);
+      results.push({ path, result });
+      assert.equal(diagnostics.pageErrors.length, 0, 'WP-14 derezz page errors');
+      assert.deepEqual(diagnostics.messages.filter(message => message.startsWith('[console.error]')), []);
+      await page.evaluate(() => globalThis.__kernelTrailProbe.api.dispose());
+    } catch (error) {
+      console.error(`GPU test failed on ${path}:`, error.stack || String(error));
+      console.error(formatPageDiagnostics(diagnostics));
+      failures.push(`${path}: ${error.stack || String(error)}`);
+    } finally { await page.close(); }
   }
   // WP-16 audio probe. One page, a real click for the autoplay gesture, then
   // the assertions the package sends to the browser: no context before the
