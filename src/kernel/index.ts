@@ -26,3 +26,5 @@ export type { ArgSpec, CallSpec, ArgRole } from './syscall/validate';
 export { ERRNO_SUBSTITUTIONS, noChildren, notADirectory, badFd, tooManyOpenFiles, addressOutOfRange, isADirectory, directoryNotEmpty } from './syscall/errno';
 export type { ErrnoSubstitution } from './syscall/errno';
 export { encodeProgram, decodeProgram, checkCompleteness, hasWorkloadState } from './snapshot';
+export { checkInvariants, assertSnapshotPure, assertSecretAbsent, InvariantViolation, RNG_ORDER } from './invariants';
+export type { InvariantView, TickStart, TlbView } from './invariants';

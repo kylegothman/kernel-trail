@@ -8,6 +8,7 @@ import { SchedulingAccounting } from './scheduler/metrics';
 import { KernelConfigError, KernelInvariantError } from './errors';
 import { buildProcessState, checkCompleteness, hasWorkloadState, validateProcessState, type ValidatedProcessState } from './snapshot';
 import { dispatch } from './syscall/dispatch';
+import { checkInvariants, type InvariantView, type TickStart } from './invariants';
 import type { KernelState } from './syscall/table';
 import { DEFAULT_TUNING, resolveTuning, validateConfig, type KernelTuning } from './config';
 import { ProcessTable } from './process/ProcessTable';
@@ -101,12 +102,7 @@ export interface SpawnOptions {
   readonly serialFraction?: number;
   readonly threadCount?: number;
 }
-export class InvariantViolation extends KernelInvariantError {
-  constructor(invariant: number, message: string, readonly tick: number) {
-    super(invariant, `I-${invariant} violated at tick ${tick}: ${message}`);
-    this.name = 'InvariantViolation';
-  }
-}
+export { InvariantViolation } from './invariants';
 export interface TlbEntry {
   readonly space: AddressSpaceId;
   readonly page: PageId;
@@ -252,8 +248,9 @@ export class KernelImpl implements Kernel {
     scheduler: tick => this.schedulingAccounting.recompute(tick, this.processes, this.contextSwitches, this.scheduler),
     memory: () => this.memorySubsystem.metrics(),
   };
-  // TODO(astra): WP-11 extends the existing invariant harness to the full set.
-  private invariants: InvariantHooks = { check: kernel => kernel.checkInvariants() };
+  /** The numbered harness of sim spec 15 over the live view; a test may replace it through installHooks. */
+  private invariants: InvariantHooks = { check: kernel => checkInvariants(kernel.invariantState()) };
+  private tickStart: TickStart | null = null;
 
   constructor(config: KernelConfig, options: KernelOptions = {}) {
     validateConfig(config);
@@ -543,13 +540,16 @@ export class KernelImpl implements Kernel {
       const restoreSecurity = snapshot.config.enabledSubsystems.includes('security') ? security.prepareKernelRestore(snapshot) : noop;
       return () => { restoreFs(); restoreSecurity(); };
     } });
-    const invariants = this.invariants;
-    this.invariants = { check: kernel => { invariants.check(kernel); deadlock.assertInvariants();
-      if (this.enabled.has('storage')) storage.assertInvariants();
-      if (this.enabled.has('fs')) fs.checkInvariants(this.tick % this.invariantSlowInterval === 0);
-      if (this.enabled.has('security')) security.assertInvariants();
-      if (this.enabled.has('io')) { io.assertInvariants(); this.assert(io.debt >= 0 && io.debt <= this.switchDebt, 33, 'I/O debt exceeds combined kernel debt'); }
-    } };
+    // The composed subsystem checks run inside the numbered harness (invariants.ts), each in its slot.
+    this.subsystemInvariants = {
+      deadlock: () => deadlock.assertInvariants(),
+      storage: () => { if (this.enabled.has('storage')) storage.assertInvariants(); },
+      fs: slow => { if (this.enabled.has('fs')) fs.checkInvariants(slow); },
+      security: () => { if (this.enabled.has('security')) security.assertInvariants(); },
+      io: () => { if (this.enabled.has('io')) io.assertInvariants(); },
+    };
+    // Cross-tick checks (I-8, I-11) compare against the state at the top of the tick; captured only when the harness is on.
+    this.onPhase(phase => { if (phase === 1 && this.tuning.checkInvariants) this.tickStart = this.captureTickStart(); });
     this.initialiseFrameTable();
     this.initialiseSystemProcesses();
   }
@@ -1320,45 +1320,36 @@ export class KernelImpl implements Kernel {
   private rebuildFreeList(): void {
     this.freeList = this.frames.filter(frame => frame.owner === null).map(frame => frame.id).sort((a, b) => a - b);
   }
-  private checkInvariants(): void {
-    const processes = this.table.filterAscending(p => p.pid !== asPid(0));
-    this.assert(processes.filter(p => p.state === 'running').length <= 1, 2, 'more than one running process');
-    for (let index = 0; index < processes.length; index++) {
-      const pcb = processes[index]; if (pcb === undefined) continue;
-      this.assert(index === 0 || pcb.pid > (processes[index - 1]?.pid ?? -1), 1, 'process table not ascending');
-      this.assert((pcb.state === 'ready') === (pcb.readySince !== null), 12, 'readySince disagrees with state');
-      if (pcb.readySince !== null) this.assert(pcb.readySince <= this.tick, 12, 'readySince lies in the future');
-      if (['ready', 'running', 'waiting'].includes(pcb.state)) this.assert(pcb.threads.length > 0, 7, 'active process has no threads');
-      for (const value of [pcb.cpuBurstRemaining, pcb.serviceRemaining, pcb.totalCpuUsed]) this.assert(Number.isSafeInteger(value) && value >= 0, 4, 'invalid process service');
-      this.assert(pcb.priority >= 0 && pcb.priority <= 39 && pcb.basePriority >= 0 && pcb.basePriority <= 39, 15, 'priority out of range');
-      if (pcb.state === 'waiting') this.assert(pcb.blockedOn !== null, 10, 'waiting process has no block reason');
-      if (this.admittedThisTick.has(pcb.pid) && pcb.readySince !== null) this.assert(pcb.readySince === this.tick, 14, 'new admission has waited');
-      if (pcb.pid > 1 && ['ready', 'running', 'waiting'].includes(pcb.state)) {
-        const sum = pcb.threads.reduce((total, tid) => total + (this.threads.table.get(tid)?.serviceRemaining ?? 0), 0);
-        this.assert(sum === pcb.serviceRemaining, 7, 'thread service is not conserved');
-      }
-    }
-    // I-11 is enforced per edge by transition(), not by comparing endpoints of a multi-edge tick.
-    const queued = this.scheduler.snapshot().queues.flat();
-    this.assert(new Set(queued).size === queued.length, 13, 'duplicate ready queue entry');
-    const expected = processes.filter(p => p.pid > 1 && p.state === 'ready').map(p => p.pid);
-    this.assert(queued.length === expected.length && expected.every(pid => queued.includes(pid)), 13, 'ready queue differs from ready processes');
-    this.assert(this.frames.filter(frame => frame.owner !== null).length + this.freeList.length === this.config.totalFrames, 17, 'frame conservation');
-    for (let index = 1; index < this.freeList.length; index++) this.assert((this.freeList[index] ?? -1) > (this.freeList[index - 1] ?? -1), 20, 'free list not ascending');
-    for (const entry of this.tlb) {
-      const frame = this.frames[entry.frame];
-      if (entry.valid) this.assert(frame?.owner === entry.space && frame.page === entry.page, 9, 'TLB does not match frame owner');
-    }
-    for (const value of Object.values(this.schedulingMetrics)) this.assert(Number.isFinite(value) && value >= 0, 19, 'invalid scheduling metric');
-    this.assert(this.schedulingMetrics.cpuUtilisation <= 1, 19, 'CPU utilisation exceeds one');
-    let previous = -1;
-    for (const event of this.events.lastFrame) { this.assert(event.seq > previous, 38, 'event sequence decreased'); previous = event.seq; }
+  private subsystemInvariants: InvariantView['subsystems'] = { deadlock: noop, storage: noop, fs: noop, security: noop, io: noop };
+  private captureTickStart(): TickStart {
+    const states = new Map<Pid, ProcessState>(); const counters = new Map<Tid, number>();
+    this.table.forEachAscending(pcb => { states.set(pcb.pid, pcb.state); });
+    for (const thread of this.threads.table.values()) counters.set(thread.tid, thread.programCounter);
+    return { states, counters };
   }
-  private assert(condition: boolean, invariant: number, message: string): void {
-    if (!condition) {
-      this.publish({ type: 'kernel.panic', message: `I-${invariant}: ${message}` });
-      throw new InvariantViolation(invariant, message, this.tick);
-    }
+  /**
+   * The read-only view the invariant harness checks (decision D13). Arrays are the
+   * live tables, so a test can corrupt one and call `checkInvariants` directly.
+   */
+  invariantState(): InvariantView {
+    const kernel = this;
+    // Phase 10 rebuilds the cached free list before the memory metrics hook runs, and that hook may
+    // suspend a process (WP-06 thrashing control) and free frames, so the view derives the list now.
+    this.rebuildFreeList();
+    return {
+      tick: this.tick, config: this.config, tuning: this.tuning, enabled: id => kernel.enabled.has(id),
+      processes: this.table.filterAscending(p => p.pid !== asPid(0)), running: this.running, queues: this.scheduler.snapshot().queues,
+      schedulerId: this.scheduler.id, schedulerParams: this.schedulerParams, threads: this.threads.table, admittedThisTick: this.admittedThisTick,
+      tickStart: this.tickStart, frames: this.frames, freeList: this.freeList, pageTables: this.pageTables, tlb: this.tlb,
+      cowRefCounts: this.lifecycle.cowRefCount, sharedMapping: (pid, page) => kernel.ipc.sharedMapping(pid, page), suspended: pid => kernel.memorySubsystem.isSuspended(pid),
+      metrics: { scheduling: this.schedulingMetrics, memory: this.memoryMetrics }, busyTicks: Math.round(this.schedulingMetrics.cpuUtilisation * this.tick),
+      syncPrimitives: this.syncPrimitives, syncStates: this.syncSubsystem.allPrimitives(), syncWaits: this.syncSubsystem.allWaits(), reserved: generation => kernel.syncSubsystem.reserved(generation), scenarios: this.syncSubsystem.allScenarios(),
+      resources: this.resources, mailboxes: this.ipc.snapshotContribution().mailboxes, diskHead: this.diskHead, diskQueue: this.diskQueue, devices: this.devices,
+      interruptLines: this.ioSubsystem.interrupts.lines, ioDebt: this.ioSubsystem.debt, switchDebt: this.switchDebt,
+      lastFrame: this.events.lastFrame, rng: this.rng.save(), slowInterval: this.invariantSlowInterval,
+      subsystems: this.subsystemInvariants,
+      panic: message => kernel.publish({ type: 'kernel.panic', message }),
+    };
   }
 }
 function clonePcb(pcb: Readonly<ProcessControlBlock>): ProcessControlBlock {

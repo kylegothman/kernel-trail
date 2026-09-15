@@ -363,6 +363,12 @@ export class SecuritySubsystem {
     return commit;
   }
   assertInvariants(): void { this.rings.assertInvariants(); this.matrix.assertEquivalent(); }
+  /** I-37 predicate (WP-11 decision D11): whether a text carries the sealing secret in decimal or hexadecimal. It reveals nothing. */
+  secretAppearsIn(text: string): boolean {
+    const secret = this.#kernelSecret;
+    if (secret === 0) return false;
+    return text.includes(String(secret)) || text.toLowerCase().includes(secret.toString(16));
+  }
   private ensure(pid: Pid) {
     let process = processState(this.data, pid); if (process !== undefined) return process;
     const pcb = this.host.process(pid); if (pcb === undefined) throw new KernelConfigError('unknown security process');
