@@ -15,7 +15,7 @@ import type { GranularVoice } from '../voices/GranularVoice';
 import type { LoadModel } from '../score/loadModel';
 import type { Score } from '../score/Score';
 import { makeTargets, type LayerTargets } from '../score/layers';
-import type { FrameAggregates } from './FrameEventQueue';
+import type { FrameAggregates } from '@world/FrameEventQueue';
 import type { PositionSource } from './PositionSource';
 import type { SoundBank } from './eventSounds';
 import { PAN_CLAMP } from '../synth/constants';
@@ -80,8 +80,7 @@ export class AudioConsumer implements EventConsumer {
   /**
    * The coalesced stream hides suppressed faults; the drain's aggregates carry
    * the true count. Accepted before or after `endFrame`.
-   * TODO(astra): WP-14 supplies FrameEventQueue; switch the import and call
-   * this from the fanout's aggregate hook once the shared queue lands.
+   * TODO(astra): WP-19 calls this from the shared queue's endFrame aggregates
    */
   observeAggregates(aggregates: FrameAggregates): void {
     if (this.frameOpen) {
