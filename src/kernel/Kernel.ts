@@ -5,7 +5,11 @@ import { createScheduler, configureSchedulerWorkload, isMetricsAware, isRunningA
 import { saveSchedulerParams } from './scheduler/SchedulerBase';
 import { createSchedulerHooks } from './scheduler/starvation';
 import { SchedulingAccounting } from './scheduler/metrics';
-import { KernelInvariantError } from './errors';
+import { KernelConfigError, KernelInvariantError } from './errors';
+import { buildProcessState, checkCompleteness, hasWorkloadState, validateProcessState, type ValidatedProcessState } from './snapshot';
+import { dispatch } from './syscall/dispatch';
+import { checkInvariants, type InvariantView, type TickStart } from './invariants';
+import type { KernelState } from './syscall/table';
 import { DEFAULT_TUNING, resolveTuning, validateConfig, type KernelTuning } from './config';
 import { ProcessTable } from './process/ProcessTable';
 import { transition, type TransitionOptions } from './process/transitions';
@@ -15,7 +19,7 @@ import { generatedProgram, scriptedProgram, instructionProgram, type Program, ty
 import { IpcManager } from './process/ipc';
 import { MemorySubsystem } from './memory/MemorySubsystem';
 import { SyncSubsystem } from './sync/SyncSubsystem';
-import { DeadlockSubsystem, deadlockSettings, decodeResourceVector, type DeadlockStrategy } from './deadlock/DeadlockSubsystem';
+import { DeadlockSubsystem, deadlockSettings, type DeadlockStrategy } from './deadlock/DeadlockSubsystem';
 import { StorageSubsystem } from './storage/StorageSubsystem';
 import { IoSubsystem } from './io/IoSubsystem';
 import { FileSystemSubsystem } from './fs/FileSystemSubsystem';
@@ -54,12 +58,12 @@ import type {
   SchedulerParams,
   SchedulerPolicy,
   SchedulingMetrics,
-  SubsystemId, SchedulerSnapshotState, SubsystemSnapshots,
+  SubsystemId, SchedulerSnapshotState, SubsystemSnapshots, ProcessSnapshotState,
   SyncPrimitive,
   SyscallRequest,
   SyscallResult,
   Tick,
-  Tid, BlockReason, DomainId, FileDescriptor, DeviceId, AccessRight, Unsubscribe,
+  Tid, BlockReason, DomainId, FileDescriptor, DeviceId, AccessRight, Unsubscribe, TerminationReason,
 } from './types';
 import { asTick, asPid, asPageId } from './types';
 
@@ -98,12 +102,7 @@ export interface SpawnOptions {
   readonly serialFraction?: number;
   readonly threadCount?: number;
 }
-export class InvariantViolation extends KernelInvariantError {
-  constructor(invariant: number, message: string, readonly tick: number) {
-    super(invariant, `I-${invariant} violated at tick ${tick}: ${message}`);
-    this.name = 'InvariantViolation';
-  }
-}
+export { InvariantViolation } from './invariants';
 export interface TlbEntry {
   readonly space: AddressSpaceId;
   readonly page: PageId;
@@ -192,7 +191,6 @@ export class KernelImpl implements Kernel {
   private currentTick = asTick(0);
   private readonly rng: StreamRegistry;
   private enabled: ReadonlySet<SubsystemId>;
-  private hooksInstalled = false;
   private requestedScheduler: SchedulerId;
   private readonly programs = new Map<Pid, Program>();
   private readonly namedPrograms = new Map<string, Program>();
@@ -250,8 +248,9 @@ export class KernelImpl implements Kernel {
     scheduler: tick => this.schedulingAccounting.recompute(tick, this.processes, this.contextSwitches, this.scheduler),
     memory: () => this.memorySubsystem.metrics(),
   };
-  // TODO(astra): WP-11 extends the existing invariant harness to the full set.
-  private invariants: InvariantHooks = { check: kernel => kernel.checkInvariants() };
+  /** The numbered harness of sim spec 15 over the live view; a test may replace it through installHooks. */
+  private invariants: InvariantHooks = { check: kernel => checkInvariants(kernel.invariantState()) };
+  private tickStart: TickStart | null = null;
 
   constructor(config: KernelConfig, options: KernelOptions = {}) {
     validateConfig(config);
@@ -523,7 +522,7 @@ export class KernelImpl implements Kernel {
           }
         }
       }, emit: event => this.publish(event), check: (domain, inode, right) => security.checkFile(domain, inode, right),
-      inodeCreated: inode => security.inodeCreated(inode), storage, io,
+      inodeCreated: inode => security.inodeCreated(inode), storage, io, maxOpenFiles: () => this.tuning.maxOpenFiles,
     }, { defaultAllocation: this.config.fileAllocation, maxSymlinkDepth: this.tuning.maxSymlinkDepth,
       dentryCacheEntries: this.tuning.dentryCacheEntries, fragmentationWarnExtents: this.tuning.fragmentationWarnExtents,
       freeSpaceMethod: this.tuning.freeSpaceMethod, linkedVariant: this.tuning.linkedVariant, journalMode: this.config.journalingEnabled ? this.tuning.journalMode : 'off' });
@@ -541,13 +540,16 @@ export class KernelImpl implements Kernel {
       const restoreSecurity = snapshot.config.enabledSubsystems.includes('security') ? security.prepareKernelRestore(snapshot) : noop;
       return () => { restoreFs(); restoreSecurity(); };
     } });
-    const invariants = this.invariants;
-    this.invariants = { check: kernel => { invariants.check(kernel); deadlock.assertInvariants();
-      if (this.enabled.has('storage')) storage.assertInvariants();
-      if (this.enabled.has('fs')) fs.checkInvariants(this.tick % this.invariantSlowInterval === 0);
-      if (this.enabled.has('security')) security.assertInvariants();
-      if (this.enabled.has('io')) { io.assertInvariants(); this.assert(io.debt >= 0 && io.debt <= this.switchDebt, 33, 'I/O debt exceeds combined kernel debt'); }
-    } };
+    // The composed subsystem checks run inside the numbered harness (invariants.ts), each in its slot.
+    this.subsystemInvariants = {
+      deadlock: () => deadlock.assertInvariants(),
+      storage: () => { if (this.enabled.has('storage')) storage.assertInvariants(); },
+      fs: slow => { if (this.enabled.has('fs')) fs.checkInvariants(slow); },
+      security: () => { if (this.enabled.has('security')) security.assertInvariants(); },
+      io: () => { if (this.enabled.has('io')) io.assertInvariants(); },
+    };
+    // Cross-tick checks (I-8, I-11) compare against the state at the top of the tick; captured only when the harness is on.
+    this.onPhase(phase => { if (phase === 1 && this.tuning.checkInvariants) this.tickStart = this.captureTickStart(); });
     this.initialiseFrameTable();
     this.initialiseSystemProcesses();
   }
@@ -571,7 +573,6 @@ export class KernelImpl implements Kernel {
     this.probes.add(probe); return () => { this.probes.delete(probe); };
   }
   installHooks(hooks: Partial<KernelHooks>): void {
-    this.hooksInstalled ||= Object.keys(hooks).some(key => key !== 'snapshots');
     if (hooks.snapshots !== undefined) this.snapshotHooks.push(hooks.snapshots);
     this.memory = { ...this.memory, ...hooks.memory }; this.sync = { ...this.sync, ...hooks.sync };
     this.io = { ...this.io, ...hooks.io }; this.storage = { ...this.storage, ...hooks.storage };
@@ -635,103 +636,111 @@ export class KernelImpl implements Kernel {
     for (let i = 0; i < ticks; i++) log.push(...this.step());
     return log;
   }
-  syscall(request: SyscallRequest): SyscallResult {
-    const pcb = this.table.get(request.pid);
-    const live = pcb !== undefined && pcb.state !== 'zombie' && pcb.state !== 'terminated';
-    const trap = live && this.enabled.has('security') ? this.securitySubsystem.enterTrap(pcb.pid) : null;
-    try {
-      const result = !live ? failure('ESRCH', 'process not found') : this.dispatchSyscall(pcb, request);
-      this.syscallResults.set(request.pid, result);
-      const actor = live ? this.ioActor(pcb) : undefined;
-      if (actor === undefined || !this.enabled.has('fs') || this.fileSystemSubsystem.pending(actor) === undefined) this.publish({ type: 'syscall.invoked', request, result });
-      return result;
-    } finally { if (live && this.enabled.has('security')) this.securitySubsystem.returnTrap(pcb.pid, trap); }
-  }
-  private dispatchSyscall(pcb: ProcessControlBlock, request: SyscallRequest): SyscallResult {
-    const arg = request.args[0];
-    switch (request.name) {
-      case 'getpid': return { ok: true, value: pcb.pid };
-      case 'fork': return this.lifecycle.fork(pcb);
-      case 'exec': {
-        if (pcb.state === 'waiting') return failure('EBUSY', 'cannot exec a blocked process');
-        const target = typeof arg === 'string' && this.enabled.has('fs') && this.fileSystemSubsystem.mounted && !this.namedPrograms.has(arg)
-          ? this.fileSystemSubsystem.execTarget(pcb.pid, arg) : undefined;
-        if (target !== undefined && !target.result.ok) return target.result;
-        const result = typeof arg === 'string' ? this.lifecycle.exec(pcb, target?.programName ?? arg) : failure('EINVAL', 'exec requires a program name');
-        if (result.ok) { this.threads.recompute(pcb); this.securitySubsystem.commitExec(pcb.pid, target?.inode); }
+  /** Executes the call immediately and synchronously, outside the tick loop (sim spec 14.1). */
+  syscall(request: SyscallRequest): SyscallResult { return dispatch(request, this.syscallState); }
+  /**
+   * The narrow kernel view the syscall table works through. Public so a test can
+   * hand it to `dispatch` with a substituted table (decision D13). Every operation
+   * delegates to the subsystem that owns the logic.
+   */
+  readonly syscallState: KernelState = this.buildSyscallState();
+  private buildSyscallState(): KernelState {
+    const kernel = this;
+    return {
+      get tick() { return kernel.tick; }, get config() { return kernel.config; }, get tuning() { return kernel.tuning; },
+      enabled: id => kernel.enabled.has(id),
+      pcb: pid => kernel.table.get(pid),
+      parentOf: pid => kernel.table.parentOf(pid),
+      pageCount: space => kernel.pageTables.get(space)?.length ?? 0,
+      rings: {
+        enter: pid => (kernel.enabled.has('security') ? kernel.securitySubsystem.enterTrap(pid) : null),
+        leave: (pid, trap) => { if (kernel.enabled.has('security')) kernel.securitySubsystem.returnTrap(pid, trap); },
+      },
+      callerDomain: pid => kernel.securitySubsystem.callerDomain(pid),
+      callerRing: pid => kernel.securitySubsystem.identity(pid)?.ring ?? 3,
+      checkAccess: (domain, object, right) => kernel.securitySubsystem.check(domain, object, right),
+      record: (pid, request, result) => {
+        kernel.syscallResults.set(pid, result);
+        const pcb = kernel.table.get(pid); const actor = pcb === undefined ? undefined : kernel.ioActor(pcb);
+        // A pending file call publishes its own syscall.invoked when it completes (WP-10), so it is not emitted twice.
+        if (actor === undefined || !kernel.enabled.has('fs') || kernel.fileSystemSubsystem.pending(actor) === undefined) kernel.publish({ type: 'syscall.invoked', request, result });
+      },
+      emit: event => kernel.publish(event),
+      fork: pcb => kernel.lifecycle.fork(pcb),
+      exec: (pcb, name) => kernel.execProgram(pcb, name),
+      exit: (pcb, code) => kernel.exitProcess(pcb, code),
+      wait: (pcb, child) => kernel.waitFor(pcb, child),
+      kill: (target, byParent) => kernel.exitProcess(target, 137, byParent ? 'killed_by_parent' : 'killed_by_user'),
+      setPriority: (pcb, priority) => { pcb.priority = priority; },
+      regionExists: id => kernel.ipc.sharedRegion(id) !== undefined,
+      mapRegion: (pid, id, writable) => kernel.ipc.mmap(pid, id, writable),
+      unmapRange: (pid, first, pages) => kernel.ipc.munmapRange(pid, first, pages),
+      growAddressSpace: (pcb, pages) => {
+        const current = kernel.pageTables.get(pcb.addressSpaceId)?.length ?? 0;
+        if (!Number.isSafeInteger(current + pages)) return null;
+        return kernel.memorySubsystem.resizeAddressSpace(pcb.addressSpaceId, current + pages).firstNewPage;
+      },
+      shrinkAddressSpace: (pcb, pages) => kernel.releaseTail(pcb, pages),
+      file: request => kernel.fileSystemSubsystem.syscall(request),
+      syncFiles: pcb => {
+        if (kernel.enabled.has('fs') && kernel.fileSystemSubsystem.mounted) return kernel.fileSystemSubsystem.syscall({ name: 'sync', pid: pcb.pid, args: [] });
+        return kernel.enabled.has('io') ? kernel.ioSubsystem.sync(kernel.ioActor(pcb)) : failure('EINVAL', 'I/O is disabled');
+      },
+      primitiveKind: resource => kernel.syncSubsystem.get(resource)?.kind,
+      syncCall: (pid, operation, resource) => kernel.syncSubsystem.syscall(pid, operation, resource),
+      resourceExists: id => kernel.deadlockSubsystem.owns(id),
+      request: (pid, vector) => kernel.deadlockSubsystem.requestVector(pid, vector),
+      release: (pid, vector) => kernel.deadlockSubsystem.releaseVector(pid, vector),
+      deviceExists: id => kernel.ioSubsystem.devices.some(device => device.id === id),
+      ioctl: (pcb, device, command, args) => {
+        if (device === 'kernel' && command === 'tlb_flush') { kernel.memorySubsystem.flush(); return { ok: true, value: null }; }
+        if (!kernel.enabled.has('io')) return failure('EINVAL', 'unknown kernel ioctl subcommand');
+        const result = kernel.ioSubsystem.control(device, command, args, kernel.ioActor(pcb));
+        if (result.ok && command === 'set_policy') kernel.currentConfig = cloneConfig({ ...kernel.config, diskPolicy: kernel.storageSubsystem.activePolicy });
         return result;
-      }
-      case 'exit': return typeof arg === 'number' && Number.isSafeInteger(arg)
-        ? this.exitProcess(pcb, arg) : failure('EINVAL', 'exit requires an integer code');
-      case 'wait': {
-        if (arg !== undefined && (typeof arg !== 'number' || !Number.isSafeInteger(arg) || arg < 0)) return failure('EINVAL', 'invalid child pid');
-        const child = typeof arg === 'number' ? asPid(arg) : null;
-        if (child !== null && (this.table.parentOf(child) !== pcb.pid || this.table.get(child)?.state === 'terminated')) return failure('ESRCH', 'not a child');
-        if (pcb.state !== 'running' && !this.lifecycle.hasExitedChild(pcb.pid, child)) {
-          const hasChildren = this.table.filterAscending(p => this.table.parentOf(p.pid) === pcb.pid && p.state !== 'terminated').length > 0;
-          if (hasChildren) return failure('EBUSY', 'blocking wait requires a running caller');
-        }
-        return this.lifecycle.wait(pcb, child);
-      }
-      case 'kill': {
-        if (typeof arg !== 'number' || !Number.isSafeInteger(arg)) return failure('EINVAL', 'invalid target pid');
-        const target = this.table.get(asPid(arg));
-        if (target === undefined || target.pid === asPid(0)) return failure('ESRCH', 'process not found');
-        return this.exitProcess(target, 137, target.parent === pcb.pid ? 'killed_by_parent' : 'killed_by_user');
-      }
-      case 'ioctl':
-        // TODO(astra): WP-11 validates ioctl arguments.
-        if (arg !== 'tlb_flush') {
-          if (!this.enabled.has('io') || typeof arg !== 'string' || typeof request.args[1] !== 'string') return failure('EINVAL', 'unknown kernel ioctl subcommand');
-          const result = this.ioSubsystem.control(arg as DeviceId, request.args[1], request.args.slice(2), this.ioActor(pcb));
-          if (result.ok && request.args[1] === 'set_policy') this.currentConfig = cloneConfig({ ...this.config, diskPolicy: this.storageSubsystem.activePolicy });
-          return result;
-        }
-        this.memorySubsystem.flush(); return { ok: true, value: null };
-      case 'sync':
-        // TODO(astra): WP-11 validates sync arguments.
-        if (this.enabled.has('fs') && this.fileSystemSubsystem.mounted) return this.fileSystemSubsystem.syscall(request);
-        return this.enabled.has('io') ? this.ioSubsystem.sync(this.ioActor(pcb)) : failure('EINVAL', 'I/O is disabled');
-      case 'read': case 'write': {
-        // TODO(astra): WP-11 validates read and write arguments; the byte-count bound below is the SEC-ARG-1 check it takes over.
-        const invalid = this.securitySubsystem.validateByteCount(pcb.pid, request.args[1]);
-        if (invalid !== null) return invalid;
-        return this.fileSystemSubsystem.syscall(request);
-      }
-      case 'open': case 'close': case 'seek': case 'stat': case 'unlink': case 'mkdir': case 'chmod':
-        // TODO(astra): WP-11 validates open, close, seek, stat, unlink, mkdir and chmod arguments.
-        return this.fileSystemSubsystem.syscall(request);
-      case 'sem_wait':
-        // TODO(astra): WP-11 validates sem_wait arguments.
-        return typeof arg === 'string' && request.args.length === 1 ? this.syncSubsystem.syscall(pcb.pid, 'sem_wait', arg as ResourceId) : failure('EINVAL', 'expected a synchronization resource');
-      case 'sem_post':
-        // TODO(astra): WP-11 validates sem_post arguments.
-        return typeof arg === 'string' && request.args.length === 1 ? this.syncSubsystem.syscall(pcb.pid, 'sem_post', arg as ResourceId) : failure('EINVAL', 'expected a synchronization resource');
-      case 'mutex_lock':
-        // TODO(astra): WP-11 validates mutex_lock arguments.
-        return typeof arg === 'string' && request.args.length === 1 ? this.syncSubsystem.syscall(pcb.pid, 'mutex_lock', arg as ResourceId) : failure('EINVAL', 'expected a synchronization resource');
-      case 'mutex_unlock':
-        // TODO(astra): WP-11 validates mutex_unlock arguments.
-        return typeof arg === 'string' && request.args.length === 1 ? this.syncSubsystem.syscall(pcb.pid, 'mutex_unlock', arg as ResourceId) : failure('EINVAL', 'expected a synchronization resource');
-      case 'request': {
-        // TODO(astra): WP-11 validates request arguments.
-        const vector = decodeResourceVector(request.args);
-        return vector === undefined ? failure('EINVAL', 'expected resource/count pairs') : this.deadlockSubsystem.requestVector(pcb.pid, vector);
-      }
-      case 'release': {
-        // TODO(astra): WP-11 validates release arguments.
-        const vector = decodeResourceVector(request.args);
-        return vector === undefined ? failure('EINVAL', 'expected resource/count pairs') : this.deadlockSubsystem.releaseVector(pcb.pid, vector);
-      }
-      case 'nice':
-        if (typeof arg !== 'number' || !Number.isSafeInteger(arg) || arg < 0 || arg > 39) return failure('EINVAL', 'priority must be in [0, 39]');
-        pcb.priority = arg; return { ok: true, value: arg };
-      default:
-        // TODO(astra): WP-11 completes the syscall table.
-        return failure('EINVAL', 'not implemented in WP-02');
-    }
+      },
+    };
   }
-  private exitProcess(pcb: ProcessControlBlock, code: number, reason: import('./types').TerminationReason = 'normal_exit'): SyscallResult {
+  private execProgram(pcb: ProcessControlBlock, name: string): SyscallResult {
+    if (pcb.state === 'waiting') return failure('EBUSY', 'cannot exec a blocked process');
+    const target = this.enabled.has('fs') && this.fileSystemSubsystem.mounted && !this.namedPrograms.has(name)
+      ? this.fileSystemSubsystem.execTarget(pcb.pid, name) : undefined;
+    if (target !== undefined && !target.result.ok) return target.result;
+    const result = this.lifecycle.exec(pcb, target?.programName ?? name);
+    if (result.ok) { this.threads.recompute(pcb); this.securitySubsystem.commitExec(pcb.pid, target?.inode); }
+    return result;
+  }
+  private waitFor(pcb: ProcessControlBlock, child: Pid | null): SyscallResult {
+    if (child !== null && (this.table.parentOf(child) !== pcb.pid || this.table.get(child)?.state === 'terminated')) return failure('ESRCH', 'not a child');
+    if (pcb.state !== 'running' && !this.lifecycle.hasExitedChild(pcb.pid, child)) {
+      const hasChildren = this.table.filterAscending(p => this.table.parentOf(p.pid) === pcb.pid && p.state !== 'terminated').length > 0;
+      if (hasChildren) return failure('EBUSY', 'blocking wait requires a running caller');
+    }
+    return this.lifecycle.wait(pcb, child);
+  }
+  /**
+   * Release the highest `pages` pages of an anonymous address space through the
+   * copy-on-write rule lifecycle uses on exit: a frame shared by copy-on-write
+   * loses one reference and its last alias regains write permission; a frame
+   * pinned by a shared region stays mapped for its attachers; an exclusively
+   * owned frame is freed.
+   */
+  private releaseTail(pcb: ProcessControlBlock, pages: number): readonly FrameId[] {
+    const current = this.pageTables.get(pcb.addressSpaceId)?.length ?? 0;
+    const removed = this.memorySubsystem.resizeAddressSpace(pcb.addressSpaceId, Math.max(0, current - pages)).removed;
+    const freed: FrameId[] = [];
+    for (const entry of removed) {
+      if (!entry.valid || entry.frame === null) continue;
+      const frame = entry.frame;
+      if (this.frames[frame]?.pinned === true) continue;
+      const remaining = (this.lifecycle.cowRefCount.get(frame) ?? 1) - 1;
+      if (remaining <= 0) { this.lifecycle.cowRefCount.delete(frame); this.memory.freeFrame(frame); freed.push(frame); continue; }
+      this.lifecycle.cowRefCount.set(frame, remaining);
+      if (remaining === 1) for (const table of this.pageTables.values()) for (const pte of table) if (pte.valid && pte.frame === frame) pte.writable = true;
+    }
+    return freed;
+  }
+  private exitProcess(pcb: ProcessControlBlock, code: number, reason: TerminationReason = 'normal_exit'): SyscallResult {
     if (pcb.pid === asPid(0)) return failure('EPERM', 'idle cannot exit');
     if (pcb.state === 'new') {
       pcb.exitCode = code; pcb.terminationReason = reason; this.move(pcb, 'terminated');
@@ -874,9 +883,13 @@ export class KernelImpl implements Kernel {
     this.syncSchedulerView();
   }
 
-  /** The scaffold's init-only replay remains supported. Workload saves need WP-11's contract channel. */
+  /**
+   * A snapshot is full whenever the kernel holds workload state, and then carries
+   * the process contribution beside every subsystem's own. Pure: two calls with
+   * no intervening step agree byte for byte (I-40).
+   */
   snapshot(): KernelSnapshot {
-    this.requireSnapshotChannel('snapshot');
+    const full = this.hasWorkload();
     return this.withSnapshotContributions({
       version: 1, tick: this.tick, seq: this.events.seq, config: cloneConfig({ ...this.config, scheduler: this.requestedScheduler, schedulerParams: this.schedulerParams }), rng: this.rng.save(),
       processes: this.processes.map(clonePcb), frames: this.frames.map(frame => ({ ...frame })),
@@ -887,7 +900,8 @@ export class KernelImpl implements Kernel {
       diskHead: { ...this.diskHead }, devices: this.devices.map(d => ({ ...d, queue: [...d.queue] })),
       inodes: this.inodes.map(i => ({ ...i, blocks: [...i.blocks] })), journal: this.journal.map(j => ({ ...j, blocks: [...j.blocks] })),
       domains: this.domains.map(d => ({ ...d, rights: new Map([...d.rights].map(([key, rights]) => [key, [...rights]])) })),
-      subsystems: { scheduler: this.saveSchedulerState() },
+      completeness: full ? 'full' : 'init_only',
+      subsystems: { scheduler: this.saveSchedulerState(), ...(full ? { process: this.saveProcessState() } : {}) },
       metrics: { scheduling: { ...this.schedulingMetrics }, memory: { ...this.memoryMetrics, workingSets: new Map(this.memoryMetrics.workingSets) } },
     });
   }
@@ -900,27 +914,66 @@ export class KernelImpl implements Kernel {
     }
     return { ...snapshot, subsystems };
   }
+  private hasWorkload(): boolean {
+    const customTuning = Object.keys(DEFAULT_TUNING).some(key => key !== 'checkInvariants' && Reflect.get(this.tuning, key) !== Reflect.get(DEFAULT_TUNING, key));
+    return hasWorkloadState({ nextPid: this.table.nextPid, namedPrograms: this.namedPrograms.size, ipcHasState: this.ipc.hasState, customTuning });
+  }
+  private saveProcessState(): ProcessSnapshotState {
+    return buildProcessState({
+      programs: this.programs, namedPrograms: this.namedPrograms, processes: this.processes, raw: this.table.raw,
+      table: this.table.snapshotContribution(), threads: this.threads.snapshotContribution(), lifecycle: this.lifecycle.snapshotContribution(),
+      ipc: this.ipc.snapshotContribution(), burstSizes: this.burstSizes, copyDebts: this.copyDebt, syscallResults: this.syscallResults,
+      nextAddressSpace: this.nextSpace, tuning: this.tuning,
+    });
+  }
+  /**
+   * Replace state in place. Version, completeness and the process contribution
+   * are validated before any mutation. Afterwards the process tables are staged
+   * first and every subsystem contribution is prepared and committed in
+   * registration order, because sync, memory and deadlock validate their
+   * payloads against the live tables and deadlock against committed sync state.
+   * Any failure after staging rolls the kernel back to the snapshot taken at
+   * entry, so one invalid contribution still changes nothing (decision D1).
+   */
   restore(snapshot: KernelSnapshot): void {
-    if (snapshot.version !== 1) throw new Error(`unsupported snapshot version ${String(snapshot.version)}`);
-    this.requireSnapshotChannel('restore');
-    if (snapshot.processes.some(pcb => pcb.pid !== asPid(1) || pcb.state !== 'ready') || snapshot.processes.length !== 1) this.snapshotBlocked('restore');
+    if (snapshot.version !== 1) throw new KernelConfigError(`unsupported snapshot version ${String(snapshot.version)}`);
+    const completeness = checkCompleteness(snapshot, this.hasWorkload());
+    const validated = completeness === 'full' ? validateProcessState(snapshot, this.tuning) : null;
+    if (validated === null && (snapshot.processes.length !== 1 || snapshot.processes[0]?.pid !== asPid(1))) throw new KernelConfigError('restore refused: an init-only snapshot holds a workload');
     if (snapshot.subsystems?.scheduler !== undefined) prepareSchedulerRestore(snapshot.subsystems.scheduler, {
-      ...this.schedulerContext(), tick: snapshot.tick, running: null, readyQueue: [],
+      ...this.schedulerContext(), tick: snapshot.tick,
+      running: snapshot.processes.find(pcb => pcb.pid > 1 && pcb.state === 'running')?.pid ?? null,
+      readyQueue: snapshot.processes.filter(pcb => pcb.pid > 1 && pcb.state === 'ready').map(pcb => pcb.pid),
       process: pid => snapshot.processes.find(pcb => pcb.pid === pid),
-    }, this.schedulingAccounting, pid => this.burstSizes.get(pid), {
+    }, this.schedulingAccounting, pid => snapshot.subsystems?.process?.burstSizes.find(([candidate]) => candidate === pid)?.[1] ?? this.burstSizes.get(pid), {
       maxProcesses: this.tuning.maxProcesses, mlfqAccounting: this.tuning.mlfqAccounting, emit: event => this.publish(event),
     }, snapshot.config);
-    const restoreContributions = this.snapshotHooks.map(hooks => hooks.restoreState(snapshot));
+    const entry = this.snapshot();
+    try { this.applyRestore(snapshot, validated); }
+    catch (error) {
+      try { this.applyRestore(entry, entry.completeness === 'full' ? validateProcessState(entry, this.tuning) : null); }
+      catch (inner) { throw new KernelConfigError(`restore failed and the rollback failed too: ${String(error)}; ${String(inner)}`); }
+      throw error;
+    }
+  }
+  private applyRestore(snapshot: KernelSnapshot, validated: ValidatedProcessState | null): void {
     this.currentConfig = cloneConfig(snapshot.config); this.enabled = new Set(this.config.enabledSubsystems);
     this.schedulerParams = { ...snapshot.config.schedulerParams }; this.requestedScheduler = this.config.scheduler;
     this.currentTick = snapshot.tick; this.events.beginFrame(); this.events.setSeq(snapshot.seq); this.rng.restore(snapshot.rng);
-    this.table.forEachAscending(pcb => this.threads.clear(pcb)); this.table.clear(); this.threads.reset(); this.initialiseSystemProcesses(snapshot.processes[0]);
-    const init = snapshot.processes[0];
-    const live = this.table.get(asPid(1));
-    if (init !== undefined && live !== undefined) {
-      // Init has no instruction stream; its finite service fields stay unchanged.
-      live.state = init.state; live.readySince = init.readySince;
-    }
+    this.table.forEachAscending(pcb => this.threads.clear(pcb)); this.table.clear(); this.threads.reset();
+    this.programs.clear(); this.namedPrograms.clear(); this.burstSizes.clear(); this.copyDebt.clear(); this.syscallResults.clear();
+    this.wakeable.clear(); this.admittedThisTick.clear(); this.executingThread = undefined;
+    if (validated === null) {
+      this.initialiseSystemProcesses(snapshot.processes[0]);
+      const init = snapshot.processes[0];
+      const live = this.table.get(asPid(1));
+      if (init !== undefined && live !== undefined) {
+        // Init has no instruction stream; its finite service fields stay unchanged.
+        live.state = init.state; live.readySince = init.readySince;
+      }
+      this.lifecycle.restoreContribution({ cowRefCounts: [], pendingChildReturns: [] });
+      this.ipc.restoreContribution({ sharedRegions: [], mailboxes: [], pending: [], completions: [], completedWaits: [], originalPins: [] });
+    } else this.stageProcessState(snapshot, validated);
     this.frames = snapshot.frames.map(frame => ({ ...frame })); this.rebuildFreeList();
     this.pageTables.clear();
     for (const [space, entries] of snapshot.pageTables) this.pageTables.set(space, entries.map(entry => ({ ...entry })));
@@ -934,22 +987,30 @@ export class KernelImpl implements Kernel {
     this.memoryMetrics = { ...snapshot.metrics.memory, workingSets: new Map(snapshot.metrics.memory.workingSets) };
     this.contextSwitches = snapshot.metrics.scheduling.contextSwitches;
     this.running = null; this.lastCpuOwner = null; this.sliceElapsed = 0; this.switchDebt = 0;
-    this.wakeable.clear(); this.admittedThisTick.clear(); this.scheduler = this.makeScheduler(this.config.scheduler);
+    this.scheduler = this.makeScheduler(this.config.scheduler);
     if (snapshot.subsystems?.scheduler !== undefined) this.restoreSchedulerState(snapshot.subsystems.scheduler);
     else this.schedulingAccounting.reset();
-    for (const commit of restoreContributions) commit();
+    // Prepare then commit per owner, in registration order: memory, sync, deadlock, storage and io, fs and security.
+    for (const hooks of this.snapshotHooks) hooks.restoreState(snapshot)();
     this.initialiseFrameTable();
     this.syncSchedulerView();
   }
-  private requireSnapshotChannel(name: string): void {
-    const tuningNeedsState = Object.keys(DEFAULT_TUNING).some(key => key !== 'checkInvariants'
-      && Reflect.get(this.tuning, key) !== Reflect.get(DEFAULT_TUNING, key));
-    if (this.table.nextPid > 2 || this.namedPrograms.size > 0 || this.hooksInstalled || this.ipc.hasState
-      || tuningNeedsState || this.table.get(asPid(1))?.state !== 'ready') this.snapshotBlocked(name);
-  }
-  private snapshotBlocked(name: string): never {
-    // TODO(astra): blocked on contract change, see report
-    throw new Error(`not implemented: ${name} for process workloads or custom subsystem state; WP-11 needs a KernelSnapshot channel for programs, threads and side tables`);
+  /** Install the validated process contribution into the live tables; every subsystem prepare that follows reads them. */
+  private stageProcessState(snapshot: KernelSnapshot, validated: ValidatedProcessState): void {
+    const state = validated.state;
+    this.table.restoreContribution({ processes: [this.idlePcb(), ...snapshot.processes.map(clonePcb)], raw: validated.raw,
+      createdEvents: state.createdEvents, nextPid: state.counters.nextPid });
+    const pcbs = this.table.filterAscending(pcb => pcb.pid !== asPid(0));
+    this.threads.restoreContribution({ threads: state.threads, lwpBindings: state.lwpBindings, deliveryCursors: state.deliveryCursors,
+      threadAccounting: state.threadAccounting, nextTid: state.counters.nextTid }, pcbs);
+    for (const [pid, program] of validated.programs) this.programs.set(pid, program);
+    for (const [name, program] of validated.namedPrograms) this.namedPrograms.set(name, program);
+    for (const [pid, burst] of state.burstSizes) this.burstSizes.set(pid, burst);
+    for (const [pid, debt] of state.copyDebts) this.copyDebt.set(pid, debt);
+    for (const [pid, result] of state.syscallResults) this.syscallResults.set(pid, { ...result });
+    this.nextSpace = state.counters.nextAddressSpace;
+    this.lifecycle.restoreContribution({ cowRefCounts: state.cowRefCounts, pendingChildReturns: state.pendingChildReturns });
+    this.ipc.restoreContribution(state.ipc);
   }
 
   private phase01_expireTimers(): void {
@@ -1232,9 +1293,13 @@ export class KernelImpl implements Kernel {
       threads: [], openFiles: [], heldResources: [], requestedResources: [], blockedOn: null,
       domain: 'kernel' as DomainId, exitCode: null, terminationReason: null, convoyMemberId: null };
   }
-  private initialiseSystemProcesses(savedInit?: ProcessControlBlock): void {
-    const idle = this.table.insert({ ...this.basePcb(asPid(0), null, 'idle'), priority: Number.MAX_SAFE_INTEGER, basePriority: Number.MAX_SAFE_INTEGER, cpuBurstRemaining: Infinity, serviceRemaining: Infinity });
+  private idlePcb(): ProcessControlBlock {
+    const idle = { ...this.basePcb(asPid(0), null, 'idle'), priority: Number.MAX_SAFE_INTEGER, basePriority: Number.MAX_SAFE_INTEGER, cpuBurstRemaining: Infinity, serviceRemaining: Infinity };
     idle.threads.push(0 as Tid);
+    return idle;
+  }
+  private initialiseSystemProcesses(savedInit?: ProcessControlBlock): void {
+    this.table.insert(this.idlePcb());
     const init = this.table.insert(savedInit === undefined ? this.basePcb(asPid(1), null, 'init') : clonePcb(savedInit), { rawBurst: 1, rawService: 1, serialFraction: 1 });
     this.threads.attach(init);
     this.programs.set(init.pid, instructionProgram([{ kind: 'compute' }]));
@@ -1255,45 +1320,36 @@ export class KernelImpl implements Kernel {
   private rebuildFreeList(): void {
     this.freeList = this.frames.filter(frame => frame.owner === null).map(frame => frame.id).sort((a, b) => a - b);
   }
-  private checkInvariants(): void {
-    const processes = this.table.filterAscending(p => p.pid !== asPid(0));
-    this.assert(processes.filter(p => p.state === 'running').length <= 1, 2, 'more than one running process');
-    for (let index = 0; index < processes.length; index++) {
-      const pcb = processes[index]; if (pcb === undefined) continue;
-      this.assert(index === 0 || pcb.pid > (processes[index - 1]?.pid ?? -1), 1, 'process table not ascending');
-      this.assert((pcb.state === 'ready') === (pcb.readySince !== null), 12, 'readySince disagrees with state');
-      if (pcb.readySince !== null) this.assert(pcb.readySince <= this.tick, 12, 'readySince lies in the future');
-      if (['ready', 'running', 'waiting'].includes(pcb.state)) this.assert(pcb.threads.length > 0, 7, 'active process has no threads');
-      for (const value of [pcb.cpuBurstRemaining, pcb.serviceRemaining, pcb.totalCpuUsed]) this.assert(Number.isSafeInteger(value) && value >= 0, 4, 'invalid process service');
-      this.assert(pcb.priority >= 0 && pcb.priority <= 39 && pcb.basePriority >= 0 && pcb.basePriority <= 39, 15, 'priority out of range');
-      if (pcb.state === 'waiting') this.assert(pcb.blockedOn !== null, 10, 'waiting process has no block reason');
-      if (this.admittedThisTick.has(pcb.pid) && pcb.readySince !== null) this.assert(pcb.readySince === this.tick, 14, 'new admission has waited');
-      if (pcb.pid > 1 && ['ready', 'running', 'waiting'].includes(pcb.state)) {
-        const sum = pcb.threads.reduce((total, tid) => total + (this.threads.table.get(tid)?.serviceRemaining ?? 0), 0);
-        this.assert(sum === pcb.serviceRemaining, 7, 'thread service is not conserved');
-      }
-    }
-    // I-11 is enforced per edge by transition(), not by comparing endpoints of a multi-edge tick.
-    const queued = this.scheduler.snapshot().queues.flat();
-    this.assert(new Set(queued).size === queued.length, 13, 'duplicate ready queue entry');
-    const expected = processes.filter(p => p.pid > 1 && p.state === 'ready').map(p => p.pid);
-    this.assert(queued.length === expected.length && expected.every(pid => queued.includes(pid)), 13, 'ready queue differs from ready processes');
-    this.assert(this.frames.filter(frame => frame.owner !== null).length + this.freeList.length === this.config.totalFrames, 17, 'frame conservation');
-    for (let index = 1; index < this.freeList.length; index++) this.assert((this.freeList[index] ?? -1) > (this.freeList[index - 1] ?? -1), 20, 'free list not ascending');
-    for (const entry of this.tlb) {
-      const frame = this.frames[entry.frame];
-      if (entry.valid) this.assert(frame?.owner === entry.space && frame.page === entry.page, 9, 'TLB does not match frame owner');
-    }
-    for (const value of Object.values(this.schedulingMetrics)) this.assert(Number.isFinite(value) && value >= 0, 19, 'invalid scheduling metric');
-    this.assert(this.schedulingMetrics.cpuUtilisation <= 1, 19, 'CPU utilisation exceeds one');
-    let previous = -1;
-    for (const event of this.events.lastFrame) { this.assert(event.seq > previous, 38, 'event sequence decreased'); previous = event.seq; }
+  private subsystemInvariants: InvariantView['subsystems'] = { deadlock: noop, storage: noop, fs: noop, security: noop, io: noop };
+  private captureTickStart(): TickStart {
+    const states = new Map<Pid, ProcessState>(); const counters = new Map<Tid, number>();
+    this.table.forEachAscending(pcb => { states.set(pcb.pid, pcb.state); });
+    for (const thread of this.threads.table.values()) counters.set(thread.tid, thread.programCounter);
+    return { states, counters };
   }
-  private assert(condition: boolean, invariant: number, message: string): void {
-    if (!condition) {
-      this.publish({ type: 'kernel.panic', message: `I-${invariant}: ${message}` });
-      throw new InvariantViolation(invariant, message, this.tick);
-    }
+  /**
+   * The read-only view the invariant harness checks (decision D13). Arrays are the
+   * live tables, so a test can corrupt one and call `checkInvariants` directly.
+   */
+  invariantState(): InvariantView {
+    const kernel = this;
+    // Phase 10 rebuilds the cached free list before the memory metrics hook runs, and that hook may
+    // suspend a process (WP-06 thrashing control) and free frames, so the view derives the list now.
+    this.rebuildFreeList();
+    return {
+      tick: this.tick, config: this.config, tuning: this.tuning, enabled: id => kernel.enabled.has(id),
+      processes: this.table.filterAscending(p => p.pid !== asPid(0)), running: this.running, queues: this.scheduler.snapshot().queues,
+      schedulerId: this.scheduler.id, schedulerParams: this.schedulerParams, threads: this.threads.table, admittedThisTick: this.admittedThisTick,
+      tickStart: this.tickStart, frames: this.frames, freeList: this.freeList, pageTables: this.pageTables, tlb: this.tlb,
+      cowRefCounts: this.lifecycle.cowRefCount, sharedMapping: (pid, page) => kernel.ipc.sharedMapping(pid, page), suspended: pid => kernel.memorySubsystem.isSuspended(pid),
+      metrics: { scheduling: this.schedulingMetrics, memory: this.memoryMetrics }, busyTicks: Math.round(this.schedulingMetrics.cpuUtilisation * this.tick),
+      syncPrimitives: this.syncPrimitives, syncStates: this.syncSubsystem.allPrimitives(), syncWaits: this.syncSubsystem.allWaits(), reserved: generation => kernel.syncSubsystem.reserved(generation), scenarios: this.syncSubsystem.allScenarios(),
+      resources: this.resources, mailboxes: this.ipc.snapshotContribution().mailboxes, diskHead: this.diskHead, diskQueue: this.diskQueue, devices: this.devices,
+      interruptLines: this.ioSubsystem.interrupts.lines, ioDebt: this.ioSubsystem.debt, switchDebt: this.switchDebt,
+      lastFrame: this.events.lastFrame, rng: this.rng.save(), slowInterval: this.invariantSlowInterval,
+      subsystems: this.subsystemInvariants,
+      panic: message => kernel.publish({ type: 'kernel.panic', message }),
+    };
   }
 }
 function clonePcb(pcb: Readonly<ProcessControlBlock>): ProcessControlBlock {

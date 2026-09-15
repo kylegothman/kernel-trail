@@ -6,6 +6,7 @@ import type {
   BlockReason,
   Frame,
   FrameId,
+  IpcSnapshot,
   PageId,
   PageTableEntry,
   Pid,
@@ -83,6 +84,118 @@ export class IpcManager {
   constructor(private readonly hooks: IpcHooks) {}
 
   get hasState(): boolean { return this.regions.size > 0 || this.mailboxes.size > 0; }
+
+  /** Detached, deterministically ordered copies of every IPC table (WP-11, amendment 14). */
+  snapshotContribution(): IpcSnapshot {
+    const byPid = (a: Pid, b: Pid): number => a - b;
+    const sharedRegions = this.regionOrder.map(id => {
+      const region = this.requireRegion(id);
+      const attachments = [...(this.mappings.get(id) ?? new Map<Pid, RegionMapping>())].sort(([a], [b]) => byPid(a, b))
+        .map(([pid, mapping]) => ({ pid, space: mapping.space, pages: [...mapping.pages] }));
+      const sourceTable = this.hooks.pageTable(region.space);
+      const frames: FrameId[] = [];
+      for (const page of region.pages) {
+        const entry = sourceTable.find(row => row.page === page);
+        if (entry?.valid === true && entry.frame !== null) frames.push(entry.frame);
+      }
+      return { id: region.id as string, frames, attached: attachments.map(row => row.space), value: region.value,
+        space: region.space, pages: [...region.pages], attachments };
+    });
+    const mailboxes = this.mailboxOrder.map(id => {
+      const mailbox = this.requireMailbox(id);
+      return { id: mailbox.id as string, capacity: mailbox.capacity,
+        messages: mailbox.queue.map(message => ({ from: message.from as number, tick: message.tick as number, payload: message.payload })),
+        waiters: [...mailbox.sendWaiters, ...mailbox.recvWaiters], sendWaiters: [...mailbox.sendWaiters], recvWaiters: [...mailbox.recvWaiters] };
+    });
+    const pending = [...this.pending].sort(([a], [b]) => byPid(a, b)).map(([pid, operation]) => ({
+      pid, kind: operation.kind, mailbox: operation.mailbox as string,
+      message: operation.kind === 'send' ? { from: operation.message.from, tick: operation.message.tick, payload: operation.message.payload } : null,
+    }));
+    const completions = [...this.completions].sort(([a], [b]) => byPid(a, b)).map(([pid, result]) => ({ pid, result: { ...result } }));
+    const completedWaits = [...this.completedWaits].sort(([a], [b]) => byPid(a, b)).map(([pid, resource]) => [pid, resource as string] as const);
+    const originalPins = [...this.originalPins].sort(([a], [b]) => a - b).map(([frame, pinned]) => [frame, pinned] as const);
+    return { sharedRegions, mailboxes, pending, completions, completedWaits, originalPins };
+  }
+
+  /** Replace every IPC table from a contribution. Validation runs before any mutation. */
+  restoreContribution(data: IpcSnapshot): void {
+    const invalid = (message: string): never => { throw new KernelInvariantError(11, `invalid IPC contribution: ${message}`); };
+    const count = (value: unknown, minimum = 0): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= minimum;
+    const ascendingUnique = (values: readonly string[]): boolean => values.every((value, index) => index === 0 || (values[index - 1] ?? '') < value);
+    if (!ascendingUnique(data.sharedRegions.map(row => row.id)) || !ascendingUnique(data.mailboxes.map(row => row.id))) invalid('regions and mailboxes must be ascending and unique');
+    for (const region of data.sharedRegions) {
+      if (region.id.length === 0 || region.pages.length === 0 || !count(region.space) || !Number.isSafeInteger(region.value)) invalid(`region ${region.id}`);
+      if (region.pages.some((page, index) => !count(page) || region.pages.indexOf(page) !== index)) invalid(`region ${region.id} pages`);
+      const pids = region.attachments.map(row => row.pid);
+      if (pids.some((pid, index) => !count(pid, 1) || pids.indexOf(pid) !== index)) invalid(`region ${region.id} attachers`);
+      for (const row of region.attachments) {
+        if (!count(row.space) || row.pages.length !== region.pages.length || row.pages.some(page => !count(page))) invalid(`region ${region.id} attachment ${row.pid}`);
+      }
+    }
+    for (const mailbox of data.mailboxes) {
+      if (mailbox.id.length === 0 || !count(mailbox.capacity)) invalid(`mailbox ${mailbox.id}`);
+      for (const message of mailbox.messages) {
+        if (message === null || typeof message !== 'object' || Array.isArray(message)) invalid(`mailbox ${mailbox.id} message`);
+        const { from: sender, tick: at, payload } = message as { readonly [key: string]: unknown };
+        if (!count(sender, 1) || !count(at) || typeof payload !== 'number' || !Number.isFinite(payload)) invalid(`mailbox ${mailbox.id} message`);
+      }
+      if (mailbox.messages.length > mailbox.capacity) invalid(`mailbox ${mailbox.id} overfull`);
+      for (const pid of [...mailbox.sendWaiters, ...mailbox.recvWaiters]) if (!count(pid, 1)) invalid(`mailbox ${mailbox.id} waiter`);
+    }
+    const mailboxIds = new Set(data.mailboxes.map(row => row.id));
+    const pendingPids = new Set<number>();
+    for (const row of data.pending) {
+      if (!count(row.pid, 1) || pendingPids.has(row.pid) || !mailboxIds.has(row.mailbox)) invalid(`pending operation ${row.pid}`);
+      if ((row.kind === 'send') !== (row.message !== null)) invalid(`pending operation ${row.pid} message`);
+      if (row.message !== null && (!count(row.message.from, 1) || !count(row.message.tick) || !Number.isFinite(row.message.payload))) invalid(`pending message ${row.pid}`);
+      const mailbox = data.mailboxes.find(box => box.id === row.mailbox);
+      const queue = row.kind === 'send' ? mailbox?.sendWaiters : mailbox?.recvWaiters;
+      if (queue?.includes(row.pid) !== true) invalid(`pending operation ${row.pid} is not queued`);
+      pendingPids.add(row.pid);
+    }
+    for (const mailbox of data.mailboxes) for (const [kind, queue] of [['send', mailbox.sendWaiters], ['recv', mailbox.recvWaiters]] as const) {
+      for (const pid of queue) if (!data.pending.some(row => row.pid === pid && row.kind === kind && row.mailbox === mailbox.id)) invalid(`waiter ${pid} has no pending operation`);
+    }
+    const completionPids = new Set<number>();
+    for (const row of data.completions) {
+      if (!count(row.pid, 1) || completionPids.has(row.pid) || pendingPids.has(row.pid)) invalid(`completion ${row.pid}`);
+      completionPids.add(row.pid);
+    }
+    for (const [pid, resource] of data.completedWaits) if (!completionPids.has(pid) || typeof resource !== 'string' || !resource.startsWith('mbox:')) invalid(`completed wait ${pid}`);
+    for (const [frame, pinned] of data.originalPins) if (!count(frame) || typeof pinned !== 'boolean') invalid(`original pin ${frame}`);
+
+    this.regions.clear(); this.regionOrder.length = 0; this.mappings.clear();
+    this.mailboxes.clear(); this.mailboxOrder.length = 0;
+    this.pending.clear(); this.completions.clear(); this.completedWaits.clear(); this.originalPins.clear();
+    for (const region of data.sharedRegions) {
+      const id = asResourceId(region.id);
+      this.regions.set(id, { id, pages: region.pages.map(page => asPageId(page)), space: region.space, attached: region.attachments.map(row => row.pid), value: region.value });
+      this.mappings.set(id, new Map(region.attachments.map(row => [row.pid, { space: row.space, pages: row.pages.map(page => asPageId(page)) }])));
+      this.regionOrder.push(id);
+    }
+    for (const mailbox of data.mailboxes) {
+      const id = asResourceId(mailbox.id);
+      this.mailboxes.set(id, { id, capacity: mailbox.capacity,
+        queue: mailbox.messages.map(message => { const row = message as { readonly from: number; readonly tick: number; readonly payload: number };
+          return { from: row.from as Pid, tick: row.tick as Tick, payload: row.payload }; }),
+        sendWaiters: [...mailbox.sendWaiters], recvWaiters: [...mailbox.recvWaiters] });
+      this.mailboxOrder.push(id);
+    }
+    for (const row of data.pending) {
+      this.pending.set(row.pid, row.kind === 'send' && row.message !== null
+        ? { kind: 'send', mailbox: asResourceId(row.mailbox), message: { from: row.message.from, tick: row.message.tick, payload: row.message.payload } }
+        : { kind: 'recv', mailbox: asResourceId(row.mailbox) });
+    }
+    for (const row of data.completions) this.completions.set(row.pid, { ...row.result });
+    for (const [pid, resource] of data.completedWaits) this.completedWaits.set(pid, asResourceId(resource));
+    for (const [frame, pinned] of data.originalPins) this.originalPins.set(frame, pinned);
+  }
+
+  private requireRegion(id: ResourceId): SharedRegion {
+    const region = this.regions.get(id);
+    if (region === undefined) throw new KernelInvariantError(11, 'shared region disappeared');
+    return region;
+  }
 
   createSharedRegion(region: SharedRegion): SharedRegion {
     if (this.regions.has(region.id)) throw new Error(`shared region already exists: ${region.id}`);

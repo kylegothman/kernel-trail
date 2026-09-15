@@ -412,10 +412,12 @@ describe('kernel synchronization hook integration', () => {
       { program: instructionProgram([{ kind: 'compute' }]) });
     const before = kernel.syncSubsystem.saveState();
     for (const name of ['mutex_lock', 'mutex_unlock', 'sem_wait', 'sem_post'] as const) {
-      for (const args of [[], [7], [resource, 'extra'], ['unknown:resource']]) {
+      for (const args of [[], [7], [resource, 'extra']]) {
         expect(kernel.syscall({ pid, name, args })).toMatchObject({ ok: false, errno: 'EINVAL' });
         expect(kernel.syncSubsystem.saveState()).toEqual(before);
       }
+      expect(kernel.syscall({ pid, name, args: ['unknown:resource'] })).toMatchObject({ ok: false, errno: 'ENOENT' });
+      expect(kernel.syncSubsystem.saveState()).toEqual(before);
     }
   });
   it('keeps primitive, holder, queue and collection identities stable through operations and restore', () => {

@@ -219,7 +219,7 @@ describe('fork, exit, wait and exec', () => {
       expect(call('wait')).toEqual({ ok: true, value: pid + 10 }); expect(kernel.process(pid)?.state).toBe('terminated');
       expect(kernel.events.lastFrame.filter(e => e.type === 'process.reaped' && e.pid === pid)).toMatchObject([{ by: parent }]);
     }
-    expect(call('wait')).toEqual({ ok: false, errno: 'ESRCH', message: 'no children' });
+    expect(call('wait')).toEqual({ ok: false, errno: 'ESRCH', message: `no children: ${parent}` });
   });
   it('wait blocks, and phase 4 wakes and reaps after a live child exits', () => {
     const { kernel, parent, call, fork } = family(); const child = fork();

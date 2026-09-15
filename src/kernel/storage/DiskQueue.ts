@@ -161,19 +161,31 @@ export class DiskQueue {
     this.state = { ...this.state, queue: [], active: null }; return ids;
   }
   readSector(lba: BlockId): readonly number[] {
-    blockToCylinder(lba, this.geometry); return [...(this.state.sectors.find(s => s.lba === lba)?.data ?? Array<number>(512).fill(0))];
+    blockToCylinder(lba, this.geometry); return [...(this.sectorMirror().get(lba) ?? Array<number>(512).fill(0))];
+  }
+  /**
+   * Stored sectors keyed by LBA. The persisted array in `state.sectors` is
+   * regenerated only by saveState, so a transfer costs its own bytes rather
+   * than a copy of every sector on the drive (WP-11 scope correction).
+   */
+  private mirror: Map<BlockId, number[]> | null = null;
+  private sectorMirror(): Map<BlockId, number[]> {
+    if (this.mirror === null) this.mirror = new Map(this.state.sectors.map(s => [s.lba, [...s.data]]));
+    return this.mirror;
   }
   private transfer(transfer: StorageTransferSnapshot): StorageResultSnapshot {
-    const length = transferBytes(transfer), result: number[] = [], sectors = new Map(this.state.sectors.map(s => [s.lba, [...s.data]]));
+    const length = transferBytes(transfer), result: number[] = [], sectors = this.sectorMirror();
     for (let i = 0; i < length; i++) {
       const lba = (transfer.lba + Math.floor(i / 512)) as BlockId, offset = i % 512;
       if (transfer.kind === 'read') result.push(sectors.get(lba)?.[offset] ?? 0);
       else { let data = sectors.get(lba); if (data === undefined) { data = Array<number>(512).fill(0); sectors.set(lba, data); } data[offset] = transfer.data[i]!; }
     }
-    if (transfer.kind === 'write') this.state = { ...this.state, sectors: [...sectors].sort((a, b) => a[0] - b[0]).map(([lba, data]) => ({ lba, data })) };
     return { kind: 'ok', data: result };
   }
-  saveState(): StorageDiskDriveSnapshot { return structuredClone({ ...this.state, head: this.head }); }
+  saveState(): StorageDiskDriveSnapshot {
+    const sectors = [...this.sectorMirror()].sort((a, b) => a[0] - b[0]).map(([lba, data]) => ({ lba, data }));
+    return structuredClone({ ...this.state, head: this.head, sectors });
+  }
   prepareRestore(state: StorageDiskDriveSnapshot, operations: readonly StorageDiskOperationSnapshot[]): () => void {
     validateGeometry(state.geometry);
     if (state.driveId !== this.driveId || state.geometry.cylinders !== this.head.totalCylinders || !Number.isSafeInteger(state.head.cylinder)
@@ -211,7 +223,7 @@ export class DiskQueue {
     if (![s.totalHeadMovement, s.completedRequests].every(v => Number.isSafeInteger(v) && v >= 0)
       || ![s.meanWaitTicks, s.waitM2TicksSquared].every(v => Number.isFinite(v) && v >= 0)) throw new RangeError('invalid disk statistics');
     const saved = structuredClone(state);
-    return () => { this.state = saved; this.head.cylinder = saved.head.cylinder; this.head.direction = saved.head.direction;
+    return () => { this.state = saved; this.mirror = null; this.head.cylinder = saved.head.cylinder; this.head.direction = saved.head.direction;
       this.operations.clear(); for (const [id, op] of byId) this.operations.set(id, op); };
   }
 }

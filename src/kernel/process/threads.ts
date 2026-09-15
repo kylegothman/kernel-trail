@@ -1,6 +1,6 @@
 import type { EmittableEvent } from '../EventBus';
 import { KernelInvariantError } from '../errors';
-import type { BlockReason, Pid, ProcessControlBlock, SyscallResult, Tid } from '../types';
+import type { BlockReason, Pid, ProcessControlBlock, SyscallResult, ThreadAccountingSnapshot, ThreadSnapshot, Tid } from '../types';
 import { amdahlSpeedup, usableCores } from './amdahl';
 import type { RawProcessWork } from './ProcessTable';
 
@@ -32,6 +32,27 @@ export interface ThreadConfig {
 export interface ThreadOptions {
   readonly programCounter?: number;
   readonly lwp?: number;
+}
+
+/** The thread side tables the process snapshot slot carries (amendment 14). */
+export interface ThreadContribution {
+  readonly threads: readonly ThreadSnapshot[];
+  readonly lwpBindings: readonly (readonly [Tid, number])[];
+  readonly deliveryCursors: readonly (readonly [Pid, Tid])[];
+  readonly threadAccounting: readonly ThreadAccountingSnapshot[];
+  readonly nextTid: number;
+}
+
+const THREAD_STATES: readonly ThreadState[] = ['ready', 'running', 'waiting', 'terminated'];
+function isThreadState(value: unknown): value is ThreadState {
+  return typeof value === 'string' && (THREAD_STATES as readonly string[]).includes(value);
+}
+function threadState(value: unknown): ThreadState {
+  if (!isThreadState(value)) throw new KernelInvariantError(7, 'invalid restored thread state');
+  return value;
+}
+function safeCount(value: unknown, minimum = 0): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= minimum;
 }
 
 /** Explicit bindings are separate from computed ones, so reassignment is reproducible. */
@@ -78,6 +99,61 @@ export class ThreadManager {
   reset(): void {
     this.table.clear(); this.bindings.clear(); this.lastDelivered.clear(); this.nextId = 1;
     this.accounting.clear();
+  }
+
+  /** Detached, deterministically ordered copies of every thread side table (WP-11, amendment 14). */
+  snapshotContribution(): ThreadContribution {
+    const byId = <T>(a: readonly [number, T], b: readonly [number, T]): number => a[0] - b[0];
+    return {
+      threads: [...this.table.values()].sort((a, b) => a.tid - b.tid).map(thread => ({
+        tid: thread.tid, pid: thread.pid, programCounter: thread.programCounter, state: thread.state,
+        blockedOn: thread.blockedOn === null ? null : { ...thread.blockedOn }, serviceRemaining: thread.serviceRemaining,
+      })),
+      lwpBindings: [...this.bindings].sort(byId).map(([tid, lwp]) => [tid, lwp] as const),
+      deliveryCursors: [...this.lastDelivered].sort(byId).map(([pid, tid]) => [pid, tid] as const),
+      threadAccounting: [...this.accounting].sort(byId).map(([pid, state]) => ({ pid, overheadRemaining: state.overheadRemaining, pricedCores: state.pricedCores })),
+      nextTid: this.nextId,
+    };
+  }
+
+  /**
+   * Replace every thread side table from a contribution, against the process
+   * control blocks already staged. Every TCB gets its own block-reason object,
+   * because readiness routes a wait by that object's identity. Validation runs
+   * before any mutation.
+   */
+  restoreContribution(data: ThreadContribution, pcbs: readonly ProcessControlBlock[]): void {
+    const owners = new Map<Tid, ProcessControlBlock>();
+    for (const pcb of pcbs) for (const tid of pcb.threads) {
+      if (owners.has(tid)) throw new KernelInvariantError(7, 'thread listed by two processes', { tid });
+      owners.set(tid, pcb);
+    }
+    const seen = new Set<Tid>();
+    for (const thread of data.threads) {
+      const owner = owners.get(thread.tid);
+      if (owner === undefined || owner.pid !== thread.pid || seen.has(thread.tid)) throw new KernelInvariantError(7, 'restored thread has no owning process', { tid: thread.tid });
+      if (!isThreadState(thread.state) || !safeCount(thread.programCounter) || !safeCount(thread.serviceRemaining)) throw new KernelInvariantError(7, 'invalid restored thread', { tid: thread.tid });
+      if ((thread.state === 'waiting') !== (thread.blockedOn !== null)) throw new KernelInvariantError(10, 'thread wait state disagrees with its block reason', { tid: thread.tid });
+      if (!safeCount(data.nextTid, thread.tid + 1)) throw new KernelInvariantError(7, 'restored next tid would reissue a live tid', { tid: thread.tid });
+      seen.add(thread.tid);
+    }
+    for (const tid of owners.keys()) if (!seen.has(tid)) throw new KernelInvariantError(7, 'process thread missing from the contribution', { tid });
+    for (const [tid, lwp] of data.lwpBindings) if (!seen.has(tid) || !safeCount(lwp)) throw new KernelInvariantError(7, 'invalid restored LWP binding', { tid });
+    for (const [pid, tid] of data.deliveryCursors) if (owners.get(tid)?.pid !== pid) throw new KernelInvariantError(7, 'delivery cursor names a foreign thread', { pid, tid });
+    for (const row of data.threadAccounting) {
+      if (!pcbs.some(pcb => pcb.pid === row.pid) || !safeCount(row.overheadRemaining) || (row.pricedCores !== null && !safeCount(row.pricedCores, 1))) throw new KernelInvariantError(7, 'invalid restored thread accounting', { pid: row.pid });
+    }
+    if (!safeCount(data.nextTid, 1)) throw new KernelInvariantError(7, 'invalid restored next tid');
+    this.reset();
+    for (const thread of data.threads) {
+      this.table.set(thread.tid, { tid: thread.tid, pid: thread.pid, state: threadState(thread.state), programCounter: thread.programCounter,
+        serviceRemaining: thread.serviceRemaining, lwp: null, blockedOn: thread.blockedOn === null ? null : { ...thread.blockedOn } });
+    }
+    for (const [tid, lwp] of data.lwpBindings) this.bindings.set(tid, lwp);
+    for (const [pid, tid] of data.deliveryCursors) this.lastDelivered.set(pid, tid);
+    for (const row of data.threadAccounting) this.accounting.set(row.pid, { overheadRemaining: row.overheadRemaining, pricedCores: row.pricedCores });
+    this.nextId = data.nextTid;
+    for (const pcb of pcbs) if (pcb.threads.length > 0) this.assign(pcb);
   }
 
   newTid(): Tid {
