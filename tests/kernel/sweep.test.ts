@@ -4,10 +4,10 @@
  * the harness on, zero violations; and each combination run twice hashes the same.
  * Budgeted on its own (pre-flight D10); the wall time is printed for the report.
  *
- * Committed form: 252 combinations by 1000 ticks by 2 runs, 54 s on the authoring
- * machine. The fixture's 2000-tick form was run once at 6379ffc and passed in 103 s,
- * above the 120 s line once the CI runner's factor is applied, which is why D10
- * halves the ticks here.
+ * The measured ladder, 252 combinations by 2 runs each: 2000 ticks took 103 s on the
+ * authoring M3 (run once at 6379ffc, passed); 1000 ticks took 54 s on the M3 and 186 s
+ * in a clean two-core Linux container, the honest proxy for the CI runner; 500 ticks
+ * is the committed form, halved twice under decision D10's 120 s line.
  */
 import { describe, expect, it } from 'vitest';
 import type { DiskSchedulingId, KernelConfig, PageReplacementId, SchedulerId } from '@kernel/types';
@@ -18,13 +18,8 @@ import { canonical, hash } from './canonical';
 const SCHEDULERS: readonly SchedulerId[] = ['fcfs', 'sjf', 'srtf', 'priority', 'priority_aging', 'rr', 'mlfq'];
 const REPLACEMENTS: readonly PageReplacementId[] = ['fifo', 'lru', 'clock', 'optimal', 'lfu', 'random'];
 const DISKS: readonly DiskSchedulingId[] = ['fcfs', 'sstf', 'scan', 'cscan', 'look', 'clook'];
-/**
- * The fixture says 2000. At 2000 the 504 runs took 103 s on the authoring machine, and the
- * CI runner is assumed at least twice as slow, which crosses the 120 s line pre-flight
- * decision D10 set, so the tick count is halved as that decision directs. The 2000-tick
- * sweep was run once and passed; the report records both timings.
- */
-const SWEEP_TICKS = 1000;
+/** The fixture says 2000; halved twice under decision D10 (see the ladder in the header). */
+const SWEEP_TICKS = 500;
 
 /**
  * The reference configuration with the three policies substituted. Fatal starvation
@@ -54,5 +49,5 @@ describe('INV-ALL-2', () => {
     const seconds = (performance.now() - started) / 1000;
     console.log(`INV-ALL-2: ${combinations} combinations, ${SWEEP_TICKS} ticks each, run twice: ${seconds.toFixed(1)} s`);
     expect(combinations).toBe(252);
-  }, 600_000);
+  }, 300_000);
 });
