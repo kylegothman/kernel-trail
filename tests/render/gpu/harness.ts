@@ -31,6 +31,7 @@ export function capturePageDiagnostics(page: Page): PageDiagnostics {
   };
   page.on('console', message => {
     const location = message.location();
+    if(message.text().startsWith('[WebGPU device')) console.log(message.text());
     diagnostics.messages.push(`[console.${message.type()}] ${message.text()}\n` +
       `  ${location.url}:${location.lineNumber}:${location.columnNumber}`);
   });
@@ -54,8 +55,8 @@ export function formatPageDiagnostics(diagnostics: Pick<PageDiagnostics, 'messag
     ...diagnostics.messages,
     diagnostics.messages.length ? '--- End page messages ---' : '(none)',
     '--- First pageerror and stack ---',
-    first ? first.stack ?? `${first.name}: ${first.message}` : '(no pageerror event received)',
-    ...diagnostics.pageErrors.slice(1).map(error => `Additional pageerror:\n${error.stack ?? error.message}`),
+    first ? first.stack || `${first.name}: ${first.message}` : '(no pageerror event received)',
+    ...diagnostics.pageErrors.slice(1).map(error => `Additional pageerror:\n${error.stack || `${error.name}: ${error.message}`}`),
   ].join('\n');
 }
 
