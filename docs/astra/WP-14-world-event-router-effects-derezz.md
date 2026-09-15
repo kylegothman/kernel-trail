@@ -552,7 +552,7 @@ them; do not paraphrase.
 State:
 
 1. Pass or fail for each of the twenty-seven acceptance criteria, by number.
-2. The three verification command outcomes.
+2. The four verification command outcomes, including the contract guard.
 3. Whether the existing `WorldEventRouter.ts` switch was complete against the
    frozen union, and any variant it was missing.
 4. The measured routing cost in milliseconds for 500 events, against the 0.4 ms
@@ -563,3 +563,92 @@ State:
    0.06, and the cell size it scaled to at low tier.
 7. Every Three.js API you checked against `node_modules` before using.
 8. Every `// TODO(astra):` left in the tree, with file and line.
+
+## Scope correction 2026-09-15
+
+Written before WP-14 starts, after WP-13 merged as cb08cce. The package above
+was written against the scaffold; where this section disagrees with the text
+above, this section wins.
+
+- **Verification is four gates.** `npm run check:contracts` precedes
+  typecheck, test and build. Four frozen files now: `src/kernel/types.ts`,
+  `src/game/types.ts`, `src/design/tokens.ts`,
+  `src/render/camera/focusContract.ts`. Thirteen amendments. Zero skip
+  budget, zero em dashes, the IP-term scan. Baseline at cb08cce: 1406
+  passed, 0 skipped, 72 files.
+- **Paths are the scaffold's and WP-12's.** `src/world/EffectPool.ts` exists
+  as scaffold and stays at that path; do not create
+  `src/world/effects/EffectPool.ts`. `src/world/effects/types.ts` and
+  `EffectRegistry.ts` are new and go where the package lists them. The post
+  chain is `src/render/postChain.ts` (not `post/chain.ts`) and its
+  `panic(message)` exists; `materialPanic` in `src/render/materials/index.ts`
+  is the shared shader clock freeze that panic drives.
+- **Two contexts, and the rule between them.** WP-13 defined both in
+  `src/world/contracts.ts`: `WorldEventContext` carries exactly the router
+  scaffold's three fields (`elapsedSeconds`, `tick`, `suppressEffects`), and
+  `WorldContext` extends it with the scene, quality, focus camera, material
+  facade, labels, time and a `kernel` read surface limited to `process(pid)`
+  and `tick`. Event handlers receive `WorldEventContext` and nothing more:
+  the router scaffold's comment is the rule (the event stream is the only
+  channel from kernel to world, and a handler that read a PCB would break
+  replay). The `kernel` field on `WorldContext` exists for structure
+  construction and per-frame update reads, not for handlers. Resolve the
+  router's line 42 TODO by importing `WorldEventContext` from
+  `./contracts` and deleting the inline declaration; the router's handler
+  signature takes `WorldEventContext`. A test asserts by source scan that no
+  file under `src/world/domains/` references `ctx.kernel` or imports
+  `ProcessControlBlock` as a value.
+- **What WP-13 exposes to you.** `StageBuilder` and the eight group names
+  with their layer assignments (`GROUP_NAMES`, `GROUP_LAYERS`);
+  `StructureHandle` with `id`, `root`, `focusTarget`, `update` and
+  `dispose`; `StructureRegistry` with the eight named structures as throwing
+  phase-2 factories (handlers resolve them by anchor id and tolerate
+  `null`); `InstancedBatch` over the packed handle with `touch(from, to,
+  channel)` and an exclusive end; the six forms with cached geometry and
+  reference-counted leases; `SdfAtlas` as placement only, atlas loading in
+  render; `interpolation.ts` and `scratch.ts` for allocation-free per-frame
+  maths. The `FocusTarget` interface is frozen (amendment 13); do not shadow
+  or extend it.
+- **Ceilings.** `PROFILES[tier].concurrentBeams` (16/32/64) is the ceiling
+  for transient volumetric beam effects and is yours; `maxInstances.beams`
+  bounds static beam instances and is WP-13's. `maxParticles` bounds the
+  particle system WP-12 built (`src/render/backend/particles.ts`), which
+  your effects drive through its API rather than by allocating their own
+  buffers. The transparency discipline (three layers at a pixel) applies to
+  effects too: register each effect's placement through
+  `TransparencyPlacement` so `StageBuilder`'s bound stays honest.
+- **Panic.** `kernel.panic` is the only event allowed to change global post
+  configuration. The sequence is: freeze the shared shader clock
+  (`materialPanic`), call `postChain.panic(message)`, and ask the host to
+  stop simulation, world and camera movement through a host callback the
+  router exposes; the black cut is the post chain's separate fade. Nothing
+  else in the router touches post state.
+- **Derezz.** `src/render/derezz/` is yours to create. Its shaders are TSL
+  node material code like the rest of the renderer, not raw GLSL, despite
+  the `.glsl.ts` filenames the package lists; keep the filenames, since the
+  visual bible cites them, and put TSL in them. The fracture geometry is
+  generated once per variant and cached; the pool is bounded by the
+  effect budget and never allocates in the frame.
+- **Tests run in Node** with no GPU context and the skip budget is zero.
+  Router dispatch, coalescing, the frame queue's fixed consumer order,
+  effect pooling, budget enforcement, the ten domain handlers' state
+  transitions and the fracture geometry are Node assertions. The derezz
+  shader compiling and the six-beat sequence rendering are `.gpu.ts` files
+  under `tests/render/gpu/` registered in `run.mjs` (`harness.ts` untouched),
+  run by Kyle with `npm run test:gpu` under Node 22; propose the split in the
+  pre-flight.
+- **A number to know.** On the WP-13 GPU run, `depth_resolve` measured
+  0.99 ms at high tier against 0.11 ms before the blended-projection decode
+  landed. It is inside budget and not yours to fix, but if your effects add
+  depth reads, measure them and report the delta rather than assuming the
+  pass is cheap.
+- **Shared files.** `src/world/index.ts` for the two exports the package
+  names; `vitest.config.ts` only if a `tests/world` alias is missing (WP-13
+  added it). `package.json` does not change. Off limits, unchanged:
+  `src/kernel`, `src/game`, `src/design`, `src/platform`,
+  `src/render/materials`, `src/render/post`, `src/render/camera`,
+  `src/world/contracts.ts`, `src/world/forms`, `src/world/instancing`,
+  `src/world/structures/base`, `tests/kernel`, `tests/design`,
+  `tests/render/gpu/harness.ts`. A WP-12 or WP-13 bug that blocks an
+  acceptance criterion is reported with the line and waits for a grant.
+
