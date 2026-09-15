@@ -835,9 +835,10 @@ export const holoLabel = (opts: {
 
 Every holographic label is accompanied by a backing plate: a `PlaneGeometry` sized to the
 text's measured bounds plus 0.06 m padding, `MeshBasicMaterial` with
-`color: VOID.base, transparent: true, opacity: 0.72`, on `LAYER.WORLD` so it renders before
-bloom and therefore receives a faint halo from anything behind it, which separates the
-plate from the void without any outline. A 0.006 m emissive hairline runs along the plate's
+`color: VOID.base, transparent: true, opacity: 0.92`, composed after tone mapping with the
+text (section 2.6 rule 2 needs the plate in display space to hold its contrast bound), so
+the plate itself receives no bloom. The separation from the void comes from the hairline:
+a 0.006 m emissive hairline in the world stage runs along the plate's
 bottom edge in the label's token colour.
 
 ### 3.7 Reflective floor
@@ -1879,11 +1880,12 @@ Three mechanisms, all active:
    occlude correctly. No glyph is ever an input to the bright pass. This is the main
    mechanism and it removes the whole class of problem where a bright label smears into an
    unreadable blob.
-2. **The backing plate.** A `VOID.base` plane at 0.72 opacity behind every world-space
-   label, on `LAYER.WORLD`, so the plate itself is in the scene and receives a faint bloom
-   contribution from whatever is behind it. The plate has a 0.006 m emissive hairline on its
-   bottom edge in the label's token colour, at `EMISSIVE_GAIN.dim`, which is below the bloom
-   threshold and reads as an underline that anchors the label to the object.
+2. **The backing plate.** A `VOID.base` plane at 0.92 opacity behind every world-space
+   label, composed after tone mapping with the text so the display-space contrast bound of
+   2.6 holds (corrected 2026-09-15 from 0.72 on `LAYER.WORLD`). The plate has a 0.006 m
+   emissive hairline on its bottom edge in the label's token colour, at
+   `EMISSIVE_GAIN.dim`, which stays in the world stage, sits below the bloom threshold and
+   reads as an underline that anchors the label to the object.
 3. **The contrast floor.** Section 2.6's table, enforced at build time. Combined with the
    plate holding local background luminance below 0.012, the stated ratios hold no matter
    what the label is floating in front of.

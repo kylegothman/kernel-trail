@@ -2189,7 +2189,7 @@ is available. Those four branches are the entire cost of supporting two APIs.
 
 | Feature | WebGPU | WebGL2 | Player-visible difference |
 |---|---|---|---|
-| Particle integration | Compute shader, 1 dispatch, up to 20k particles | Vertex-shader ping-pong over two float render targets, capped at 8k | Fewer motes in a fault storm. The surge effect compensates by raising per-mote size. |
+| Particle integration | Compute shader, 1 dispatch, up to 20k particles | Vertex-shader integration with transform-feedback buffer ping-pong (the pinned renderer's native WebGL2 mechanism; earlier text said float render targets), capped at 8k | Fewer motes in a fault storm. The surge effect compensates by raising per-mote size. |
 | Volumetric light | Raymarched, 48 steps at high, blue-noise dithered, half-res | Raymarched, 24 steps max, quarter-res, plus a cheaper analytic cone falloff | Softer god-rays, slightly banded at grazing angles. |
 | HDR target format | `rgba16float`, always | `rgba16float` when `EXT_color_buffer_float` exists, otherwise `rgba8` with a Reinhard pre-tonemap | Without the extension, bloom banding on gradients. Rare; the extension is near-universal on WebGL2. |
 | MSAA | 4x on the HDR target | 4x when `MAX_SAMPLES >= 4` and float renderbuffers are supported, otherwise 0 and FXAA takes over | Slightly softer edges on the fallback. The art is hard-edged emissive geometry, so this is the most noticeable degradation and is why FXAA is retained rather than dropped. |
@@ -4064,7 +4064,10 @@ export type LossOutcome = 'recovered_same' | 'recovered_fallback' | 'unrecoverab
 
 export class DeviceLossPolicy {
   private attempts = 0;
-  private static readonly MAX_SAME_BACKEND_ATTEMPTS = 2;
+  // One same-backend attempt (corrected 2026-09-15 from two): a device that
+  // fails to come back once is not going to on the second try, and the
+  // player is waiting.
+  private static readonly MAX_SAME_BACKEND_ATTEMPTS = 1;
 
   constructor(
     private readonly rebuild: (forceWebGL: boolean) => Promise<void>,
@@ -4084,10 +4087,12 @@ export class DeviceLossPolicy {
         return;
       } catch { /* fall through to the WebGL2 path */ }
     }
+    // The forced-WebGL2 attempt only makes sense when the lost backend was
+    // WebGPU; a lost WebGL2 device goes straight to the card.
     try {
       this.persistFallbackFlag();       // remembered for future sessions
       await this.rebuild(true);
-      this.onOutcome('recovered_fallback', 'Switched to WebGL2 after repeated device loss.');
+      this.onOutcome('recovered_fallback', 'Switched to WebGL2 after device loss.');
     } catch (err) {
       this.onOutcome('unrecoverable', String(err));
     }
