@@ -586,7 +586,7 @@ here rather than declaring its own, so the count is auditable.
 State:
 
 1. Pass or fail for each of the twenty-eight acceptance criteria, by number.
-2. The three verification command outcomes.
+2. The four verification command outcomes, including the contract guard.
 3. What the existing `FocusCamera.ts` already implemented correctly, what was
    missing, and every line you changed. Be specific: this is the main input a
    reviewer has for judging whether the reference implementation was sound.
@@ -598,3 +598,80 @@ State:
 7. Every Three.js API you checked against `node_modules` before using.
 8. Every `// TODO(astra):` left in the tree, with file and line, including the
    eight structure stubs.
+
+## Scope correction 2026-09-15
+
+Written before WP-13 starts, after WP-12 merged as 470b511 (main 8ff60fd).
+The package above was written against the scaffold; where this section
+disagrees with the text above, this section wins.
+
+- **Verification is four gates.** `npm run check:contracts` precedes
+  typecheck, test and build. Three files are frozen now: `src/kernel/types.ts`,
+  `src/game/types.ts` and `src/design/tokens.ts`. The guard also enforces a
+  zero skip budget, zero em dashes and the IP-term scan; nothing under `src/`
+  is on the IP allowlist. Baseline at 8ff60fd: 1229 passed, 0 skipped, 57
+  files.
+- **Paths are the scaffold's.** The backend interface is
+  `src/render/RendererBackend.ts` (not `backend/RendererBackend.ts`); the
+  post chain is `src/render/postChain.ts`; the governor is
+  `src/platform/qualityGovernor.ts`. `src/render/camera/FocusCamera.ts`
+  exists (960 lines) and is verified and completed in place, as the package
+  says. `src/world/WorldEventRouter.ts` and `EffectPool.ts` exist as WP-14's
+  scaffold and are not yours; the interface the router's line 42 TODO asks to
+  move into `src/world/contracts.ts` is yours to define there, and WP-14
+  imports it.
+- **The instance contract WP-12 shipped.** `InstancedBatchHandle` keeps the
+  original `matrices`, `colours` and `state` arrays and adds the three packed
+  vec4 attributes `colorGain`, `statePhase` and `patternId` (four floats per
+  instance: colour rgb plus gain; state id, phase 0..1, pulse Hz, focus
+  weight; dash on, dash off, hatch id, entity id). `touch(from, to, channel?)`
+  takes an exclusive end and a `BatchChannel` of `'matrix' | 'colour' |
+  'state' | 'colorGain' | 'statePhase' | 'patternId' | 'all'`; touch the
+  matrix channel only when an instance moved. Your `InstancedBatch` and
+  `SlotAllocator` wrap that handle; they do not reimplement it.
+- **Validators are WP-12's, invoking them is yours.** `validateScene(root)`
+  (layer membership and the ninth-repeated-mesh rule) and
+  `assertTransparencyDepth(layersAtPixel)` live in
+  `src/render/DrawCallBudget.ts`; `StageBuilder` calls them at stage
+  construction, and the transparency ceiling is a placement discipline your
+  forms enforce, not a beam count.
+- **Layers** are the architecture 5.6 semantic layers 1 to 8, exported from
+  the frozen tokens; the scaffold's 0/1/2 assignment is gone. Read the
+  export, do not redefine it.
+- **Glass ownership.** High-transmission (derezz-glass) materials are taken
+  through `acquireGlass(owner, semantic, tier)` and returned through
+  `releaseGlass(owner)` so the eight-object ceiling counts scene owners;
+  `getMaterial` alone cannot. Structures that use glass own that lifecycle.
+- **Text.** WP-12 owns the `holoLabel` material, the SDF glyph atlas loading
+  through troika and `createLabelPlateMaterial()`; the plate is composed
+  after tone mapping at 0.92 opacity and the hairline stays in the world
+  stage. So `src/world/labels/SdfAtlas.ts` does not build an atlas: it is
+  the world-side label placement layer (billboard-to-focus versus
+  billboard-to-camera, the 13-device-pixel floor enforced through framing
+  expansion, `WorldLabelClass` cap heights). Keep the filename the package
+  lists, but its contents are placement, and it imports the atlas from
+  `@render`. Report this in item 4 of the report alongside the `EASE`
+  question.
+- **Motion tokens.** `EASE`, `DUR` and `cubicBezier` are in the frozen
+  `src/design/tokens.ts` and re-exported by `src/design/motion.ts`. The
+  camera module imports them; it defines no easing table of its own.
+  `src/render/camera/easing.ts` may hold camera-specific composition
+  (blend curves over `EASE`), never a second table of the same values.
+- **Tests run in Node.** `npm test` has no GPU context and the skip budget
+  is zero. Projection maths, blend continuity, the screen-space drift bound
+  (computed from the projection matrices at device-pixel scale), slot
+  allocation, form geometry counts and the 400-instance allocation count
+  are all Node assertions. Anything that needs a real context goes in the
+  existing `tests/render/gpu/` runner as a `.gpu.ts` file and is reported
+  with Kyle's log, as WP-12 did; propose the split in the pre-flight.
+- **Shared files.** `src/render/index.ts` for the camera exports only, as the
+  package says. `vitest.config.ts` may gain the `tests/world` alias if one is
+  needed. `package.json` does not change: no new dependency without a
+  pre-flight amendment.
+- **Off limits**, unchanged: `src/kernel`, `src/game`, `src/design`,
+  `src/platform`, `src/render/materials`, `src/render/post`,
+  `src/render/RendererBackend.ts`, `src/render/postChain.ts`, `tests/kernel`,
+  `tests/design`, `tests/render/gpu/harness.ts` and `run.mjs`. A WP-12 bug
+  that blocks an acceptance criterion is reported, with the line, and
+  waits for a grant.
+
