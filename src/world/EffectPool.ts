@@ -1,142 +1,141 @@
-/**
- * Bounded, recycling pool for transient visual effects.
- *
- * The simulator can emit hundreds of events in a single tick. A burst of page
- * faults during thrashing, or a cascade of terminations when a deadlock is
- * broken, would allocate hundreds of objects per frame if effects were created
- * on demand. This pool caps the count instead: when the pool is exhausted, the
- * oldest live effect is retired early and its slot reused, so the frame cost
- * stays flat no matter how loud the simulation gets.
- *
- * Retiring the oldest is deliberate. The newest event is the one the player is
- * reacting to, and a dropped tail effect is less noticeable than a dropped head.
- *
- * See 01-ARCHITECTURE.md section 3 and the per-tier caps in 03-VISUAL-BIBLE.md
- * section 12.
- */
+import { Vector3 } from 'three/webgpu';
+import type { EffectSpawn, LiveEffect, OverflowPolicy } from './effects/types';
 
-export interface PooledEffect {
-  /** Seconds this effect has been alive. The pool maintains it. */
-  age: number;
-  /** Total lifetime in seconds. The pool retires the effect when age exceeds it. */
-  lifetime: number;
-  /** True while the effect occupies a slot. */
-  active: boolean;
-}
+export interface EffectPoolOptions { readonly capacity: number; readonly overflow: OverflowPolicy; }
+type MutableEffect = { -readonly [K in keyof LiveEffect]: LiveEffect[K] } & { readonly toStore: Vector3 };
 
-export interface EffectPoolOptions<T extends PooledEffect> {
-  /** Hard ceiling on simultaneously active effects. Comes from the quality tier. */
-  readonly capacity: number;
-  /** Builds one instance. Called `capacity` times at construction, never after. */
-  readonly create: () => T;
-  /** Prepares a recycled instance for reuse. Must reset all per-use state. */
-  readonly reset: (effect: T) => void;
-  /** Called when an effect leaves the active set, whether it expired or was evicted. */
-  readonly release?: (effect: T) => void;
-}
-
-export class EffectPool<T extends PooledEffect> {
-  private readonly all: T[] = [];
-  private readonly free: T[] = [];
-  /** Active effects in acquisition order, so index 0 is always the oldest. */
-  private readonly live: T[] = [];
-  private readonly opts: EffectPoolOptions<T>;
-
-  /** Effects retired early because the pool was full. Surfaced in the dev HUD. */
+/** Fixed storage for transient effects. Records and vectors are built once. */
+export class EffectPool {
+  private readonly items: MutableEffect[];
+  private readonly free: Int32Array;
+  private freeCount: number;
+  private readonly order: Int32Array;
+  private readonly activeView: LiveEffect[];
+  private orderHead = 0;
+  private orderCount = 0;
+  private nextId = 1;
+  private liveCount = 0;
   public evictions = 0;
 
-  constructor(opts: EffectPoolOptions<T>) {
-    if (opts.capacity <= 0) {
-      throw new Error('EffectPool capacity must be positive');
-    }
-    this.opts = opts;
-    // Allocate the whole pool up front. Steady-state allocation is then zero,
-    // which is the entire point of the class.
+  constructor(private readonly opts: EffectPoolOptions) {
+    if (!Number.isInteger(opts.capacity) || opts.capacity < 1) throw new Error('EffectPool capacity must be positive');
+    this.items = new Array<MutableEffect>(opts.capacity);
+    this.free = new Int32Array(opts.capacity);
+    this.order = new Int32Array(opts.capacity);
+    this.activeView = new Array<LiveEffect>(opts.capacity);
     for (let i = 0; i < opts.capacity; i += 1) {
-      const effect = opts.create();
-      effect.active = false;
-      effect.age = 0;
-      this.all.push(effect);
-      this.free.push(effect);
+      const at = new Vector3();
+      const toStore = new Vector3();
+      this.items[i] = { kind: 'derezz', at, toStore, lifetimeSeconds: 0, intensity: 0, colour: 0, age: 0, slot: i, id: 0, alive: false };
+      this.free[i] = i;
     }
+    this.freeCount = opts.capacity;
   }
 
-  get capacity(): number {
-    return this.opts.capacity;
+  get capacity(): number { return this.opts.capacity; }
+  get inUse(): number { return this.liveCount; }
+  get activeCount(): number { return this.liveCount; }
+  get active(): readonly LiveEffect[] {
+    let count = 0;
+    for (let i = 0; i < this.orderCount; i += 1) {
+      const effect = this.items[this.order[(this.orderHead + i) % this.opts.capacity]!]!;
+      if (effect.alive) this.activeView[count++] = effect;
+    }
+    this.activeView.length = count;
+    return this.activeView;
   }
+  get instances(): readonly LiveEffect[] { return this.items; }
 
-  get activeCount(): number {
-    return this.live.length;
-  }
-
-  /**
-   * Take a slot. Never returns null: when the pool is full the oldest live
-   * effect is retired to make room, so callers do not need a fallback path.
-   */
-  acquire(lifetime: number): T {
-    let effect = this.free.pop();
-
-    if (effect === undefined) {
-      const oldest = this.live.shift();
-      if (oldest === undefined) {
-        // Unreachable while capacity > 0, but the type system does not know that.
-        throw new Error('EffectPool exhausted with no live effects to evict');
+  spawn(spec: EffectSpawn): LiveEffect | null {
+    let slot = this.freeCount > 0 ? this.free[--this.freeCount]! : -1;
+    if (slot < 0) {
+      if (this.opts.overflow === 'drop') return null;
+      if (this.opts.overflow === 'aggregate') {
+        const newestIndex = this.orderIndex(this.orderCount - 1);
+        if (newestIndex >= 0) {
+          const newest = this.items[newestIndex]!;
+          newest.intensity = Math.min(1, newest.intensity + spec.intensity * 0.25);
+        }
+        return null;
       }
-      this.retire(oldest);
+      slot = this.order[this.orderHead]!;
+      this.orderHead = (this.orderHead + 1) % this.opts.capacity;
+      this.items[slot]!.alive = false;
+      this.liveCount -= 1;
       this.evictions += 1;
-      effect = oldest;
+      this.orderCount -= 1;
     }
 
-    effect.active = true;
+    const effect = this.items[slot]!;
+    effect.kind = spec.kind;
+    effect.at.copy(spec.at);
+    if (spec.to) { effect.toStore.copy(spec.to); effect.to = effect.toStore; }
+    else delete effect.to;
+    if (spec.follow === undefined) delete effect.follow;
+    else effect.follow = spec.follow;
+    effect.lifetimeSeconds = Math.max(0, spec.lifetimeSeconds);
+    effect.intensity = Math.max(0, Math.min(1, spec.intensity));
+    effect.colour = spec.colour;
+    if (spec.a === undefined) delete effect.a; else effect.a = spec.a;
+    if (spec.b === undefined) delete effect.b; else effect.b = spec.b;
+    if (spec.c === undefined) delete effect.c; else effect.c = spec.c;
+    if (spec.d === undefined) delete effect.d; else effect.d = spec.d;
     effect.age = 0;
-    effect.lifetime = lifetime;
-    this.opts.reset(effect);
-    this.live.push(effect);
+    effect.id = this.nextId++;
+    effect.alive = true;
+    const tail = (this.orderHead + this.orderCount) % this.opts.capacity;
+    this.order[tail] = slot;
+    this.orderCount += 1;
+    this.liveCount += 1;
     return effect;
   }
 
-  /**
-   * Age every live effect and retire the expired ones. Call once per rendered
-   * frame with the real elapsed time, not the simulation tick delta, because
-   * effects are presentation and run on wall-clock time.
-   */
-  update(dtSeconds: number): void {
-    // Iterate backwards so in-place removal does not skip entries.
-    for (let i = this.live.length - 1; i >= 0; i -= 1) {
-      const effect = this.live[i];
-      if (effect === undefined) continue;
+  update(dtSeconds: number, onExpire?: (effect: LiveEffect) => void): void {
+    if (!Number.isFinite(dtSeconds) || dtSeconds < 0) throw new Error('Invalid effect delta');
+    for (let i = this.orderCount - 1; i >= 0; i -= 1) {
+      const orderIndex = (this.orderHead + i) % this.opts.capacity;
+      const slot = this.order[orderIndex]!;
+      const effect = this.items[slot]!;
       effect.age += dtSeconds;
-      if (effect.age >= effect.lifetime) {
-        this.live.splice(i, 1);
-        this.retire(effect);
-      }
+      if (effect.age < effect.lifetimeSeconds) continue;
+      effect.alive = false;
+      this.liveCount -= 1;
+      this.free[this.freeCount++] = slot;
+      this.removeOrderAt(i);
+      onExpire?.(effect);
     }
   }
 
-  /** Read-only view of the live set, for the renderer to walk. Do not mutate. */
-  get active(): readonly T[] {
-    return this.live;
+  forEachLive(fn: (effect: LiveEffect) => void): void {
+    for (let i = 0; i < this.orderCount; i += 1) {
+      const effect = this.items[this.order[(this.orderHead + i) % this.opts.capacity]!]!;
+      if (effect.alive) fn(effect);
+    }
   }
 
-  /** Retire everything. Used on leg teardown. */
   clear(): void {
-    for (let i = this.live.length - 1; i >= 0; i -= 1) {
-      const effect = this.live[i];
-      if (effect !== undefined) this.retire(effect);
+    for (let i = 0; i < this.orderCount; i += 1) {
+      const effect = this.items[this.order[(this.orderHead + i) % this.opts.capacity]!]!;
+      effect.alive = false;
+      this.free[this.freeCount++] = effect.slot;
     }
-    this.live.length = 0;
+    this.orderHead = 0;
+    this.orderCount = 0;
+    this.liveCount = 0;
+    this.freeCount = 0;
+    for (let i = 0; i < this.items.length; i += 1) this.free[this.freeCount++] = i;
     this.evictions = 0;
   }
 
-  /** Every instance the pool owns, live or not. For disposing GPU resources. */
-  get instances(): readonly T[] {
-    return this.all;
+  private orderIndex(offset: number): number {
+    if (offset < 0 || offset >= this.orderCount) return -1;
+    return this.order[(this.orderHead + offset) % this.opts.capacity]!;
   }
 
-  private retire(effect: T): void {
-    effect.active = false;
-    effect.age = 0;
-    this.opts.release?.(effect);
-    this.free.push(effect);
+  private removeOrderAt(offset: number): void {
+    for (let i = offset; i < this.orderCount - 1; i += 1) {
+      this.order[(this.orderHead + i) % this.opts.capacity] = this.order[(this.orderHead + i + 1) % this.opts.capacity]!;
+    }
+    this.orderCount -= 1;
   }
 }
