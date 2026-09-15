@@ -416,7 +416,9 @@ asserted by repetition at a known module**, and that module is 4.00 metres. Mino
 grid lines are off beyond 30 metres at low tier.
 
 The horizon is **drawn as a line, not a gradient** (visual bible 5.4), in
-`VOID.horizon`.
+`CYAN.trace`. The gradient band and the distant parallax columns that 5.4
+also describes are separate environment elements belonging to the first
+leg's establishing shot, not to this package.
 
 Edge lighting on hard-surface geometry follows visual bible 5.5; the emissive
 line material carries it and this package supplies the edge geometry.
@@ -468,12 +470,17 @@ here rather than declaring its own, so the count is auditable.
 15. `uFocusWeight` is written once per frame per material, not once per object.
     Asserted with a counting proxy over a scene of 400 objects sharing 3
     materials.
-16. Rotation input is rejected in `locked` mode; pan is clamped so the structure's
-    bounding box never leaves the frame; zoom is clamped to `[0.6, 1.6]`.
+16. Rotation input is rejected in `locked` mode; pan is clamped so the framed
+    region (the whole target when it is readable, otherwise the current
+    readable sub-region) never leaves the frame; zoom is clamped to
+    `[0.6, 1.6]`.
 17. The simulation is not paused during a lock: `update` is called and the
     kernel's tick advances normally in an integration test.
-18. `minGlyphHeight` expansion works: a target whose label density would push text
-    below the minimum gets a larger `orthoHeight`, asserted with two densities.
+18. `minGlyphHeight` framing works: a target whose label density would push
+    text below the minimum is framed to a smaller readable sub-region with
+    bounded pan across the whole (a larger `orthoHeight` shrinks glyphs, so
+    the earlier wording had the direction backwards), asserted with two
+    densities.
 19. No glyph renders below 13 device pixels at any tier, asserted for the probe
     scene at 1440x900.
 20. Every form generator returns a cached geometry: 100 calls give 1 object.
@@ -545,7 +552,7 @@ here rather than declaring its own, so the count is auditable.
 | Case | Assertion |
 |---|---|
 | `layout` | the three `vec4` attributes carry the documented twelve floats in the documented order |
-| `write cost` | updating one instance writes exactly 12 floats and touches one attribute range |
+| `write cost` | updating one instance writes exactly 12 floats across the three packed attributes and touches one coalesced range per changed attribute, never the matrix channel |
 | `matrix untouched` | a colour-only update does not write `instanceMatrix` |
 | `slot reuse` | per acceptance criterion 24 |
 | `high water` | `count` tracks the high-water mark rather than the capacity |
@@ -560,7 +567,7 @@ here rather than declaring its own, so the count is auditable.
 | `triangle budgets` | per acceptance criterion 21, one case per form |
 | `grid module` | the grid floor's repetition module is exactly 4.00 metres |
 | `grid minor lines` | minor lines are absent beyond 30 metres at low tier and present at medium and high |
-| `horizon is a line` | the horizon geometry is a line, not a gradient plane |
+| `horizon is a line` | the horizon geometry is a `CYAN.trace` line, not a gradient plane; the band and columns are not built here |
 | `glyph size` | per acceptance criterion 19 |
 | `sdf size by tier` | 48 at low, 64 at medium and high |
 | `label plane` | `'billboard-to-focus'` rotates labels to the reading plane and `'billboard-to-camera'` to the camera |
@@ -674,4 +681,129 @@ disagrees with the text above, this section wins.
   `tests/design`, `tests/render/gpu/harness.ts` and `run.mjs`. A WP-12 bug
   that blocks an acceptance criterion is reported, with the line, and
   waits for a grant.
+
+## Pre-flight decisions 2026-09-15
+
+The WP-13 agent's pre-flight (the WP-12 agent, continuing) mapped all
+twenty-eight acceptance criteria, audited the 960-line reference camera
+line by line, and raised fourteen decisions. The code claims were checked
+against the tree at 8195111 and Three 0.185.0 (the frozen `cubicBezier`
+really does return about -13709 for the CSS-valid curve (0, 0, 0, 1) at
+x = 0.001; the post chain's depth decode really is perspective-only; the
+backend's flush really does allocate through Three's `addUpdateRange`; the
+materials factory really has no focus weight). Decisions follow. The
+package corrections (acceptance 16 and 18, the horizon colour and scope,
+the write-cost row) were applied in the same commit.
+
+1. **Release semantics, approved.** `FocusCameraState.t` stays raw
+   transition progress; `state.blend` becomes the current focus amount
+   (rising on engage, falling on release); eased path progress is internal.
+   Dimming, labels and post effects consume `blend`.
+2. **Drift scope and picking, approved.** The 0.5-device-pixel assertion
+   applies to a stationary, camera-parallel plane at view depth d across the
+   blend. The camera subclass overrides `updateProjectionMatrix` so the
+   renderer's coordinate-system refresh cannot overwrite the blend. Picking
+   through a blended camera uses inverse-projection rays, not
+   `Raycaster.setFromCamera`.
+3. **Easing defect, fix by amendment.** The frozen solver is wrong for
+   degenerate control points. Submit an exact patch to `src/design/tokens.ts`
+   limited to `cubicBezier` (Newton with t clamped to [0, 1] and a bisection
+   fallback when the slope is small or the iteration leaves the interval),
+   with the four named curves unchanged to within 1e-12, as its own
+   contract-only amendment (provisional 12, after WP-10's 11). Until it
+   lands, acceptance 10 is asserted for the four named curves; after it
+   lands, add the general property test including (0, 0, 0, 1). No
+   competing solver in the camera module.
+4. **Dense labels, approved.** `FocusTarget` stays exactly as printed.
+   Density and layout metadata live in the placement layer; a target whose
+   labels would fall below `minGlyphHeight` is framed to a readable
+   sub-region with bounded pan across the whole. Acceptance 16 and 18 were
+   corrected.
+5. **Material focus support, granted.** Narrow additive edits to
+   `src/render/materials/index.ts` and `tests/render/materials.test.ts`:
+   factory-owned focus weight per focus group with the 0.35 matte and 0.18
+   emission endpoints for every archetype, no change to cache identity (400
+   requests for one triple still yield one material), per-instance focus
+   still through the packed field. Acceptance 15 counts material-uniform
+   writes separately from instance attribute updates, at most one write per
+   material per frame.
+6. **Blended-projection depth, granted.** Narrow edit to
+   `src/render/postChain.ts` (currently 141-153) and the depth helper:
+   decode linear depth from the actual blended projection's coefficients,
+   not the perspective formula. Focus distance and strength reach the post
+   state through stage or host wiring. `tests/render/postChain.test.ts` may
+   gain the assertion.
+7. **GPU runner registration and instrumentation, granted.** Additive
+   registration of WP-13 fixtures in `tests/render/gpu/run.mjs`;
+   `harness.ts` unchanged. Constructor instrumentation extended to
+   `Quaternion`; a test-only transform if needed; no dependency or script
+   change.
+8. **Update-range allocation, not granted.** Three's `addUpdateRange`
+   allocates one `{ start, count }` per dirty attribute per flush inside
+   Three itself; avoiding it would mean writing into Three's internal array.
+   Acceptance 23 stays the named-constructor assertion (`Matrix4`, `Vector3`,
+   `Color`, `Quaternion`), and the report records the bounded per-flush
+   allocation (at most four small objects per batch per frame) as known.
+9. **Ranges and ceilings, approved with one backend fix.** A 12-float update
+   is three exclusive-end channel touches, never a matrix touch; the test row
+   was corrected. `assertCeiling` throws in dev, as the package says. Beam
+   limits are two different things: `maxInstances.beams` bounds static beam
+   instances, `concurrentBeams` bounds WP-14's transient volumetric effects.
+   One narrow edit to `src/render/RendererBackend.ts` (the clamp at line 254)
+   so a `beam` batch is bounded by `maxInstances.beams`; nothing else in the
+   backend changes.
+10. **World context, approved.** A small event-context interface carrying the
+    router's exact three fields (`elapsedSeconds`, `tick`,
+    `suppressEffects`), extended into the structure `WorldContext`; WP-14
+    performs the router import change. Kernel access is `process` and
+    `tick` only. `MaterialLibrary` is a narrow facade over the existing
+    factory functions, defined in `contracts.ts`. Batch creation and post
+    focus access are injected into `StageBuilder`; `StageContext` is
+    untouched.
+11. **Forms and environment, approved.** The six listed modules; `makeBlock`,
+    `makePlatter` and `makeBollard` are deferred catalogue entries for the
+    legs that need them, named in the report. Triangle numbers are ceilings
+    (the stele's 60 indexed triangles stand). The horizon is a `CYAN.trace`
+    line; the band and columns belong to WP-L00's establishing shot.
+12. **Edges and transparency, granted.** The materials grant of decision 5
+    also covers consuming barycentric edge and mask attributes for repeated
+    forms. Edges are generated as `LineSegmentsGeometry` with the outward
+    offset computed from the source form's faces before conversion, with
+    triangulation diagonals masked. `assertTransparencyDepth` is called with
+    a conservative placement bound derived from form metadata, and a GPU
+    overlap fixture checks the real thing. No claim that `renderOrder` sorts
+    instances within one mesh.
+13. **Labels and geometry lifetime, approved.** The shipped per-label mesh
+    API is used within the tier label budgets; atlas-page batching is
+    recorded as future renderer work, not built here. Geometry is shared
+    through stage-owned reference-counted leases and released after the last
+    owner; CPU disposal and GPU memory recovery are asserted separately.
+14. **Freezing the focus contract, approved as its own file.** Create
+    `src/render/camera/focusContract.ts` holding exactly `FocusMode`,
+    `FocusTarget` and the public `FocusCameraState` types, imported by
+    `FocusCamera.ts`; at the end of the package submit its exact content
+    for review and freeze it by amendment (provisional 13), the way
+    tokens.ts was frozen. The implementation file is never frozen.
+
+Also approved: acceptance 8's "78 percent" means the padded limiting
+dimension per the printed equation; the path and lift formulas are tested
+as printed with the offset bound on explicit fixtures; the reference
+divergences listed in the pre-flight are all to be completed in place
+(aspect assignment, stable state records, release-progress separation,
+re-engagement snapshots, world-space lift, moving-anchor refresh, oblique
+plane distance, interrupted-transition continuity, resize handling, teardown
+and free-pose seeding).
+
+Documentation to correct on main after this package: architecture 5.6's
+layer numbers and point-light wording, 7.3's per-instance byte accounting
+(140 bytes per slot with the shipped layout), and visual bible 7.4's
+unconditional contrast claim.
+
+### Not granted
+
+- No edit under `src/kernel`, `src/game`, `src/design` (outside the
+  cubicBezier amendment), `src/platform`, `src/render/post/`,
+  `tests/kernel`, `tests/design`, or `tests/render/gpu/harness.ts`.
+- No backend edit beyond the line 254 beam clamp; no rewrite of
+  `FocusCamera.ts`; no second easing table; no new dependency.
 
