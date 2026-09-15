@@ -7,7 +7,7 @@ import { instructionProgram } from '@kernel/process/Program';
 import type { EmittableEvent } from '@kernel/EventBus';
 import { createRng } from '@kernel/rng';
 import { asFrameId, asPageId, asPid, asTick } from '@kernel/types';
-import type { AddressSpaceId, FrameId, JsonValue, PageTableEntry, SubsystemEnvelope } from '@kernel/types';
+import type { AddressSpaceId, FrameId, FsSnapshotState, JsonValue, PageTableEntry, SubsystemEnvelope } from '@kernel/types';
 import { canonical } from '../canonical';
 import { REFERENCE_CONFIG } from '../fixtures/referenceConfig';
 
@@ -433,12 +433,67 @@ describe('aggregate memory and VM persistence', () => {
 
 describe('kernel memory snapshot dispatch and teardown', () => {
   it('dispatches snapshot-only registrations and validates them before changing kernel state', () => {
-    const kernel = createKernel(REFERENCE_CONFIG);
+    const kernel = createKernel({ ...REFERENCE_CONFIG,
+      enabledSubsystems: REFERENCE_CONFIG.enabledSubsystems.filter(id => id !== 'fs'),
+    });
+    const emptyPayload: FsSnapshotState['payload'] = {
+      tick: asTick(0),
+      settings: {
+        defaultAllocation: 'indexed',
+        maxSymlinkDepth: 8,
+        dentryCacheEntries: 128,
+        fragmentationWarnExtents: 4,
+        freeSpaceMethod: 'bitmap',
+        linkedVariant: 'in_block',
+        journalMode: 'metadata',
+      },
+      mountState: 'unformatted',
+      volume: null,
+      nextDescriptorId: 0,
+      nextOperationId: 1,
+      nextTransferId: 1,
+      nextTransactionId: 1,
+      nextImageGeneration: 1,
+      lastTimerTick: null,
+      metadata: {
+        nextInodeId: 2,
+        freeInodeIds: [],
+        inodeGenerations: [],
+        blockGenerations: [],
+        inodes: [],
+        directories: [],
+        freeSpace: { kind: 'bitmap', words: [] },
+      },
+      durableMetadata: [],
+      caches: { dentries: [], metadata: [] },
+      descriptors: [],
+      processes: [],
+      operations: [],
+      transfers: [],
+      journal: { entries: [], transactions: [], checkpointedThrough: 0, retained: null },
+      recovery: null,
+      corruption: [],
+      lastCrash: null,
+      counters: {
+        completedOperations: 0,
+        logicalBlockReads: 0,
+        logicalBlockWrites: 0,
+        logicalRunStarts: 0,
+        physicalSectorReads: 0,
+        physicalSectorWrites: 0,
+        bitmapWordsScanned: 0,
+      },
+    };
+    const contribution = (completedOperations: number): FsSnapshotState => ({
+      owner: 'fs', version: 1, payload: {
+        ...emptyPayload, counters: { ...emptyPayload.counters, completedOperations },
+      },
+    });
     let retained = 5;
     kernel.installHooks({ snapshots: {
-      saveState: () => ({ fs: { owner: 'fs', version: 1, payload: retained } }),
+      saveState: () => ({ fs: contribution(retained) }),
       restoreState: snapshot => {
-        const value = snapshot.subsystems?.fs?.payload;
+        const value = snapshot.subsystems?.fs?.payload.counters.completedOperations;
         if (typeof value !== 'number' || value < 0) throw new Error('invalid fixture contribution');
         return () => { retained = value; };
       },
@@ -448,7 +503,7 @@ describe('kernel memory snapshot dispatch and teardown', () => {
     retained = 9; kernel.run(2); kernel.restore(saved);
     expect(retained).toBe(5); expect(canonical(kernel.snapshot())).toBe(canonical(saved));
     const before = canonical(kernel.snapshot());
-    expect(() => kernel.restore({ ...saved, subsystems: { ...saved.subsystems, fs: { owner: 'fs', version: 1, payload: -1 } } })).toThrow();
+    expect(() => kernel.restore({ ...saved, subsystems: { ...saved.subsystems, fs: contribution(-1) } })).toThrow();
     expect(canonical(kernel.snapshot())).toBe(before);
   });
 

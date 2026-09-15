@@ -746,8 +746,548 @@ export interface SubsystemSnapshots {
   readonly storage?: StorageSnapshotState;
   /** Amendment 9. Device requests, interrupts, CPU charges, buffers, cache and spools. */
   readonly io?: IoSnapshotState;
-  readonly fs?: SubsystemEnvelope;
-  readonly security?: SubsystemEnvelope;
+  /** Amendment 11. File-system namespace, allocation, descriptors, journal and recovery continuation. */
+  readonly fs?: FsSnapshotState;
+  /** Amendment 11. Sparse access views, ring/domain returns, capabilities and protection continuation. */
+  readonly security?: SecuritySnapshotState;
+}
+
+/** WP-10 filesystem continuation. Storage owns physical media; metadata caches are explicit. */
+export interface FsSnapshotState {
+  readonly owner: 'fs';
+  readonly version: 1;
+  readonly payload: {
+    readonly tick: Tick;
+    readonly settings: {
+      readonly defaultAllocation: FileAllocationMethod;
+      readonly maxSymlinkDepth: number;
+      readonly dentryCacheEntries: number;
+      readonly fragmentationWarnExtents: number;
+      readonly freeSpaceMethod: 'bitmap' | 'linked_list' | 'grouping' | 'counting';
+      readonly linkedVariant: 'in_block' | 'fat';
+      readonly journalMode: 'off' | 'metadata' | 'full';
+    };
+    readonly mountState: 'unformatted' | 'formatting' | 'mounted' | 'crashed';
+    /** Null only for the empty, unformatted state; addresses are sector LBAs. */
+    readonly volume: {
+      readonly device: DeviceId;
+      readonly firstSector: BlockId;
+      readonly blockCount: number;
+      readonly rootInode: InodeId;
+      readonly lostFoundInode: InodeId;
+      /** Filesystem BlockIds below are relative 4096-byte block indices. */
+      readonly superblock: BlockId;
+      readonly bitmapBlocks: readonly BlockId[];
+      readonly journalControlBlock: BlockId;
+      readonly journalPayloadStart: BlockId;
+      readonly journalPayloadBlocks: number;
+      readonly fatBlocks: readonly BlockId[];
+    } | null;
+    /** High-water mark; lowest available handle below it derives from descriptors. */
+    readonly nextDescriptorId: number;
+    /** Operation, transfer, transaction and image IDs start at 1, never at 0. */
+    readonly nextOperationId: number;
+    readonly nextTransferId: number;
+    readonly nextTransactionId: number;
+    readonly nextImageGeneration: number;
+    readonly lastTimerTick: Tick | null;
+    readonly metadata: FsMetadataSnapshot;
+    /**
+     * Last completely acknowledged metadata images, not a second media store.
+     * Only inode/directory/allocation/format images are retained here. During a
+     * partial physical write the storage sectors can be newer than this cache;
+     * crash drops these decode images and reloads the actual surviving sectors.
+     */
+    readonly durableMetadata: readonly FsMetadataImageSnapshot[];
+    readonly caches: {
+      /** Oldest to newest; hits recheck all traversal permissions. */
+      readonly dentries: readonly {
+        readonly cwd: InodeId;
+        readonly path: string;
+        readonly inode: InodeId;
+        readonly generation: number;
+        readonly traversal: readonly { readonly inode: InodeId; readonly generation: number }[];
+      }[];
+      /** Decoded metadata identities; actual block-cache bytes stay in io.cache. */
+      readonly metadata: readonly {
+        readonly kind: 'inode' | 'directory' | 'index' | 'fat';
+        readonly block: BlockId;
+        readonly imageGeneration: number;
+        readonly cacheGeneration: number | null;
+      }[];
+    };
+    /** Global handles are the shared open descriptions; one offset per handle. */
+    readonly descriptors: readonly {
+      readonly fd: FileDescriptor;
+      readonly inode: InodeId;
+      readonly inodeGeneration: number;
+      readonly mode: 'r' | 'w' | 'rw' | 'a';
+      readonly offset: number;
+      readonly references: number;
+    }[];
+    readonly processes: readonly {
+      readonly pid: Pid;
+      readonly cwd: InodeId;
+      readonly cwdGeneration: number;
+      readonly descriptors: readonly {
+        readonly fd: FileDescriptor;
+        readonly closeOnExec: boolean;
+      }[];
+    }[];
+    readonly operations: readonly FsOperationSnapshot[];
+    /** Only unsettled work or results still needed by an owner are retained. */
+    readonly transfers: readonly FsTransferSnapshot[];
+    readonly journal: {
+      /** Live presentation/protocol history; byte-image retention is separate. */
+      readonly entries: readonly {
+        readonly tick: Tick;
+        readonly txId: number;
+        readonly phase: 'begin' | 'write' | 'commit' | 'checkpoint';
+        readonly blocks: readonly BlockId[];
+      }[];
+      /** TxId order; only the first unfinished transaction can issue writes. */
+      readonly transactions: readonly FsTransactionSnapshot[];
+      /** Zero means no checkpoint; every actual transaction has a positive ID. */
+      readonly checkpointedThrough: number;
+      /** At most one checkpointed transaction, occupying the existing reservation. */
+      readonly retained: {
+        readonly txId: number;
+        readonly mode: 'metadata' | 'full';
+        readonly images: readonly {
+          readonly homeBlock: BlockId;
+          readonly journalBlock: BlockId;
+          readonly generation: number;
+          readonly checksum: number;
+          readonly kind: 'data' | 'inode' | 'directory' | 'allocation' | 'superblock';
+          /** Enables generation-safe ORRERY lookup without a second byte archive. */
+          readonly inode: InodeId | null;
+          readonly inodeGeneration: number | null;
+        }[];
+      } | null;
+    };
+    readonly recovery: {
+      readonly kind: 'journal' | 'fsck' | 'reconstruct';
+      readonly phase: 'scan' | 'replay' | 'bitmap' | 'verify';
+      readonly targetInode: InodeId | null;
+      readonly targetGeneration: number | null;
+      readonly transactionIds: readonly number[];
+      readonly nextTransaction: number;
+      readonly nextImage: number;
+      readonly bitmapWordCursor: number;
+      readonly transferIds: readonly number[];
+      readonly changes: FsMetadataDeltaSnapshot;
+      /** Already emitted in this invocation, so resume never repeats an event. */
+      readonly recoveredInodes: readonly InodeId[];
+    } | null;
+    readonly corruption: readonly {
+      readonly kind: 'orphan_inode' | 'leaked_block' | 'dangling_entry' | 'duplicate_block' | 'stale_descriptor';
+      readonly inode: InodeId | null;
+      readonly otherInode: InodeId | null;
+      readonly block: BlockId | null;
+      readonly expectedGeneration: number | null;
+      readonly observedGeneration: number | null;
+      readonly discoveredAtTick: Tick;
+      readonly reported: boolean;
+    }[];
+    readonly lastCrash: {
+      readonly tick: Tick;
+      readonly abortedTransferIds: readonly number[];
+      readonly droppedCacheBlocks: readonly { readonly device: DeviceId; readonly sectorLba: BlockId }[];
+      readonly panicEmitted: boolean;
+    } | null;
+    readonly counters: {
+      /** Nonnegative; valid even in the empty unformatted fixture state. */
+      readonly completedOperations: number;
+      readonly logicalBlockReads: number;
+      readonly logicalBlockWrites: number;
+      readonly logicalRunStarts: number;
+      readonly physicalSectorReads: number;
+      readonly physicalSectorWrites: number;
+      readonly bitmapWordsScanned: number;
+    };
+  };
+}
+
+export type FsInodeSnapshot = {
+  readonly id: InodeId;
+  readonly name: string;
+  readonly kind: 'file' | 'directory' | 'link';
+  readonly sizeBytes: number;
+  readonly method: FileAllocationMethod;
+  readonly blocks: readonly BlockId[];
+  readonly indexBlock: BlockId | null;
+  readonly owner: DomainId;
+  readonly permissions: { readonly read: boolean; readonly write: boolean; readonly execute: boolean };
+  readonly createdTick: Tick;
+  readonly modifiedTick: Tick;
+  readonly linkCount: number;
+  /** A reused numeric inode ID must not inherit an old security binding or fd. */
+  readonly generation: number;
+  readonly metadataBlock: BlockId;
+  readonly symlinkTarget: string | null;
+  readonly programName: string | null;
+  /** Sorted logical positions; absent positions below EOF read as zero-filled holes. */
+  readonly mapping: readonly {
+    readonly logicalBlock: number;
+    readonly block: BlockId;
+    /** This inode's expected incarnation, distinct from the current global generation. */
+    readonly generation: number;
+  }[];
+  readonly allocation:
+    | { readonly kind: 'contiguous' }
+    | {
+        readonly kind: 'linked';
+        readonly variant: 'in_block' | 'fat';
+        readonly links: readonly { readonly block: BlockId; readonly next: BlockId | null }[];
+      }
+    | {
+        readonly kind: 'indexed';
+        readonly roots: readonly { readonly logicalStart: number; readonly level: 1 | 2 | 3; readonly block: BlockId }[];
+        readonly nodes: readonly {
+          readonly block: BlockId;
+          readonly level: 1 | 2 | 3;
+          readonly pointers: readonly (BlockId | null)[];
+        }[];
+      }
+    | {
+        readonly kind: 'extent';
+        readonly extents: readonly { readonly logicalStart: number; readonly startBlock: BlockId; readonly length: number }[];
+      };
+};
+
+export type FsDirectorySnapshot = {
+  readonly inode: InodeId;
+  readonly parent: InodeId;
+  /** Code-unit name order. Dot and dotdot are virtual and are never entries. */
+  readonly entries: readonly { readonly name: string; readonly inode: InodeId; readonly generation: number }[];
+};
+
+export type FsFreeSpaceSnapshot =
+  | { readonly kind: 'bitmap'; readonly words: readonly number[] }
+  | {
+      readonly kind: 'linked_list';
+      readonly head: BlockId | null;
+      readonly nodes: readonly { readonly block: BlockId; readonly next: BlockId | null }[];
+    }
+  | {
+      readonly kind: 'grouping';
+      readonly head: BlockId | null;
+      readonly groups: readonly {
+        readonly block: BlockId;
+        /** At most 127 free IDs, in pop order; group block itself is free. */
+        readonly entries: readonly BlockId[];
+        readonly next: BlockId | null;
+      }[];
+    }
+  | { readonly kind: 'counting'; readonly runs: readonly { readonly start: BlockId; readonly length: number }[] };
+
+export type FsMetadataSnapshot = {
+  /** At least 2, including unformatted state; numeric inode IDs 0 and 1 are reserved. */
+  readonly nextInodeId: number;
+  /** Lowest reusable ID first; generations survive retirement of a live inode. */
+  readonly freeInodeIds: readonly InodeId[];
+  readonly inodeGenerations: readonly { readonly inode: InodeId; readonly generation: number }[];
+  readonly blockGenerations: readonly { readonly block: BlockId; readonly generation: number }[];
+  readonly inodes: readonly FsInodeSnapshot[];
+  readonly directories: readonly FsDirectorySnapshot[];
+  readonly freeSpace: FsFreeSpaceSnapshot;
+};
+
+export type FsMetadataImageSnapshot = {
+  readonly block: BlockId;
+  readonly generation: number;
+  readonly kind: 'inode' | 'directory' | 'allocation' | 'superblock';
+  /** Exactly 4096 integer bytes, using the version-1 bounded metadata codec. */
+  readonly contents: readonly number[];
+};
+
+/** Changes hold only modified records; unrelated namespace state is not cloned. */
+export type FsMetadataDeltaSnapshot = {
+  readonly inodes: readonly { readonly id: InodeId; readonly before: FsInodeSnapshot | null; readonly after: FsInodeSnapshot | null }[];
+  readonly directories: readonly { readonly inode: InodeId; readonly before: FsDirectorySnapshot | null; readonly after: FsDirectorySnapshot | null }[];
+  readonly freeSpace: { readonly before: FsFreeSpaceSnapshot; readonly after: FsFreeSpaceSnapshot } | null;
+  readonly inodeAllocator: {
+    readonly nextBefore: number;
+    readonly nextAfter: number;
+    readonly freeBefore: readonly InodeId[];
+    readonly freeAfter: readonly InodeId[];
+  } | null;
+  readonly inodeGenerations: readonly { readonly inode: InodeId; readonly before: number | null; readonly after: number }[];
+  readonly blockGenerations: readonly { readonly block: BlockId; readonly before: number | null; readonly after: number }[];
+};
+
+export type FsCallSnapshot =
+  | { readonly name: 'open'; readonly path: string; readonly mode: 'r' | 'w' | 'rw' | 'a' }
+  | { readonly name: 'close'; readonly fd: FileDescriptor }
+  | { readonly name: 'read' | 'write'; readonly fd: FileDescriptor; readonly bytes: number }
+  | { readonly name: 'seek'; readonly fd: FileDescriptor; readonly offset: number; readonly whence: 0 | 1 | 2 }
+  | { readonly name: 'stat'; readonly target: { readonly kind: 'path'; readonly path: string } | { readonly kind: 'descriptor'; readonly fd: FileDescriptor } }
+  | { readonly name: 'unlink' | 'mkdir'; readonly path: string }
+  | { readonly name: 'chmod'; readonly path: string; readonly permissions: string }
+  | { readonly name: 'sync' };
+
+export type FsOperationSnapshot = {
+  readonly id: number;
+  readonly actor: { readonly pid: Pid; readonly tid: Tid };
+  readonly callerDomain: DomainId;
+  readonly requestedAtTick: Tick;
+  readonly call: FsCallSnapshot;
+  readonly stage: 'queued' | 'reading' | 'transaction' | 'syncing' | 'complete';
+  readonly inode: InodeId | null;
+  readonly inodeGeneration: number | null;
+  readonly descriptor: FileDescriptor | null;
+  readonly startOffset: number | null;
+  readonly nextOffset: number | null;
+  readonly transactionId: number | null;
+  readonly transferIds: readonly number[];
+  readonly cacheSyncId: number | null;
+  /** Bytes already selected/returned by reads; count-only writes derive zero bytes. */
+  readonly contents: readonly number[];
+  readonly result:
+    | { readonly ok: true; readonly value: string | number | boolean | null }
+    | { readonly ok: false; readonly errno: Errno; readonly message: string }
+    | null;
+  /** Publication, descriptor/offset effects, and instruction retirement are distinct. */
+  readonly resultPublished: boolean;
+  readonly effectsApplied: boolean;
+  readonly instructionRetired: boolean;
+  readonly wakeable: boolean;
+};
+
+export type FsTransferSnapshot = {
+  readonly id: number;
+  readonly purpose:
+    | { readonly kind: 'format' }
+    | { readonly kind: 'operation'; readonly operationId: number }
+    | { readonly kind: 'journal'; readonly txId: number; readonly phase: 'payload' | 'descriptors' | 'commit' | 'home' | 'checkpoint' }
+    | { readonly kind: 'recovery' };
+  /** Sector addresses are absolute within the selected device, unlike FS blocks. */
+  readonly command:
+    | { readonly kind: 'read'; readonly sectorLba: BlockId; readonly bytes: number }
+    | {
+        readonly kind: 'write';
+        readonly sectorLba: BlockId;
+        /** References keep immutable transaction bytes in exactly one FS location. */
+        readonly source:
+          | { readonly kind: 'transaction_image'; readonly txId: number; readonly imageIndex: number }
+          | { readonly kind: 'transaction_control'; readonly txId: number; readonly controlIndex: number }
+          | { readonly kind: 'inline'; readonly contents: readonly number[] };
+      };
+  readonly progress:
+    | { readonly kind: 'planned' }
+    | { readonly kind: 'storage'; readonly requestId: number }
+    | { readonly kind: 'io'; readonly requestId: number }
+    | { readonly kind: 'cache'; readonly flushId: number; readonly generation: number }
+    | {
+        readonly kind: 'settled';
+        readonly atTick: Tick;
+        readonly result:
+          | { readonly kind: 'ok'; readonly data: readonly number[] }
+          | { readonly kind: 'failed'; readonly reason: 'io_timeout' | 'storage_corruption' | 'cancelled' | 'device_failed' };
+      };
+};
+
+export type FsTransactionSnapshot = {
+  readonly id: number;
+  readonly operationId: number | null;
+  readonly requestedAtTick: Tick;
+  readonly mode: 'off' | 'metadata' | 'full';
+  readonly stage: 'prepared' | 'payload' | 'barrier1' | 'commit' | 'barrier2' | 'home' | 'checkpoint' | 'complete' | 'aborted';
+  readonly changes: FsMetadataDeltaSnapshot;
+  readonly changesApplied: boolean;
+  /** Captured immutable generations; at most volume.journalPayloadBlocks are journaled. */
+  readonly images: readonly {
+    readonly homeBlock: BlockId;
+    readonly generation: number;
+    readonly checksum: number;
+    readonly kind: 'data' | 'inode' | 'directory' | 'allocation' | 'superblock';
+    readonly inode: InodeId | null;
+    readonly inodeGeneration: number | null;
+    readonly contents: readonly number[];
+    /** Null for nonjournaled images, including data under metadata mode. */
+    readonly journalBlock: BlockId | null;
+    readonly journalTransferId: number | null;
+    readonly homeTransferId: number | null;
+  }[];
+  /** Actual compact descriptor, commit and checkpoint sector images, all counted. */
+  readonly controls: readonly {
+    readonly phase: 'descriptors' | 'commit' | 'checkpoint';
+    readonly sectorLba: BlockId;
+    readonly contents: readonly number[];
+    readonly transferId: number | null;
+  }[];
+  /**
+   * Named FS barriers await the persisted payload/descriptor transfers, then
+   * the commit transfer. A transfer acknowledges durable media, including any
+   * captured cache flush generation. Barriers create no extra I/O sync group.
+   */
+  readonly firstBarrierAtTick: Tick | null;
+  readonly secondBarrierAtTick: Tick | null;
+  readonly checkpointAtTick: Tick | null;
+  readonly failure: { readonly errno: Errno; readonly message: string } | null;
+};
+
+/** Amendment 11. Sparse authority and protection continuation; excludes private sealing material. */
+export interface SecuritySnapshotState {
+  readonly owner: 'security';
+  readonly version: 1;
+  readonly payload: {
+    readonly tick: Tick;
+    readonly accessModel: 'acl' | 'capability';
+    readonly nextTrapId: number;
+    /** Authoritative sparse rows. Rights use read, write, execute, owner, copy, control order. */
+    readonly domains: readonly {
+      readonly id: DomainId;
+      readonly displayName: string;
+      readonly ring: ProtectionRing;
+      readonly rights: readonly {
+        readonly object: string;
+        readonly rights: readonly AccessRight[];
+        readonly transferableRights: readonly AccessRight[];
+      }[];
+    }[];
+    /** Materialized columns must agree with the authoritative rows. */
+    readonly acl: readonly {
+      readonly object: string;
+      readonly entries: readonly {
+        readonly domain: DomainId;
+        readonly rights: readonly AccessRight[];
+      }[];
+    }[];
+    /** These rows are active membership; a seal alone never restores revoked authority. */
+    readonly capabilities: readonly {
+      readonly domain: DomainId;
+      readonly entries: readonly {
+        readonly object: string;
+        readonly rights: readonly AccessRight[];
+        readonly seal: number;
+      }[];
+    }[];
+    readonly roles: readonly {
+      readonly id: string;
+      readonly displayName: string;
+      readonly domains: readonly DomainId[];
+      readonly inherits: readonly string[];
+    }[];
+    /** Exited records retain final bindings and successful-use history for the debrief. */
+    readonly processes: readonly {
+      readonly pid: Pid;
+      readonly active: boolean;
+      readonly domain: DomainId;
+      readonly ring: ProtectionRing;
+      readonly roles: readonly string[];
+      readonly usedRights: readonly {
+        readonly object: string;
+        readonly right: AccessRight;
+      }[];
+      /** Bottom to top. Inactive processes have no trap frames. */
+      readonly traps: readonly {
+        readonly id: number;
+        readonly savedDomain: DomainId;
+        readonly savedRing: ProtectionRing;
+        /** An authorized lasting transition replaces this trap's normal return. */
+        readonly committedReturn: null | {
+          readonly domain: DomainId;
+          readonly ring: ProtectionRing;
+          readonly reason: 'exec' | 'explicit_switch';
+        };
+      }[];
+    }[];
+    /** FS generations prevent reused inode ids from inheriting old setuid authority. */
+    readonly inodeDomains: readonly {
+      readonly inode: InodeId;
+      readonly generation: number;
+      readonly targetDomain: DomainId;
+    }[];
+    readonly pageProtection: readonly {
+      readonly space: AddressSpaceId;
+      readonly page: PageId;
+      readonly requiredRing: ProtectionRing;
+    }[];
+    /** Shared aliases resolve protection through their backing identity, not their frame. */
+    readonly sharedProtection: readonly {
+      readonly region: ResourceId;
+      readonly backingSpace: AddressSpaceId;
+      readonly backingPage: PageId;
+      readonly requiredRing: ProtectionRing;
+      readonly aliases: readonly {
+        readonly pid: Pid;
+        readonly space: AddressSpaceId;
+        readonly page: PageId;
+      }[];
+    }[];
+    /** Cross-owner ids refer to I/O requests; no I/O-owned request shape is widened. */
+    readonly requests: readonly {
+      readonly requestId: number;
+      readonly submittedAtTick: Tick;
+      readonly authority:
+        | {
+            readonly kind: 'process';
+            readonly pid: Pid;
+            readonly tid: Tid;
+            readonly domain: DomainId;
+            readonly ring: ProtectionRing;
+          }
+        | {
+            readonly kind: 'kernel';
+            readonly domain: DomainId;
+            readonly ring: 0;
+          };
+      /** Result discriminant prevents repeated destination writes or denial events. */
+      readonly delegatedWrite: null | {
+        readonly driverPid: Pid;
+        readonly driverDomain: DomainId;
+        readonly driverRing: 1;
+        readonly region: ResourceId;
+        readonly value: number;
+        readonly completion:
+          | { readonly kind: 'pending' }
+          | { readonly kind: 'written'; readonly acknowledgedAtTick: Tick }
+          | { readonly kind: 'failed'; readonly atTick: Tick; readonly errno: Errno; readonly message: string };
+      };
+    }[];
+    /** Scenario data reconstructs its existing-instruction program without functions. */
+    readonly probes: readonly {
+      readonly id: string;
+      readonly programName: string;
+      readonly pid: Pid;
+      readonly driverPid: Pid;
+      readonly region: ResourceId;
+      readonly descriptor: FileDescriptor;
+      readonly binaryPath: string;
+      readonly binaryInode: InodeId;
+      readonly binaryGeneration: number;
+      readonly outOfRangeLength: number;
+      readonly delegatedValue: number;
+      readonly overwriteBytes: number;
+      readonly presentedCapability: {
+        readonly object: string;
+        readonly rights: readonly AccessRight[];
+        readonly seal: number;
+      };
+      /** The binary attack acknowledges open and write separately before attempting exec. */
+      readonly stage:
+        | 'ring_write' | 'argument_bounds' | 'deputy_write'
+        | 'binary_open' | 'binary_write' | 'binary_exec'
+        | 'capability_forgery' | 'finished';
+      readonly overwriteDescriptor: FileDescriptor | null;
+      /** A completed operation is consumed once before advancing stage. */
+      readonly pendingOperation:
+        | null
+        | { readonly kind: 'fs'; readonly operationId: number }
+        | { readonly kind: 'io'; readonly requestId: number };
+      readonly outcomes: readonly {
+        readonly attempt: 1 | 2 | 3 | 4 | 5;
+        readonly tick: Tick;
+        readonly result:
+          | { readonly ok: true; readonly value: string | number | boolean | null }
+          | { readonly ok: false; readonly errno: Errno; readonly message: string };
+        readonly blocked: boolean;
+        readonly decisionEmitted: boolean;
+      }[];
+      readonly status: 'active' | 'completed' | 'compromised' | 'cancelled';
+    }[];
+  };
 }
 
 /** Read data is bytes; successful writes acknowledge with an empty array. */

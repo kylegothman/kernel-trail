@@ -40,7 +40,13 @@ export interface IoHost {
   emit(event: EmittableEvent): void;
   terminate(pid: Pid, reason: 'io_timeout'): void;
   chargeKernelDebt(ticks: number): void;
+  abortStorage?(): void;
+  onRequestSubmitted?(request: IoSnapshotRequest): void;
+  onRequestRemoved?(request: IoSnapshotRequest): void;
+  onRequestCompleted?(request: IoSnapshotRequest, result: IoSnapshotResult): void;
 }
+export type IoControlExtension = (device: DeviceId, command: string,
+  args: readonly (string | number | boolean)[], actor: IoSnapshotActor | undefined) => SyscallResult | undefined;
 const asDeviceId = (value: string): DeviceId => value as DeviceId;
 const asBlockId = (value: number): BlockId => value as BlockId;
 type Payload = IoSnapshotState['payload'];
@@ -54,6 +60,7 @@ export class IoSubsystem {
   readonly cache: BlockCache;
   readonly spool: Spooler;
   private readonly drivers = new Map<DeviceId, DeviceDriver>();
+  private readonly controlExtensions = new Set<IoControlExtension>();
   private readonly buffers = new Map<DeviceId, DeviceBuffer>();
   private data: Mutable<Payload>;
   private inDelivery = false;
@@ -132,6 +139,7 @@ export class IoSubsystem {
     const req: Request = { id, owner: structuredClone(owner) as Mutable<IoSnapshotRequest['owner']>, device, submittedAtTick: this.host.tick(), startedAtTick: null, wordSize: state.wordSize,
       command: structuredClone(selected) as Mutable<IoSnapshotRequest['command']>, service: { kind: 'queued' }, continuation: structuredClone(next), instructionRetired: owner.kind !== 'actor', wakeable: false };
     this.data.requests.push(req);
+    this.host.onRequestSubmitted?.(req);
     if (owner.kind === 'actor') this.host.emit({ type: 'io.request', pid: owner.actor.pid, device, mode: next.mode });
     else { req.continuation.setupTicksRemaining = 0; this.drivers.get(device)!.submit(req, this.context); }
     this.refreshDevices(); return id;
@@ -253,6 +261,10 @@ export class IoSubsystem {
   }
   control(device: DeviceId, command: string, args: readonly (string | number | boolean)[], actor: IoSnapshotActor | undefined): SyscallResult {
     if (!this.host.enabled()) return failure('I/O disabled');
+    for (const extension of this.controlExtensions) {
+      const result = extension(device, command, args, actor);
+      if (result !== undefined) { this.refreshDevices(); return result; }
+    }
     const driver = this.drivers.get(device); if (driver === undefined) return failure('unknown device');
     this.controlActor = actor;
     try { const result = driver.control(command, args, this.context); this.refreshDevices(); return result; }
@@ -261,6 +273,44 @@ export class IoSubsystem {
   sync(actor: IoSnapshotActor | undefined): SyscallResult {
     if (!this.host.enabled() || actor === undefined) return failure('missing I/O caller');
     const result = this.cache.sync(actor); this.refreshDevices(); return result;
+  }
+  registerControl(extension: IoControlExtension): () => void {
+    this.controlExtensions.add(extension); return () => { this.controlExtensions.delete(extension); };
+  }
+  /** Crash is unconditional; reset's DMA refusal remains unchanged. */
+  crashAbort(): { readonly requests: readonly number[]; readonly dirty: readonly { readonly device: DeviceId; readonly sectorLba: BlockId }[] } {
+    const ids = new Set(this.data.requests.map(request => request.id));
+    const dirty = this.cache.snapshot().entries.filter(entry => entry.generation > entry.durableGeneration)
+      .map(entry => ({ device: entry.device, sectorLba: entry.block }));
+    for (const device of this.data.devices) {
+      device.activeRequestId = null; device.requestOrder.length = 0; device.pollingTokens.length = 0;
+      if (device.mitigation !== null) { device.mode = device.mitigation.priorMode; device.mitigation = null; }
+      this.spool.reset(device.id);
+    }
+    for (const buffer of this.buffers.values()) buffer.remove(ids);
+    this.cache.dropDirty();
+    for (const device of this.data.devices) this.cache.abortDevice(device.id);
+    this.host.abortStorage?.();
+    for (const request of [...this.data.requests]) {
+      if (request.service.kind === 'storage') this.storage?.cancel(request.service.storageRequestId);
+      if (request.owner.kind !== 'actor') { this.removeRequest(request.id); continue; }
+      request.service = { kind: 'completed', atTick: this.host.tick(), result: { kind: 'failed', reason: 'cancelled' } };
+      request.wakeable = true; request.continuation.setupTicksRemaining = 0;
+      if (request.continuation.mode === 'dma') {
+        request.continuation.dmaEventEmitted = true;
+        request.continuation.elapsedTransferTicks = request.continuation.transferTicks;
+        request.continuation.stealAccumulator = request.continuation.stealBudget;
+        request.continuation.stealsCharged = request.continuation.stealBudget;
+      } else if (request.continuation.mode === 'interrupt') request.continuation.copyDebt = 'charged';
+      this.host.onRequestRemoved?.(request);
+    }
+    const interrupts = this.interrupts.snapshot();
+    this.interrupts.restore({ ...interrupts, lines: interrupts.lines.map(line => ({ ...line, pending: [], panicEmitted: false })),
+      serviceStack: [], masks: [], storm: null });
+    this.data.pendingKernelCharges.length = 0;
+    this.host.chargeKernelDebt(-this.data.kernelDebt); this.data.kernelDebt = 0;
+    this.refreshDevices();
+    return { requests: [...ids], dirty };
   }
   dirtyEntries(): readonly import('../types').BlockId[] { return this.cache.dirtyEntries(); }
   dropDirty(): readonly import('../types').BlockId[] { return this.cache.dropDirty(); }
@@ -472,6 +522,7 @@ export class IoSubsystem {
     return result;
   }
   private mediaDone(req: Request, result: IoSnapshotResult): void {
+    this.host.onRequestCompleted?.(req, result);
     req.service = { kind: 'completed', atTick: this.host.tick(), result: structuredClone(result) as Mutable<IoSnapshotResult> };
     const driver = this.drivers.get(req.device); check(driver !== undefined, 'completion driver'); driver.complete(req, this.context);
   }
@@ -522,6 +573,7 @@ export class IoSubsystem {
   private cancelRequest(id: number): void { const req = this.find(id); if (req?.service.kind === 'storage') this.storage?.cancel(req.service.storageRequestId); this.removeRequest(id); }
   private removeRequest(id: number): void {
     const req = this.find(id); if (req !== undefined) this.releaseDevice(req);
+    if (req !== undefined) this.host.onRequestRemoved?.(req);
     this.data.requests = this.data.requests.filter(value => value.id !== id);
     this.interrupts.remove(token => token.kind === 'completion' && token.requestId === id);
     for (const device of this.data.devices) { device.requestOrder = device.requestOrder.filter(value => value !== id); device.pollingTokens = device.pollingTokens.filter(token => token.kind !== 'completion' || token.requestId !== id); }

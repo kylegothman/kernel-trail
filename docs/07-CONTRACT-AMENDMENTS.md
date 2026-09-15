@@ -757,3 +757,84 @@ Kyle accepted the actual WebGPU and forced-WebGL2 run as WP-12 runtime
 evidence. Image-based reflection and SDF checks, a no-float-colour-extension
 device, reduced-motion visuals and the 60 fps benchmark remain open for
 WP-13 and the smoke harness; they are not recorded as passes.
+
+
+## Amendment 11, 2026-09-15: WP-10 file system and security continuation
+
+**Raised by:** the WP-10 implementing agent after the approved pre-flight.
+**Approved by:** Kyle, for the exact two-file promotion patch and its mechanical
+frameTable fixture migration, reviewed before application.
+**Status:** applied on wp-10 after rebasing onto main. This is amendment 11;
+WP-12's design-token freeze landed first as amendment 10. Hash regeneration was
+human-approved on 2026-09-15 for this promotion only.
+
+### What was an envelope
+
+`SubsystemSnapshots.fs` and `SubsystemSnapshots.security` were the two remaining
+`SubsystemEnvelope` slots. An envelope could accept JSON without specifying the
+namespace, allocation, journal, protection or pending-operation state needed to
+continue the simulation after restore.
+
+### What changed
+
+The slots are now `FsSnapshotState` and `SecuritySnapshotState`, both version 1.
+Their slot comments carry amendment 11. All nested records are explicit type
+literals or aliases over type literals and existing branded scalars/unions;
+no frozen interface is embedded into a payload and no generic JSON escape hatch
+is introduced. The existing Inode, PCB, TCB, Frame, KernelConfig and all other
+subsystem snapshot definitions are unchanged.
+
+The FS payload carries namespace and allocation metadata, inode/block
+generations, the reserved volume layout, each free-space representation,
+descriptor membership/shared offsets, cwd, cache identities, pending file calls,
+immutable journal image/control plans, acknowledged transfers, recovery cursors
+and explicit corruption evidence. Physical storage remains authoritative for
+media bytes; I/O retains its cache bytes and flush groups. FS metadata image
+caches are explicit and discarded on crash before reading surviving sectors.
+
+The security payload carries sparse authority and its materialized ACL and active
+capability views, transferability, roles and actual-use history, current/saved
+rings and domains with committed return overrides, inode-generation setuid
+bindings, page/backing protection, captured requester identity, delegated-write
+acknowledgments and probe stages. `kernelSecret` is excluded from the payload by
+design. Neither payload has a secret accessor, substitute sealing field, seed,
+RNG clone or function. The existing source snapshot seed supplies private restore
+context without advancing the live restored RNG.
+
+### Why this shape
+
+Saved domains accompany saved rings so trap return can restore authority and
+preserve a successful exec or explicit domain switch. Inode generations prevent
+reused IDs from inheriting stale descriptors or setuid authority; per-inode block
+generations retain evidence of delayed overwrite corruption. Journal barriers
+wait on the exact persisted transfer acknowledgments, so restore neither repeats
+completed writes nor loses pending durability work. Transaction IDs start at 1;
+checkpoint 0 is the empty-prefix marker. Recovery retains at most the latest
+checkpointed images in the existing journal reservation.
+
+Both payloads were proven to extend JsonValue under standalone strict flags,
+including exactOptionalPropertyTypes and noUncheckedIndexedAccess. Both complete
+states remain assignable to SubsystemEnvelope. Negative controls reject an
+embedded interface without an index signature, Map, Set and a function.
+
+### Consequences
+
+The protected snapshot-dispatch fixture in
+`tests/kernel/memory/frameTable.test.ts` now contributes a full typed empty FS
+payload. Only its local configuration excludes fs, preventing a duplicate owner
+when the production FS hook is installed. The retained value lives in the
+nonnegative completedOperations counter; the invalid contribution uses -1 in
+that same field. Assertions, seeds, run calls and REFERENCE_CONFIG are preserved.
+This mechanical migration belongs to the contract-only commit so that commit
+passes typecheck independently of the implementation.
+
+Restore validates owner/version, bounds, canonical order, cross-owner IDs and
+presentation-table agreement before applying either prepared commit closure.
+Private sealing material has no serialization path. Full fresh-kernel workload
+restoration remains WP-11's responsibility; the protected cross-seed and init-only
+restore behaviors remain requirements.
+
+Only the kernel contract hash changes. The frozen hashes for
+`src/design/tokens.ts` and `src/game/types.ts` are unchanged. The three-file
+freeze, source scanner, zero skip budget and all guard policies remain intact.
+No filesystem or security implementation accompanies this amendment commit.

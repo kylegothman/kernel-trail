@@ -51,6 +51,7 @@ export interface IpcHooks {
   readonly pageTable: (space: AddressSpaceId) => PageTableEntry[];
   readonly frame: (id: FrameId) => Frame | undefined;
   readonly rights: (pid: Pid, region: ResourceId) => readonly AccessRight[];
+  readonly onAccessDenied?: (pid: Pid, region: ResourceId, right: 'read' | 'write') => void;
   readonly block: (pid: Pid, reason: BlockReason) => void;
   readonly onSharedMap?: (pid: Pid, mapping: SharedMapping) => void;
   readonly onSharedUnmap?: (pid: Pid, mapping: SharedMapping) => void;
@@ -141,6 +142,7 @@ export class IpcManager {
     if (region === undefined || mappings === undefined) return noRegion();
     const rights = this.hooks.rights(pid, id);
     if (!rights.includes('read') || (writable === true && !rights.includes('write'))) {
+      this.hooks.onAccessDenied?.(pid, id, !rights.includes('read') ? 'read' : 'write');
       return { ok: false, errno: 'EACCES', message: 'shared region access denied' };
     }
     const existing = mappings.get(pid);
