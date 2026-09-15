@@ -5,7 +5,8 @@ import { createScheduler, configureSchedulerWorkload, isMetricsAware, isRunningA
 import { saveSchedulerParams } from './scheduler/SchedulerBase';
 import { createSchedulerHooks } from './scheduler/starvation';
 import { SchedulingAccounting } from './scheduler/metrics';
-import { KernelInvariantError } from './errors';
+import { KernelConfigError, KernelInvariantError } from './errors';
+import { buildProcessState, checkCompleteness, hasWorkloadState, validateProcessState, type ValidatedProcessState } from './snapshot';
 import { DEFAULT_TUNING, resolveTuning, validateConfig, type KernelTuning } from './config';
 import { ProcessTable } from './process/ProcessTable';
 import { transition, type TransitionOptions } from './process/transitions';
@@ -54,7 +55,7 @@ import type {
   SchedulerParams,
   SchedulerPolicy,
   SchedulingMetrics,
-  SubsystemId, SchedulerSnapshotState, SubsystemSnapshots,
+  SubsystemId, SchedulerSnapshotState, SubsystemSnapshots, ProcessSnapshotState,
   SyncPrimitive,
   SyscallRequest,
   SyscallResult,
@@ -192,7 +193,6 @@ export class KernelImpl implements Kernel {
   private currentTick = asTick(0);
   private readonly rng: StreamRegistry;
   private enabled: ReadonlySet<SubsystemId>;
-  private hooksInstalled = false;
   private requestedScheduler: SchedulerId;
   private readonly programs = new Map<Pid, Program>();
   private readonly namedPrograms = new Map<string, Program>();
@@ -571,7 +571,6 @@ export class KernelImpl implements Kernel {
     this.probes.add(probe); return () => { this.probes.delete(probe); };
   }
   installHooks(hooks: Partial<KernelHooks>): void {
-    this.hooksInstalled ||= Object.keys(hooks).some(key => key !== 'snapshots');
     if (hooks.snapshots !== undefined) this.snapshotHooks.push(hooks.snapshots);
     this.memory = { ...this.memory, ...hooks.memory }; this.sync = { ...this.sync, ...hooks.sync };
     this.io = { ...this.io, ...hooks.io }; this.storage = { ...this.storage, ...hooks.storage };
@@ -874,9 +873,13 @@ export class KernelImpl implements Kernel {
     this.syncSchedulerView();
   }
 
-  /** The scaffold's init-only replay remains supported. Workload saves need WP-11's contract channel. */
+  /**
+   * A snapshot is full whenever the kernel holds workload state, and then carries
+   * the process contribution beside every subsystem's own. Pure: two calls with
+   * no intervening step agree byte for byte (I-40).
+   */
   snapshot(): KernelSnapshot {
-    this.requireSnapshotChannel('snapshot');
+    const full = this.hasWorkload();
     return this.withSnapshotContributions({
       version: 1, tick: this.tick, seq: this.events.seq, config: cloneConfig({ ...this.config, scheduler: this.requestedScheduler, schedulerParams: this.schedulerParams }), rng: this.rng.save(),
       processes: this.processes.map(clonePcb), frames: this.frames.map(frame => ({ ...frame })),
@@ -887,7 +890,8 @@ export class KernelImpl implements Kernel {
       diskHead: { ...this.diskHead }, devices: this.devices.map(d => ({ ...d, queue: [...d.queue] })),
       inodes: this.inodes.map(i => ({ ...i, blocks: [...i.blocks] })), journal: this.journal.map(j => ({ ...j, blocks: [...j.blocks] })),
       domains: this.domains.map(d => ({ ...d, rights: new Map([...d.rights].map(([key, rights]) => [key, [...rights]])) })),
-      subsystems: { scheduler: this.saveSchedulerState() },
+      completeness: full ? 'full' : 'init_only',
+      subsystems: { scheduler: this.saveSchedulerState(), ...(full ? { process: this.saveProcessState() } : {}) },
       metrics: { scheduling: { ...this.schedulingMetrics }, memory: { ...this.memoryMetrics, workingSets: new Map(this.memoryMetrics.workingSets) } },
     });
   }
@@ -900,27 +904,66 @@ export class KernelImpl implements Kernel {
     }
     return { ...snapshot, subsystems };
   }
+  private hasWorkload(): boolean {
+    const customTuning = Object.keys(DEFAULT_TUNING).some(key => key !== 'checkInvariants' && Reflect.get(this.tuning, key) !== Reflect.get(DEFAULT_TUNING, key));
+    return hasWorkloadState({ nextPid: this.table.nextPid, namedPrograms: this.namedPrograms.size, ipcHasState: this.ipc.hasState, customTuning });
+  }
+  private saveProcessState(): ProcessSnapshotState {
+    return buildProcessState({
+      programs: this.programs, namedPrograms: this.namedPrograms, processes: this.processes, raw: this.table.raw,
+      table: this.table.snapshotContribution(), threads: this.threads.snapshotContribution(), lifecycle: this.lifecycle.snapshotContribution(),
+      ipc: this.ipc.snapshotContribution(), burstSizes: this.burstSizes, copyDebts: this.copyDebt, syscallResults: this.syscallResults,
+      nextAddressSpace: this.nextSpace, tuning: this.tuning,
+    });
+  }
+  /**
+   * Replace state in place. Version, completeness and the process contribution
+   * are validated before any mutation. Afterwards the process tables are staged
+   * first and every subsystem contribution is prepared and committed in
+   * registration order, because sync, memory and deadlock validate their
+   * payloads against the live tables and deadlock against committed sync state.
+   * Any failure after staging rolls the kernel back to the snapshot taken at
+   * entry, so one invalid contribution still changes nothing (decision D1).
+   */
   restore(snapshot: KernelSnapshot): void {
-    if (snapshot.version !== 1) throw new Error(`unsupported snapshot version ${String(snapshot.version)}`);
-    this.requireSnapshotChannel('restore');
-    if (snapshot.processes.some(pcb => pcb.pid !== asPid(1) || pcb.state !== 'ready') || snapshot.processes.length !== 1) this.snapshotBlocked('restore');
+    if (snapshot.version !== 1) throw new KernelConfigError(`unsupported snapshot version ${String(snapshot.version)}`);
+    const completeness = checkCompleteness(snapshot, this.hasWorkload());
+    const validated = completeness === 'full' ? validateProcessState(snapshot, this.tuning) : null;
+    if (validated === null && (snapshot.processes.length !== 1 || snapshot.processes[0]?.pid !== asPid(1))) throw new KernelConfigError('restore refused: an init-only snapshot holds a workload');
     if (snapshot.subsystems?.scheduler !== undefined) prepareSchedulerRestore(snapshot.subsystems.scheduler, {
-      ...this.schedulerContext(), tick: snapshot.tick, running: null, readyQueue: [],
+      ...this.schedulerContext(), tick: snapshot.tick,
+      running: snapshot.processes.find(pcb => pcb.pid > 1 && pcb.state === 'running')?.pid ?? null,
+      readyQueue: snapshot.processes.filter(pcb => pcb.pid > 1 && pcb.state === 'ready').map(pcb => pcb.pid),
       process: pid => snapshot.processes.find(pcb => pcb.pid === pid),
-    }, this.schedulingAccounting, pid => this.burstSizes.get(pid), {
+    }, this.schedulingAccounting, pid => snapshot.subsystems?.process?.burstSizes.find(([candidate]) => candidate === pid)?.[1] ?? this.burstSizes.get(pid), {
       maxProcesses: this.tuning.maxProcesses, mlfqAccounting: this.tuning.mlfqAccounting, emit: event => this.publish(event),
     }, snapshot.config);
-    const restoreContributions = this.snapshotHooks.map(hooks => hooks.restoreState(snapshot));
+    const entry = this.snapshot();
+    try { this.applyRestore(snapshot, validated); }
+    catch (error) {
+      try { this.applyRestore(entry, entry.completeness === 'full' ? validateProcessState(entry, this.tuning) : null); }
+      catch (inner) { throw new KernelConfigError(`restore failed and the rollback failed too: ${String(error)}; ${String(inner)}`); }
+      throw error;
+    }
+  }
+  private applyRestore(snapshot: KernelSnapshot, validated: ValidatedProcessState | null): void {
     this.currentConfig = cloneConfig(snapshot.config); this.enabled = new Set(this.config.enabledSubsystems);
     this.schedulerParams = { ...snapshot.config.schedulerParams }; this.requestedScheduler = this.config.scheduler;
     this.currentTick = snapshot.tick; this.events.beginFrame(); this.events.setSeq(snapshot.seq); this.rng.restore(snapshot.rng);
-    this.table.forEachAscending(pcb => this.threads.clear(pcb)); this.table.clear(); this.threads.reset(); this.initialiseSystemProcesses(snapshot.processes[0]);
-    const init = snapshot.processes[0];
-    const live = this.table.get(asPid(1));
-    if (init !== undefined && live !== undefined) {
-      // Init has no instruction stream; its finite service fields stay unchanged.
-      live.state = init.state; live.readySince = init.readySince;
-    }
+    this.table.forEachAscending(pcb => this.threads.clear(pcb)); this.table.clear(); this.threads.reset();
+    this.programs.clear(); this.namedPrograms.clear(); this.burstSizes.clear(); this.copyDebt.clear(); this.syscallResults.clear();
+    this.wakeable.clear(); this.admittedThisTick.clear(); this.executingThread = undefined;
+    if (validated === null) {
+      this.initialiseSystemProcesses(snapshot.processes[0]);
+      const init = snapshot.processes[0];
+      const live = this.table.get(asPid(1));
+      if (init !== undefined && live !== undefined) {
+        // Init has no instruction stream; its finite service fields stay unchanged.
+        live.state = init.state; live.readySince = init.readySince;
+      }
+      this.lifecycle.restoreContribution({ cowRefCounts: [], pendingChildReturns: [] });
+      this.ipc.restoreContribution({ sharedRegions: [], mailboxes: [], pending: [], completions: [], completedWaits: [], originalPins: [] });
+    } else this.stageProcessState(snapshot, validated);
     this.frames = snapshot.frames.map(frame => ({ ...frame })); this.rebuildFreeList();
     this.pageTables.clear();
     for (const [space, entries] of snapshot.pageTables) this.pageTables.set(space, entries.map(entry => ({ ...entry })));
@@ -934,22 +977,30 @@ export class KernelImpl implements Kernel {
     this.memoryMetrics = { ...snapshot.metrics.memory, workingSets: new Map(snapshot.metrics.memory.workingSets) };
     this.contextSwitches = snapshot.metrics.scheduling.contextSwitches;
     this.running = null; this.lastCpuOwner = null; this.sliceElapsed = 0; this.switchDebt = 0;
-    this.wakeable.clear(); this.admittedThisTick.clear(); this.scheduler = this.makeScheduler(this.config.scheduler);
+    this.scheduler = this.makeScheduler(this.config.scheduler);
     if (snapshot.subsystems?.scheduler !== undefined) this.restoreSchedulerState(snapshot.subsystems.scheduler);
     else this.schedulingAccounting.reset();
-    for (const commit of restoreContributions) commit();
+    // Prepare then commit per owner, in registration order: memory, sync, deadlock, storage and io, fs and security.
+    for (const hooks of this.snapshotHooks) hooks.restoreState(snapshot)();
     this.initialiseFrameTable();
     this.syncSchedulerView();
   }
-  private requireSnapshotChannel(name: string): void {
-    const tuningNeedsState = Object.keys(DEFAULT_TUNING).some(key => key !== 'checkInvariants'
-      && Reflect.get(this.tuning, key) !== Reflect.get(DEFAULT_TUNING, key));
-    if (this.table.nextPid > 2 || this.namedPrograms.size > 0 || this.hooksInstalled || this.ipc.hasState
-      || tuningNeedsState || this.table.get(asPid(1))?.state !== 'ready') this.snapshotBlocked(name);
-  }
-  private snapshotBlocked(name: string): never {
-    // TODO(astra): blocked on contract change, see report
-    throw new Error(`not implemented: ${name} for process workloads or custom subsystem state; WP-11 needs a KernelSnapshot channel for programs, threads and side tables`);
+  /** Install the validated process contribution into the live tables; every subsystem prepare that follows reads them. */
+  private stageProcessState(snapshot: KernelSnapshot, validated: ValidatedProcessState): void {
+    const state = validated.state;
+    this.table.restoreContribution({ processes: [this.idlePcb(), ...snapshot.processes.map(clonePcb)], raw: validated.raw,
+      createdEvents: state.createdEvents, nextPid: state.counters.nextPid });
+    const pcbs = this.table.filterAscending(pcb => pcb.pid !== asPid(0));
+    this.threads.restoreContribution({ threads: state.threads, lwpBindings: state.lwpBindings, deliveryCursors: state.deliveryCursors,
+      threadAccounting: state.threadAccounting, nextTid: state.counters.nextTid }, pcbs);
+    for (const [pid, program] of validated.programs) this.programs.set(pid, program);
+    for (const [name, program] of validated.namedPrograms) this.namedPrograms.set(name, program);
+    for (const [pid, burst] of state.burstSizes) this.burstSizes.set(pid, burst);
+    for (const [pid, debt] of state.copyDebts) this.copyDebt.set(pid, debt);
+    for (const [pid, result] of state.syscallResults) this.syscallResults.set(pid, { ...result });
+    this.nextSpace = state.counters.nextAddressSpace;
+    this.lifecycle.restoreContribution({ cowRefCounts: state.cowRefCounts, pendingChildReturns: state.pendingChildReturns });
+    this.ipc.restoreContribution(state.ipc);
   }
 
   private phase01_expireTimers(): void {
@@ -1232,9 +1283,13 @@ export class KernelImpl implements Kernel {
       threads: [], openFiles: [], heldResources: [], requestedResources: [], blockedOn: null,
       domain: 'kernel' as DomainId, exitCode: null, terminationReason: null, convoyMemberId: null };
   }
-  private initialiseSystemProcesses(savedInit?: ProcessControlBlock): void {
-    const idle = this.table.insert({ ...this.basePcb(asPid(0), null, 'idle'), priority: Number.MAX_SAFE_INTEGER, basePriority: Number.MAX_SAFE_INTEGER, cpuBurstRemaining: Infinity, serviceRemaining: Infinity });
+  private idlePcb(): ProcessControlBlock {
+    const idle = { ...this.basePcb(asPid(0), null, 'idle'), priority: Number.MAX_SAFE_INTEGER, basePriority: Number.MAX_SAFE_INTEGER, cpuBurstRemaining: Infinity, serviceRemaining: Infinity };
     idle.threads.push(0 as Tid);
+    return idle;
+  }
+  private initialiseSystemProcesses(savedInit?: ProcessControlBlock): void {
+    this.table.insert(this.idlePcb());
     const init = this.table.insert(savedInit === undefined ? this.basePcb(asPid(1), null, 'init') : clonePcb(savedInit), { rawBurst: 1, rawService: 1, serialFraction: 1 });
     this.threads.attach(init);
     this.programs.set(init.pid, instructionProgram([{ kind: 'compute' }]));

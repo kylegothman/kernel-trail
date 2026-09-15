@@ -96,7 +96,7 @@ describe('eleven-phase execution', () => {
     const tid = pcb.threads[0]; if (tid === undefined) throw new Error('missing thread'); kernel.threads.join(pcb, tid);
     expect(kernel.process(pid)).toMatchObject({ state: 'zombie', exitCode: 0 });
   });
-  it('unimplemented methods throw, while init-only snapshots preserve the user-requested replay regression', () => {
+  it('init-only snapshots preserve the user-requested replay regression and refuse a workload kernel', () => {
     const kernel = createKernel(REFERENCE_CONFIG); const snap = kernel.snapshot();
     kernel.setDiskPolicy('sstf'); expect(kernel.activeDiskPolicy).toBe('sstf');
     expect(kernel.evaluateBankers(asPid(2), asResourceId('r'), 1))
@@ -105,8 +105,8 @@ describe('eleven-phase execution', () => {
     kernel.setReplacementPolicy('fifo'); expect(kernel.activeReplacementPolicy).toBe('fifo');
     kernel.setAllocationStrategy('buddy'); expect(kernel.activeAllocationStrategy).toBe('buddy');
     kernel.restore(snap); kernel.spawn(WORK);
-    expect(() => kernel.snapshot()).toThrow(/^not implemented: snapshot.*KernelSnapshot channel/);
-    expect(() => kernel.restore(snap)).toThrow(/^not implemented: restore.*KernelSnapshot channel/);
+    expect(kernel.snapshot().completeness).toBe('full');
+    expect(() => kernel.restore(snap)).toThrow(/completeness/);
   });
 });
 
@@ -178,8 +178,8 @@ describe('thread progress at blocking and completion boundaries', () => {
   });
 });
 
-it('snapshot rejects custom tuning and IPC state instead of silently dropping it', () => {
-  expect(() => createKernel(REFERENCE_CONFIG, { coreCount: 8 }).snapshot()).toThrow(/^not implemented:/);
+it('snapshot carries custom tuning and IPC state instead of silently dropping it', () => {
+  expect(createKernel(REFERENCE_CONFIG, { coreCount: 8 }).snapshot().subsystems?.process?.tuning).toMatchObject({ coreCount: 8 });
   const kernel = createKernel(REFERENCE_CONFIG); kernel.ipc.createMailbox(asResourceId('empty'), 1);
-  expect(() => kernel.snapshot()).toThrow(/^not implemented:/);
+  expect(kernel.snapshot().subsystems?.process?.ipc.mailboxes.map(box => box.id)).toEqual(['empty']);
 });

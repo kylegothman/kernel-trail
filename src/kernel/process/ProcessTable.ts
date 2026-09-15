@@ -2,6 +2,21 @@ import { KernelInvariantError } from '../errors';
 import { asPid } from '../types';
 import type { Pid, ProcessControlBlock } from '../types';
 
+export interface ProcessTableContribution {
+  readonly rawWork: readonly (readonly [Pid, number])[];
+  readonly rawBursts: readonly (readonly [Pid, number])[];
+  readonly createdEvents: readonly Pid[];
+  readonly nextPid: number;
+}
+
+export interface ProcessTableRestore {
+  /** Ascending by pid, idle included; each is inserted as given. */
+  readonly processes: readonly ProcessControlBlock[];
+  readonly raw: readonly { readonly pid: Pid; readonly rawBurst: number; readonly rawService: number; readonly serialFraction: number }[];
+  readonly createdEvents: readonly Pid[];
+  readonly nextPid: number;
+}
+
 export interface RawProcessWork {
   rawBurst: number;
   rawService: number;
@@ -96,6 +111,41 @@ export class ProcessTable {
     this.raw.clear();
     this.createdEvents.clear();
     this.pidCounter = 1;
+  }
+
+  /** Detached, ascending copies of the raw work, creation marks and the pid allocator (WP-11, amendment 14). */
+  snapshotContribution(): ProcessTableContribution {
+    const raw = [...this.raw].sort(([a], [b]) => a - b);
+    return {
+      rawWork: raw.map(([pid, work]) => [pid, work.rawService] as const),
+      rawBursts: raw.map(([pid, work]) => [pid, work.rawBurst] as const),
+      createdEvents: [...this.createdEvents].sort((a, b) => a - b),
+      nextPid: this.pidCounter,
+    };
+  }
+
+  /**
+   * Replace the whole table from staged control blocks. Each block is inserted in
+   * ascending pid order with its raw work; validation runs before any mutation.
+   */
+  restoreContribution(data: ProcessTableRestore): void {
+    const count = (value: unknown, minimum: number): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= minimum;
+    const pids = data.processes.map(pcb => pcb.pid);
+    if (pids.some((pid, index) => !count(pid, 0) || (index > 0 && pid <= (pids[index - 1] ?? -1)))) throw new KernelInvariantError(1, 'restored processes must ascend by pid');
+    const known = new Set<number>(pids);
+    for (const row of data.raw) {
+      if (!known.has(row.pid) || !count(row.rawBurst, 0) || !count(row.rawService, 0) || !(row.serialFraction >= 0 && row.serialFraction <= 1)) throw new KernelInvariantError(4, 'invalid restored raw work', { pid: row.pid });
+    }
+    for (const pid of data.createdEvents) if (!known.has(pid)) throw new KernelInvariantError(11, 'creation mark for an unknown process', { pid });
+    const highest = pids[pids.length - 1] ?? 0;
+    if (!count(data.nextPid, highest + 1)) throw new KernelInvariantError(11, 'restored next pid must exceed all allocated pids');
+    this.clear();
+    for (const pcb of data.processes) {
+      const raw = data.raw.find(row => row.pid === pcb.pid);
+      this.insert(pcb, raw === undefined ? undefined : { rawBurst: raw.rawBurst, rawService: raw.rawService, serialFraction: raw.serialFraction });
+    }
+    for (const pid of data.createdEvents) this.createdEvents.add(pid);
+    this.pidCounter = data.nextPid;
   }
 
   setNextPid(next: number): void {

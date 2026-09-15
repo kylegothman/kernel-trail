@@ -1,4 +1,5 @@
 import type { EmittableEvent } from '../EventBus';
+import { KernelInvariantError } from '../errors';
 import { asPid } from '../types';
 import type {
   AddressSpaceId, FileDescriptor, FrameId, PageId, PageTableEntry, Pid,
@@ -53,6 +54,30 @@ export class ProcessLifecycle {
   readonly childForkReturns = new Map<Pid, number>();
 
   constructor(private readonly ctx: LifecycleContext) {}
+
+  /** Detached, ascending copies of the lifecycle side tables (WP-11, amendment 14). */
+  snapshotContribution(): { readonly cowRefCounts: readonly (readonly [FrameId, number])[]; readonly pendingChildReturns: readonly (readonly [Pid, number])[] } {
+    return {
+      cowRefCounts: [...this.cowRefCount].sort(([a], [b]) => a - b).map(([frame, count]) => [frame, count] as const),
+      pendingChildReturns: [...this.childForkReturns].sort(([a], [b]) => a - b).map(([pid, value]) => [pid, value] as const),
+    };
+  }
+
+  /** Replace both side tables. Validation runs before any mutation. */
+  restoreContribution(data: { readonly cowRefCounts: readonly (readonly [FrameId, number])[]; readonly pendingChildReturns: readonly (readonly [Pid, number])[] }): void {
+    const count = (value: unknown, minimum: number): boolean => typeof value === 'number' && Number.isSafeInteger(value) && value >= minimum;
+    const frames = new Set<number>(); const pids = new Set<number>();
+    for (const [frame, refs] of data.cowRefCounts) {
+      if (!count(frame, 0) || !count(refs, 1) || frames.has(frame)) throw new KernelInvariantError(18, 'invalid restored copy-on-write count', { frame });
+      frames.add(frame);
+    }
+    for (const [pid, value] of data.pendingChildReturns) {
+      if (!count(pid, 2) || !count(value, 0) || pids.has(pid) || this.ctx.table.get(pid) === undefined) throw new KernelInvariantError(11, 'invalid restored fork return', { pid });
+      pids.add(pid);
+    }
+    this.cowRefCount.clear(); for (const [frame, refs] of data.cowRefCounts) this.cowRefCount.set(frame, refs);
+    this.childForkReturns.clear(); for (const [pid, value] of data.pendingChildReturns) this.childForkReturns.set(pid, value);
+  }
 
   fork(parent: ProcessControlBlock): SyscallResult {
     if (parent.state === 'zombie' || parent.state === 'terminated') {
