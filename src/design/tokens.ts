@@ -954,7 +954,19 @@ export function cubicBezier(x1: number, y1: number, x2: number, y2: number): (x:
     for (let i = 0; i < 8; i++) {
       const d = slope(t, x1, x2);
       if (Math.abs(d) < 1e-6) break;
-      t -= (calc(t, x1, x2) - x) / d;
+      const next = t - (calc(t, x1, x2) - x) / d;
+      t = Math.max(0, Math.min(1, next));
+      if (next < 0 || next > 1) break;
+    }
+    if (Math.abs(calc(t, x1, x2) - x) > 1e-14) {
+      let lo = 0;
+      let hi = 1;
+      for (let i = 0; i < 64; i++) {
+        t = (lo + hi) * 0.5;
+        if (calc(t, x1, x2) < x) lo = t;
+        else hi = t;
+      }
+      t = (lo + hi) * 0.5;
     }
     return calc(t, y1, y2);
   };
