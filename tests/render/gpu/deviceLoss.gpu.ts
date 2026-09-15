@@ -1,15 +1,15 @@
-import {ThreeUnifiedBackend} from '../../../src/render/RendererBackend';
+import {createBackend} from '../../../src/render/backend/createBackend';
 import {DeviceLossPolicy} from '../../../src/render/backend/DeviceLossPolicy';
 import {detectCapabilities,PROFILES} from '../../../src/platform';
 /** Real context loss, with host-owned canvas/world reconstruction through the policy. */
 export async function exerciseDeviceLoss() {
   const {caps}=await detectCapabilities('gpu-loss',true);
-  let canvas=document.createElement('canvas'),active=new ThreeUnifiedBackend(caps);
-  await active.init(canvas,{forceWebGL:true,antialias:false,samples:1,profile:PROFILES.low});
+  let canvas=document.createElement('canvas');
+  let active=await createBackend(canvas,caps,{antialias:false,samples:1,profile:PROFILES.low},true);
   const attempts:boolean[]=[];let outcome='pending';
   const policy=new DeviceLossPolicy(async forceWebGL=>{
     attempts.push(forceWebGL);active.dispose();canvas.remove();canvas=document.createElement('canvas');
-    active=new ThreeUnifiedBackend(caps);await active.init(canvas,{forceWebGL,antialias:false,samples:1,profile:PROFILES.low});
+    active=await createBackend(canvas,caps,{antialias:false,samples:1,profile:PROFILES.low},forceWebGL);
   },value=>{outcome=value;},()=>{});
   try {
     await new Promise<void>((resolve,reject)=>{

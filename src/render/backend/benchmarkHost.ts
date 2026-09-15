@@ -1,12 +1,11 @@
 import { BENCHMARK,PROFILES,type BenchmarkHost,type RenderCapabilities } from '@platform';
 import { createProbeScene } from '../index';
-import { ThreeUnifiedBackend } from '../RendererBackend';
+import { createBackend } from './createBackend';
 import { createParticleIntegration } from './particles';
 /** Wall-clock render completion cost for tier selection, never labelled GPU timing. */
 export async function createBenchmarkHost(caps:RenderCapabilities):Promise<BenchmarkHost> {
   const canvas=document.createElement('canvas');
-  const backend=new ThreeUnifiedBackend(caps);
-  await backend.init(canvas,{forceWebGL:caps.backend==='webgl2',antialias:false,samples:1,profile:PROFILES.medium});
+  const backend=await createBackend(canvas,caps,{antialias:false,samples:1,profile:PROFILES.medium});
   backend.resize(BENCHMARK.width,BENCHMARK.height,1);
   const probe=createProbeScene('medium',BENCHMARK.slabs,0),particles=createParticleIntegration(BENCHMARK.particles,caps);
   probe.scene.add(particles.object);probe.camera.aspect=BENCHMARK.width/BENCHMARK.height;probe.camera.updateProjectionMatrix();

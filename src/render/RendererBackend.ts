@@ -268,7 +268,7 @@ return {
   dispose(){for(const geometry of geometries.values())geometry.dispose();geometries.clear();},
 };
 }
-export async function createBackend(canvas:HTMLCanvasElement,caps:Capabilities,opts:Omit<BackendInitOptions,'forceWebGL'>,forceWebGLOverride?:boolean):Promise<RendererBackend> {
+export async function createBackend(canvas:HTMLCanvasElement,caps:Capabilities,opts:Omit<BackendInitOptions,'forceWebGL'>,forceWebGLOverride?:boolean):Promise<ThreeUnifiedBackend> {
   const backend=new ThreeUnifiedBackend(caps);await backend.init(canvas,{...opts,forceWebGL:forceWebGLOverride??caps.backend==='webgl2'});return backend;
 }
 export { DeviceLossPolicy } from './backend/DeviceLossPolicy';
