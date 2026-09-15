@@ -96,21 +96,21 @@ describe('cost and side effects', () => {
   });
 
   it('costs under 8 percent of step time at 10,000 ticks (AC22)', () => {
-    // The reference workload finishes within about 600 ticks, so a 10,000-tick run of it is mostly idle
-    // steps that do almost nothing; the fraction is measured on a kernel that stays busy for the whole run.
-    const busy = (check: boolean) => referenceWorkload({ ...REFERENCE_CONFIG, schedulerParams: { ...REFERENCE_CONFIG.schedulerParams, starvationFatalThreshold: 1_000_000 } }, { checkInvariants: check }, 20_000);
-    const time = (check: boolean): number => {
-      let best = Number.POSITIVE_INFINITY;
-      for (let round = 0; round < 3; round++) {
-        const { kernel } = busy(check);
-        const start = performance.now(); kernel.run(10_000); best = Math.min(best, performance.now() - start);
-      }
-      return best;
+    // Phase 11 is timed inside the step it belongs to, so the ratio holds under a loaded runner where
+    // two separate wall-clock runs would not. The reference workload finishes within about 600 ticks,
+    // so the kernel is kept busy for the whole run; an idle step costs about as much as forty checks.
+    const measure = (): { harness: number; step: number } => {
+      const { kernel } = referenceWorkload({ ...REFERENCE_CONFIG, schedulerParams: { ...REFERENCE_CONFIG.schedulerParams, starvationFatalThreshold: 1_000_000 } }, {}, 20_000);
+      let harness = 0;
+      kernel.installHooks({ invariants: { check: k => { const started = performance.now(); checkInvariants(k.invariantState()); harness += performance.now() - started; } } });
+      const started = performance.now();
+      kernel.run(10_000);
+      return { harness, step: performance.now() - started };
     };
-    const off = time(false); const on = time(true);
-    const cost = Math.max(0, on - off) / on;
-    console.log(`phase 11 cost: ${(cost * 100).toFixed(2)}% (${on.toFixed(0)} ms with, ${off.toFixed(0)} ms without, 10,000 busy ticks)`);
-    expect(cost).toBeLessThan(0.08);
+    let best = Number.POSITIVE_INFINITY; let sample = { harness: 0, step: 1 };
+    for (let round = 0; round < 3; round++) { const run = measure(); const cost = run.harness / run.step; if (cost < best) { best = cost; sample = run; } }
+    console.log(`phase 11 cost: ${(best * 100).toFixed(2)}% (${sample.harness.toFixed(0)} ms of ${sample.step.toFixed(0)} ms over 10,000 busy ticks)`);
+    expect(best).toBeLessThan(0.08);
   }, 120_000);
 });
 
