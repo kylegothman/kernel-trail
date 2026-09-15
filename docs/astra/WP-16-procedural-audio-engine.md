@@ -451,7 +451,7 @@ automation. Do not test against a real browser context.
 State:
 
 1. Pass or fail for each of the twenty-seven acceptance criteria, by number.
-2. The three verification command outcomes.
+2. The four verification command outcomes, including the contract guard.
 3. The complete list of `KernelEvent` variants you gave deliberate silence, with
    the reason for each, so a human can check the judgement.
 4. The measured buffer generation time on the main thread, so the boot cost is
@@ -461,3 +461,50 @@ State:
 6. The peak concurrent voice count under a 500-events-per-second burst at each
    tier, and how many voices were stolen.
 7. Every `// TODO(astra):` left in the tree, with file and line.
+
+## Scope correction 2026-09-15
+
+Written before WP-16 starts, after WP-12 merged (main carries WP-12's
+renderer, WP-10's file system and the docs through this commit). Where this
+section disagrees with the text above, this section wins.
+
+- **Verification is four gates.** `npm run check:contracts` precedes
+  typecheck, test and build. Three frozen files; twelve amendments; zero skip
+  budget; zero em dashes; the IP-term scan, with nothing under `src/` on the
+  allowlist. Baseline: 1370 passed, 0 skipped, 67 files (1229 if WP-10 has
+  not yet merged when you start; a green run is what matters).
+- **What WP-12 gives you.** `src/design/tokens.ts` is frozen and exports
+  `DUR`, `EASE`, `cubicBezier`, `PULSE`, `STARVING_PULSE_HZ`, `TICK_MS` and
+  the gain tables; `src/design/motion.ts` re-exports the motion tokens. Import
+  timing from `@design/motion`; never redefine a duration or a curve.
+  `src/platform/quality.ts` exports `PROFILES` per tier with the voice budget
+  field the package names; read it, do not copy it.
+- **WP-14 has not landed.** Register the audio consumer against a local
+  queue with the `FrameEventQueue` interface the package describes, in your
+  own `src/audio/events/`, and leave one `// TODO(astra): WP-14 supplies
+  FrameEventQueue; switch the import` marker at the registration site. Do
+  not create anything under `src/world/`.
+- **Node tests and the Web Audio boundary.** `npm test` runs under Node with
+  no `AudioContext`, and the skip budget is zero, so no test may skip for a
+  missing context. Everything that touches the platform API goes through
+  one adapter in `src/audio/context.ts`; the synthesis graph, envelopes,
+  filters, noise, tuning, the score, the load model, the voice budget, the
+  event-to-sound mapping and `generateBuffers(seed)` are pure and testable
+  in Node against a small in-repo fake of the adapter interface. Anything
+  that must run in a real browser goes in a `.gpu.ts`-style file under
+  `tests/render/gpu/` registered in `run.mjs` (the existing browser runner;
+  `harness.ts` untouched) and is run by Kyle with `npm run test:gpu` under
+  Node 22; propose the split in the pre-flight. No `standardized-audio-context`
+  unless the package's named-incompatibility condition is met and reported.
+- **Determinism.** `generateBuffers(seed)` and every score decision draw
+  only from an sfc32 stream you construct from the seed through the public
+  `createRng(seed, 'audio')` export of `src/kernel/index.ts`. That is the one
+  value import from the kernel this package may make (plus the `KernelEvent`
+  type); `src/kernel/rngStreams.ts` is kernel territory and is not edited.
+  Same seed, same buffers, asserted byte for byte in Node.
+- **Shared files.** `vitest.config.ts` may gain the `tests/audio` alias if
+  needed. `package.json` does not change. `src/audio/` and `tests/audio/`
+  are yours alone; everything else is off limits, including `src/design/`,
+  `src/platform/`, `src/render/`, `src/world/`, `src/kernel/` (beyond the
+  `createRng` and `KernelEvent` type imports), `src/ui/`, `src/terminal/`.
+

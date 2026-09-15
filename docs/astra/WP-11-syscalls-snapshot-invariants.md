@@ -836,7 +836,7 @@ report the wall time.
 State:
 
 1. Pass or fail for each of the thirty acceptance criteria, by number.
-2. The three verification command outcomes.
+2. The four verification command outcomes, including the contract guard.
 3. The complete list of side tables you carried into `KernelSnapshot`, with the
    `subsystems` slot each went into and, for the envelopes, the `owner` and
    `version` you recorded.
@@ -890,4 +890,108 @@ your process contribution or the test cannot pass: the ThreadManager side table
 of `overheadRemaining` and `pricedCores` per PID, from the creation-debt Amdahl
 model. The process schema also omits raw burst, TCB remaining work and the round
 robin TID cursor; your process amendment has to add them.
+
+## Scope correction 2026-09-15: the state of the kernel WP-11 inherits
+
+Written before WP-11 starts, after WP-10 merged. Every kernel package (WP-01
+through WP-10) has landed; WP-12 and WP-13 are game-layer work that shares no
+kernel file. The sections above were written while most of that was still
+future; where this section disagrees with them, this section wins.
+
+- **Verification is four gates.** `npm run check:contracts` precedes
+  typecheck, test and build. Three files are frozen (`src/kernel/types.ts`,
+  `src/game/types.ts`, `src/design/tokens.ts`); twelve amendments exist
+  (thirteen once WP-13 freezes its focus contract). The guard enforces a zero
+  skip budget, zero em dashes and the IP-term scan. Baseline after the WP-10
+  merge: 1370 passed, 0 skipped, 67 files, in about 100 to 160 seconds. The
+  suite has doubled twice in three packages; keep new tests lean and do not
+  raise the global 20 s `testTimeout`.
+- **Every slot is typed.** All ten `SubsystemSnapshots` slots are now typed
+  states (process from amendment 1, memory and vm from 4 and 5, scheduler 6,
+  sync 7, deadlock 8, storage and io 9, fs and security 11). "Envelope" in the
+  text above is historical. Every subsystem already registers its contribution
+  through `installHooks({ snapshots })` with `saveState` and a `restoreState`
+  that returns a commit closure; `KernelImpl.snapshot()` and `restore()`
+  dispatch over them and still carry WP-02's init-only guard. Your job is the
+  process channel and the completeness check, and removing that guard with a
+  corrected message. If `ProcessSnapshotState` needs fields (it does: see
+  below), that is your amendment, provisional number 14; the procedure is in
+  `docs/07-CONTRACT-AMENDMENTS.md` and every recent amendment record shows the
+  form. Prove the payload extends `JsonValue` with a standalone strict check
+  and embed type literals, never frozen interfaces, before sending the patch.
+- **Process channel requirements gathered from every package:**
+  - WP-04: ThreadManager's `overheadRemaining` and `pricedCores` per pid
+    (creation-debt Amdahl), raw burst, TCB remaining work, the round-robin
+    TID cursor. The mid-run MLFQ fresh-kernel restore is your acceptance.
+  - WP-07: the program decoder must handle the `sync` `Instruction` variant
+    (`{ kind: 'sync'; operation: SyncInstruction }`, operand shapes in
+    `src/kernel/sync/SyncSubsystem.ts`); restore must recreate a distinct
+    `BlockReason` object per TCB even when values match, because readiness
+    routes waits by object identity; the private readiness helper matches
+    `thread.blockedOn` by identity. Sync's `originalWait` host callback
+    reaches into `memorySubsystem.pager.control.suspendedRecords`; give that a
+    proper accessor while you are in the restore path. The scheduler aging
+    hook is wrapped by sync at construction; a later `installHooks({
+    scheduler })` must go through that wrap or priority inheritance across
+    aging is lost.
+  - WP-08: granted request vectors with non-null `grantedAt` are already
+    allocated and must not be allocated again on restore; checkpoints are
+    `{ pid, tid, tick, programCounter }`; I-26 is validated against the
+    captured `lastDetection` evidence, never the post-recovery live graph.
+  - WP-09: I/O requests are owned by `(pid, tid, requestId)`; `Device.queue`
+    projects whole-process waiters only; the storage-backed paging adapter
+    is opt-in through `attachPagingStorage()` and never installed by
+    enabling `storage`; `chargeKernelDebt` adds to `switchDebt` and the I/O
+    portion is persisted in the io slot with `0 <= ioDebt <= switchDebt`.
+  - WP-10: FS process rows (cwd, descriptor membership, CLOEXEC) and pending
+    file operations are in the fs payload and need PCB `openFiles` and thread
+    identity restored by your channel; probe programs are re-registered by
+    name from the security payload on commit; `kernelSecret` is rebuilt from
+    the source snapshot's seed and never serialised.
+- **The syscall table you inherit.** The dispatcher in `Kernel.ts` now has
+  branches for getpid, fork, exec, exit, wait, kill, ioctl, sync, sem_wait,
+  sem_post, mutex_lock, mutex_unlock, request, release, nice, and the file
+  calls open, close, read, write, seek, stat, unlink, mkdir, chmod, each
+  behind a `// TODO(astra): WP-11 validates ...` marker with a local shape
+  check. You replace the local checks with `validate.ts` against `table.ts`
+  and keep every existing assertion, in particular SEC-ARG-1's exact
+  `"address out of range: "` prefix, which is currently produced by
+  `SecuritySubsystem.validateByteCount` (marked for you). The file ABI as
+  implemented: `open(path, mode)`, count-based `read` and `write`,
+  `seek(fd, offset, whence)`, `stat` returning canonical JSON text, scalar or
+  null elsewhere. `ioctl` keeps the `(device, command, ...args)` shape with
+  the kernel pseudo-device; the commands in play are `kernel/tlb_flush`
+  (WP-05), the disk0, nvm0, tty0 and net0 driver controls (WP-09), and
+  `kernel/set_ring`, `kernel/domain_switch`, `kernel/capability_access`,
+  `disk0/write_region`, `disk0/crash` (WP-10) through
+  `IoSubsystem.registerControl`. The device is `tty0`; the literal `console`
+  is rejected by the source scanner.
+- **The invariant harness you inherit.** Every subsystem composes its checks
+  onto the constructor invariant wrapper (WP-08, WP-09, WP-10 all wrap
+  `this.invariants`). Phase 11 calls the wrapper. Your `invariants.ts` folds
+  them into the numbered harness without changing phase 11's body. Exceptions
+  already decided and documented: the two memory exceptions above, the twelve
+  WP-06 rows, WP-07's nine (I-10 per TCB, VM suspension reasons, hand-off
+  reservations, Mesa and Hoare states, barrier generations, counting
+  semaphores and I-23 scoped to exclusive actors), WP-08's scoped I-24 and
+  captured I-26, WP-09's I-27, I-28, I-32, I-33, WP-10's I-29 to I-31 on the
+  50-tick slow interval and I-34 to I-37. `corruption.test.ts` expects a
+  C-only crash to trip I-29 at the next 50-tick boundary; keep that.
+- **A performance fix you should make.** `src/kernel/storage/DiskQueue.ts`
+  `transfer` copies every stored sector on every transfer (quadratic). It
+  forced WP-10's journal-cost fixture onto a fixture-local media and
+  dominates two 30 s tests. Replace the copy with a map keyed by LBA, same
+  semantics, WP-09's tests untouched; it is granted here because you are the
+  last kernel package and the sweep depends on suite time.
+- **Non-null assertions.** `src/kernel/fs` and `src/kernel/security` carry
+  about ninety `!` assertions and `storage` nineteen. The briefing discourages
+  them and nothing enforces it. Do not spend WP-11 on it; note the count in
+  the report so a cleanup package can be scheduled.
+- **D2.** `tests/kernel/determinism.test.ts` has the D2 snapshot-restore test
+  live (the skip budget has been zero since WP-02); the "un-skip D2" line in
+  the grant above is stale. D2 must stay green through your restore work and
+  extend to a workload kernel.
+- **Ending state.** `src/kernel` currently has fourteen `// TODO(astra):`
+  markers outside `types.ts`; every one of them is yours. This package ends
+  with zero.
 
