@@ -44,7 +44,7 @@ Files that must already exist:
 - `02-KERNEL-SIM-SPEC.md` section 16.11 (file system fixtures) and 16.12
   (protection and security fixtures)
 - `02-KERNEL-SIM-SPEC.md` section 15, the "Storage, I/O and file system" and
-  "Security" invariant groups, especially I-22 and I-29
+  "Security" invariant groups, especially I-36 and I-29
 
 ## Files you will create
 
@@ -432,8 +432,13 @@ interface RingState {
    gate; entry lands at a fixed handler and never at a caller-supplied address.
 3. The only way outward is a return from a trap, which pops `stack` and can only
    restore a ring numerically greater than or equal to the saved one.
-4. A call from ring `r` to a gate declared for ring `g` is permitted only when
-   `r >= g`. Calling outward is permitted; calling inward without a gate is not.
+4. A gate's declared ring `g` is a caller ceiling: a call from ring `r` is
+   permitted only when `r <= g` (a lower number is more privileged, so ring 0
+   may use a gate declared for ring 3 and ring 3 may not use one declared for
+   ring 1). The routine's own target ring is separate from the ceiling; the
+   syscall gate has ceiling 3 and targets ring 0. Calling inward without a
+   gate is never permitted. (Corrected 2026-09-15: the earlier `r >= g` had
+   the inequality backwards.)
 5. Data access follows the same rule: a process in ring `r` may read or write a
    page whose required ring is `g` only when `r <= g`. A violation emits
    `security.access_denied` and terminates with
@@ -479,7 +484,7 @@ real property, so structure the code so it cannot leak.
 
 Default is `accessModel: 'acl'`, because revocation matters for Leg 12.
 Switching `accessModel` rebuilds the other representation from the matrix, and
-invariant I-22 asserts both representations agree after the rebuild.
+invariant I-36 asserts both representations agree after the rebuild.
 
 ### 9. `src/kernel/security/domains.ts` and `rbac.ts`
 
@@ -615,7 +620,11 @@ field you leave out.
 5. Fixture `FS-BITMAP-1` passes: 6400 blocks of 4096 bytes gives a bitmap of
    **200 `Uint32` words, 800 bytes**.
 6. Fixture `FS-ALLOC-1` passes: a 64-block file with 20 random reads costs
-   contiguous 20 reads, linked **650** reads, indexed 40 reads, extent 20 reads.
+   contiguous 20 reads, indexed 40 reads, extent 20 reads, and linked
+   `sum(index + 1)` reads over the 20 pinned block indices drawn from
+   `root/fs` (the first untouched draws are
+   `[46,13,13,2,25,49,42,51,16,44,49,56,33,52,25,16,60,22,50,15]`, sum 679,
+   so 699 reads). The earlier 650 was an expectation, not a measurement.
 7. Fixture `FS-ALLOC-2` passes: sequential read costs contiguous 64 reads and 1
    seek, indexed 65 reads, extent 64 reads and `e` seeks.
 8. Fixture `FS-ALLOC-3` passes: appending to a contiguous file whose next block
@@ -707,7 +716,7 @@ field you leave out.
 
 | Fixture | Assertion |
 |---|---|
-| `FS-ALLOC-1` | per acceptance criterion 6, with the 20 random block indices pinned in the fixture so 650 is reproducible |
+| `FS-ALLOC-1` | per acceptance criterion 6, with the 20 random block indices pinned in the fixture and the linked count derived from them |
 | `FS-ALLOC-2` | per acceptance criterion 7 |
 | `FS-ALLOC-3` | per acceptance criterion 8 |
 | `linked random cost` | reading block `i` of a linked file costs exactly `i + 1` reads, asserted for i = 0, 1, 63, 999 |
@@ -785,7 +794,7 @@ field you leave out.
 | `denied emits` | a failed check emits exactly one `security.access_denied` with the right and object |
 | `sparse` | the matrix is never materialised as a 2D array; verified by asserting memory does not grow with the object count |
 | `SEC-ACL-CAP-1` | per acceptance criterion 21 |
-| `I-22` | after switching `accessModel`, both representations agree for every domain and object |
+| `I-36` | after switching `accessModel`, both representations agree for every domain and object |
 | `revocation` | clearing an ACL column revokes access from every domain; the equivalent capability operation requires touching every domain |
 
 ### `tests/kernel/security/capabilities.test.ts`
@@ -836,7 +845,7 @@ field you leave out.
 
 State:
 
-1. Pass or fail for each of the twenty-seven acceptance criteria, by number.
+1. Pass or fail for each of the twenty-eight acceptance criteria, by number.
 2. The four verification command outcomes, including the contract guard.
 3. The 20 block indices you pinned for `FS-ALLOC-1`, and confirmation that the
    linked-method cost came out at exactly 650.
@@ -900,9 +909,11 @@ above, this section wins.
 - **Storage addresses.** The block device speaks 512-byte sector LBAs
   (`BlockId`); the file system's 4096-byte block `b` is sectors `8b` to
   `8b+7`. `src/kernel/storage/geometry.ts` maps sectors to cylinders; the
-  package's `FS-ALLOC-1` seek-cost fixture must be computed through that
-  conversion, and the pinned 650 must be re-derived and reported, not
-  assumed.
+  package's `FS-ALLOC-2` seek counts are computed through that conversion
+  (block `b` is cylinder `floor(b / 32)`, so an aligned 64-block run spans
+  two cylinders), and `FS-ALLOC-1`'s linked count is derived from the pinned
+  draws, not assumed. Logical run-start costs and physical head movement are
+  reported separately.
 - **`kernelSecret`** lives in the security subsystem's private state, is
   excluded from `saveState`, never appears in an event payload, and the
   terminal (WP-15) has no accessor for it. State the measure in the report.
@@ -927,4 +938,141 @@ results, `setDiskPolicy`), `blockCache.dirtyEntries()` and `dropDirty()` for
 the crash simulator, `DeviceDriver.control` for `ioctl` commands, and the
 `tty0` character device (renamed from `console`, which the source scanner
 rejects as a literal under `src/kernel`).
+
+## Pre-flight decisions 2026-09-15
+
+The WP-10 agent's pre-flight (the WP-09 agent, continuing) mapped all
+twenty-eight acceptance criteria, requested twelve grants and proposed
+seventeen decision groups. The code sites, the linked-read arithmetic (sum of
+the pinned draws plus one per read), the journal sector totals and the gate
+inequality were checked before this section was written. All are approved
+as below. The S17 corrections were applied in the same commit, along with
+the gate rule in spec 13 and the FS-ALLOC-1, FS-JOURNAL-COST and
+SEC-ESCALATION-1 rows in 16.
+
+### Grants G1 to G12, approved
+
+- **G1.** Seven additive tuning keys in `config.ts` with the listed defaults
+  and validation; no `KernelConfig` change.
+- **G2, G3, G10.** Additive edits to `src/kernel/io/IoSubsystem.ts` now that
+  WP-09 has merged: runtime control registration and dispatch including the
+  `kernel` pseudo-device (G2); one whole-I/O crash-abort helper that clears
+  device queues and unfinished work, keeps completed media bytes and leaves
+  failed or wakeable continuations consistent, built on existing storage
+  controls (G3); optional submission, removal and a narrowly scoped
+  completion callback for security-owned requester metadata (G10). Every
+  WP-09 test stays untouched and green; the ioctl branch at Kernel.ts
+  610-617 does not change.
+- **G4.** Wrap the syscall dispatch (573-579) in an enabled-security trap
+  entry and return with try/finally, preserving results, events and the
+  original caller identity.
+- **G5.** Inode-backed exec with a setuid transition committed only after
+  successful authorized execution, composed at the existing program and
+  lifecycle callbacks (318-326, 586-591); registered-program exec keeps
+  working; no lifecycle source edit.
+- **G6.** Fork composition for cwd and security inheritance (327-331) and
+  the shared-map and unmap callbacks (around 348) for backing protection and
+  successful-use accounting.
+- **G7.** One page-ring guard in the `access` instruction case (1017-1027)
+  before any COW, fault or allocation effect; protection metadata stays in
+  security side tables.
+- **G8.** `FsHooks` gains pending-operation completion and readiness
+  members; FS-owned waits are recognised in the readiness helper (924)
+  ahead of the io delegation, using the existing `io` block reason; the
+  `syscall` instruction case (1039-1041) gains continuation with
+  `threads.deferServiceCharge()`.
+- **G9.** FS and security invariant checks composed at the existing wrapper
+  (482-485); I-29 on the existing 50-tick slow interval.
+- **G11.** The frameTable fixture migrates to a typed `fs` payload and its
+  local configuration excludes `fs`, so the dummy producer does not collide
+  with the built-in one; every assertion, seed and run call unchanged.
+  `REFERENCE_CONFIG` unchanged.
+- **G12.** One optional denial callback in `src/kernel/process/ipc.ts` at
+  its existing denial branch, so exactly one correctly attributed
+  `security.access_denied` is emitted with the operation that failed.
+
+### Decisions S1 to S17, approved
+
+- **S1.** The linked count is derived from the pinned `root/fs` draws
+  (699 for the reference indices), not 650; FS block `b` is sectors
+  `8b..8b+7`, cylinder `floor(b / 32)`; logical run-start costs and physical
+  head movement are reported separately.
+- **S2.** Expanded block ownership stays in the frozen `Inode.blocks`;
+  extent, index, FAT and link metadata live in side tables. Sixty-four
+  linked blocks hold 260,096 useful bytes. Relocation `n + n` excludes the
+  appended block; a linked append also writes the old tail's pointer.
+- **S3.** Reserved layout as proposed (blocks 0-5 metadata, journal control
+  at 5375, payload images 5376-6399, FAT reserves 50 more); custom geometry
+  scales and rejects impossible layouts; oversized transactions fail
+  atomically; extent and counting free-space methods accepted, contiguous
+  and linked-list rejected; enabling an unused FS issues no I/O.
+- **S4.** Virtual dot and dotdot, directory link count `2 + childDirectories`,
+  navigation links excluded from cycle checks; dentry cache keyed by cwd
+  with permission rechecks on hit; empty path, repeated separators,
+  trailing slash and relative symlinks defined explicitly and tested.
+- **S5.** The bitmap is journaled in metadata mode and rebuilt only as
+  verification; "after commit" means after the second barrier completes;
+  transactions and checkpoints serialise; home acknowledgements precede
+  reclamation; durable state and recovery events are distinct.
+- **S6.** The journal-cost fixture is one transaction of 900 data and 100
+  metadata home blocks with compact descriptors, commit and checkpoint
+  counted: 8000 / 8803 / 16003 sectors, to be confirmed by measurement and
+  pinned; the 16.9 row now says "about" and counts every control write.
+- **S7.** Crash fixtures select independent durable-write subsets rather
+  than pretending B-only or C-only are prefixes; freed ids are reused on
+  purpose to show aliasing; diagnostics-enabled and gameplay-delay fixtures
+  are separate; ORRERY reconstruction needs intact retained images and
+  fails honestly without them.
+- **S8.** The file ABI as proposed in the report: `open(path, mode)`,
+  count-based `read` and `write`, `seek(fd, offset, whence)`, canonical JSON
+  text from `stat`, scalar or null elsewhere; global descriptor handles
+  with offsets shared across fork; per-process membership, CLOEXEC, cwd,
+  pending operations and sparse mappings persisted; retries never duplicate
+  writes or events. WP-11 reviews the signatures when it takes the table.
+- **S9.** The gate ring is a caller ceiling, `r <= g`; spec 13 and the
+  package are corrected.
+- **S10.** Control routes keep the `(device, command, ...args)` ioctl shape:
+  `kernel/domain_switch`, rejected `kernel/set_ring`, `disk0/crash`, plus
+  `kernel/capability_access` and `disk0/write_region` as the report
+  defines them; no new driver or Program variant.
+- **S11.** Setuid's secure default is expressed through effective
+  permissions and ACLs and enforced on write-open; an explicit erroneous
+  grant is what makes the failure fixture possible; the target domain is
+  committed only after a successful authorized exec.
+- **S12.** Five blocked attack decisions; legitimate transitions keep their
+  events and are not counted; "no state change" means no functional
+  mutation; the exact `"address out of range: "` prefix and the WP-11
+  validator marker stay.
+- **S13.** Original authority persists in security-owned request metadata;
+  pre-trap identity is captured and survives delayed completion; the legacy
+  PCB domain `kernel` is canonicalised for lookup without rewriting PCBs.
+- **S14.** Canonical six-right ordering, owner expansion, active membership
+  with seal validation, security-owned transferability; copy needs held
+  authority and trusted resealing; revocation invalidates; inspection is not
+  use; sparse tests inspect stored rows, not timing.
+- **S15.** Role eligibility constrains switch targets that still require
+  control; admin covers ring-3 user domains; driver stays isolated; excess
+  is current effective pairs minus historically used pairs, never negative;
+  the `ScoreBreakdown.correctness` comparison is the game layer's.
+- **S16.** Amendment 10 carries both complete plain-data continuations
+  (domains as well as rings, FS pending operations, cross-owner ids).
+  `kernelSecret` has no accessor and no serialization path; restore
+  reconstructs it from the source snapshot's seed without advancing the
+  live RNG and validates saved seals. Protected cross-seed and init-only
+  restore behaviour preserved. Fresh-kernel workload restore stays WP-11's.
+- **S17.** Applied: I-36 for the ACL and capability equality at all three
+  package sites and in spec 13; twenty-eight criteria; the snapshot tail
+  supersedes the earlier text; "exec event" means `syscall.invoked` named
+  exec; the stale storage method names in the merge-surface section are
+  read against the code; the scope correction no longer calls 650 a seek
+  cost.
+
+### Not granted
+
+- No new production module or test file beyond the package's lists.
+- No edit to any phase body, scheduler, sync, memory replacement, threads,
+  lifecycle, transitions, metrics or the invariants module.
+- No `KernelConfig`, PCB, TCB, Frame, `Inode` or other frozen change outside
+  the approved amendment commit.
+- No accessor for `kernelSecret`, and no serialization of it anywhere.
 

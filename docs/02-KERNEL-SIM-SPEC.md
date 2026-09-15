@@ -4664,9 +4664,13 @@ interface RingState {
    handler and never at a caller-supplied address.
 3. **The only way outward is a return from a trap**, which pops `stack` and can
    only restore a ring numerically greater than or equal to the saved one.
-4. **A call from ring `r` to a gate declared for ring `g` is permitted only when
-   `r >= g`.** Calling outward (a ring 0 handler calling a ring 3 routine) is
-   permitted; calling inward without a gate is not.
+4. **A gate's declared ring `g` is a caller ceiling: a call from ring `r` is
+   permitted only when `r <= g`.** A lower number is more privileged, so ring 0
+   may use any gate and ring 3 may use only gates declared for ring 3; the
+   syscall gate has ceiling 3 and targets ring 0. Calling outward (a ring 0
+   handler calling a ring 3 routine) is permitted; calling inward without a
+   gate is never permitted. (Corrected 2026-09-15: the earlier `r >= g` had the
+   inequality backwards, which would have refused the syscall gate to ring 3.)
 5. Data access follows the same rule: a process in ring `r` may read or write a
    page whose required ring is `g` only when `r <= g`. A violation emits
    `security.access_denied` and terminates the process with
@@ -4760,7 +4764,7 @@ cryptography.
 The sim uses ACL as the default (`accessModel: 'acl'`) because revocation
 matters for the Leg 12 scenario, and offers `'capability'` so the player can
 discover that revocation is the hard part. `ConfigChange` of `accessModel`
-rebuilds the other representation from the matrix, and invariant I-22 asserts
+rebuilds the other representation from the matrix, and invariant I-36 asserts
 that both representations agree after the rebuild.
 
 ### 13.4 Domain switching (Ch. 17.4.1)
@@ -5816,7 +5820,7 @@ Queue `98, 183, 37, 122, 14, 124, 65, 67`, head 53, 200 cylinders.
 |---|---|---|
 | `FS-INODE-1` | 12 direct, 3 indirect levels, blockSize 4096, pointerSize 32 | max file size 8,657,616,896 bytes; reads to reach offsets 0 / 100,000 / 1,000,000 are 1 / 2 / 3 |
 | `FS-BITMAP-1` | 6400 blocks of 4096 bytes | bitmap is 200 `Uint32` words, 800 bytes |
-| `FS-ALLOC-1` | 64-block file, 20 random reads | contiguous 20 reads, linked 650 reads, indexed 40 reads, extent 20 reads |
+| `FS-ALLOC-1` | 64-block file, 20 random reads at the pinned `root/fs` indices | contiguous 20 reads, linked `sum(index + 1)` = 699 reads for the pinned draws, indexed 40 reads, extent 20 reads |
 | `FS-ALLOC-2` | 64-block file, sequential read | contiguous 64 reads and 1 seek; indexed 65 reads; extent 64 reads and `e` seeks |
 | `FS-ALLOC-3` | contiguous file, append with the next block occupied | the whole file relocates: `n` reads and `n` writes |
 | `FS-PATH-1` | resolve `/a/b/c/d/e` | 5 directory reads; `execute` checked on each of `/`, `a`, `b`, `c`, `d` |
@@ -5827,7 +5831,7 @@ Queue `98, 183, 37, 122, 14, 124, 65, 67`, head 53, 200 cylinders.
 | `FS-CORRUPT-2` | no journal, crash after A and B | `fs.corruption { recoverable: true }`, leaked blocks |
 | `FS-CORRUPT-3` | no journal, crash after B only | `fs.corruption { recoverable: false }`, dangling entry |
 | `FS-CORRUPT-4` | no journal, crash after C only | `fs.corruption { recoverable: false }`, double allocation; invariant I-29 fires on the next slow check |
-| `FS-JOURNAL-COST` | 1000 writes, mode `off` / `metadata` / `full` | physical write counts in ratio 1.0 : ~1.1 : 2.0 |
+| `FS-JOURNAL-COST` | one transaction of 900 data and 100 metadata home blocks, mode `off` / `metadata` / `full`, every control write counted | physical sector writes 8000 / 8803 / 16003, ratios 1.0 : about 1.1 : about 2.0 |
 
 ### 16.12 Protection and security (Ch. 16 and 17)
 
@@ -5839,7 +5843,7 @@ Queue `98, 183, 37, 122, 14, 124, 65, 67`, head 53, 200 cylinders.
 | `SEC-SETUID-1` | `open` for writing on an inode carrying `switchesToDomain` | `EACCES` |
 | `SEC-SETUID-2` | the same inode mis-permissioned by the leg | the open succeeds and the escalation succeeds; `blocked: false`; this is the failure fixture |
 | `SEC-CAP-1` | forged `Capability` with an incorrect seal | `EPERM`; `kernelSecret` appears nowhere in the serialised event log of the whole run |
-| `SEC-ESCALATION-1` | the full probe, default configuration, 5000 ticks | exactly five `security.escalation_attempt` events, all `blocked: true`; the probe ends with `terminationReason: 'protection_fault'` |
+| `SEC-ESCALATION-1` | the full probe, default configuration, 5000 ticks | exactly five blocked attack decisions, each a `security.escalation_attempt` with `blocked: true`; legitimate gate transitions may emit their own events and are not counted; the probe ends with `terminationReason: 'protection_fault'` |
 | `SEC-ACL-CAP-1` | the same matrix under `'acl'` and `'capability'` | every `checkAccess` query returns the same answer under both |
 | `SEC-LEASTPRIV-1` | a run with every worker in `domain:kernel` vs correctly scoped domains | privilege excess is strictly larger in the first; `ScoreBreakdown.correctness` is strictly lower |
 
