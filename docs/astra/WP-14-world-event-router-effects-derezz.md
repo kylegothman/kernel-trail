@@ -2,7 +2,7 @@
 
 ## Objective
 
-When this package is done every one of the 48 `KernelEvent` variants has a visual
+When this package is done every one of the 45 `KernelEvent` variants has a visual
 treatment, routed through one exhaustive switch that fails to compile if a variant
 is added without a case. Events are batched and coalesced per frame so five
 hundred page faults in one tick read as one surge rather than five hundred
@@ -107,7 +107,7 @@ implements:
  * variant produces a compile error until it is given a visual treatment. That is
  * deliberate.
  */
-export type KernelEvent = /* 48 variants */;
+export type KernelEvent = /* 45 variants */;
 
 export type KernelEventType = KernelEvent['type'];
 export type KernelEventOf<T extends KernelEventType> = Extract<KernelEvent, { type: T }>;
@@ -411,7 +411,7 @@ them; do not paraphrase.
    `// @ts-expect-error` fixture in the test file that omits one case.
 6. Every row of visual bible Appendix A has a corresponding domain handler that
    produces at least one observable change: an `EffectSpawn`, an instance write,
-   or a post-chain call. Asserted row by row, 48 cases.
+   or a post-chain call. Asserted row by row, 45 cases.
 7. Handlers never throw: a domain method injected to throw disables that consumer
    for the leg and the frame still completes.
 8. Routing 500 `memory.access` events costs under 0.4 ms, measured in the test.
@@ -651,4 +651,26 @@ above, this section wins.
   `src/world/structures/base`, `tests/kernel`, `tests/design`,
   `tests/render/gpu/harness.ts`. A WP-12 or WP-13 bug that blocks an
   acceptance criterion is reported with the line and waits for a grant.
+
+## Pre-flight decisions 2026-09-15
+
+The WP-14 agent's pre-flight (the WP-13 agent, continuing) confirmed the
+router's forty-five cases match the frozen union one for one, mapped every
+acceptance criterion, and raised one grant ambiguity. Rulings:
+
+- **GPU runner registration, granted.** Additive registration of the WP-14
+  fixtures in `tests/render/gpu/run.mjs` (one block, the way WP-13
+  registered its focus and overlap probes); `harness.ts` untouched. The
+  package's "Files you may modify" predates the runner and the scope
+  correction's grant stands.
+- **EffectPool.** `src/world/EffectPool.ts` keeps its path and is rewritten
+  in place into the WP-14 pool (`EffectSpawn`, `LiveEffect`, kinds, the
+  three overflow policies, follow anchors, monotonic ids); the WP-13
+  scaffold's generic shape has no consumer on main, so nothing migrates.
+- **Variant count.** Forty-five, corrected in this commit (3 places).
+- **Router TODO wording.** `PostChain.updatePanic` in the scaffold's comment
+  is stale; the shipped API is `postChain.panic(message)` with
+  `materialPanic` for the shader clock, as the scope correction says.
+- Everything else in the pre-flight is granted as the package and scope
+  correction already state.
 

@@ -95,7 +95,7 @@ for no user-visible benefit.
 From `src/kernel/types.ts`, the input to the audio consumer. It may not be edited:
 
 ```ts
-export type KernelEvent = /* 48 variants */;
+export type KernelEvent = /* 45 variants; the frozen union is authoritative */;
 export type KernelEventType = KernelEvent['type'];
 export type KernelEventOf<T extends KernelEventType> = Extract<KernelEvent, { type: T }>;
 ```
@@ -232,7 +232,7 @@ audio in the game.
 
 ### 6. `src/audio/events/`
 
-`AudioConsumer` implements `EventConsumer` and maps each of the 48 `KernelEvent`
+`AudioConsumer` implements `EventConsumer` and maps each of the 45 `KernelEvent`
 variants to a sound or to deliberate silence. Structure it as an exhaustive switch
 with `assertNever`, the same shape WP-14 uses, so a new variant is a compile
 error here too.
@@ -322,8 +322,9 @@ produces no state divergence.
    only. Asserted by a boundary test.
 7. The `AudioConsumer` switch is exhaustive over `KernelEvent['type']` with an
    `assertNever` default, and deleting a case is a compile error.
-8. Every one of the 48 variants has either a sound or a commented deliberate
-   silence. Asserted variant by variant, 48 cases.
+8. Every one of the 45 variants has either a sound or a commented deliberate
+   silence. Asserted variant by variant, 45 cases, with the exhaustive switch
+   proving the count against the frozen union.
 9. The audio context is never constructed at module load. Verified by importing
    the module in a test with no gesture and asserting the context count is zero.
 10. A failing `AudioContext` construction sets `state` to `'failed'` and every
@@ -507,4 +508,76 @@ section disagrees with the text above, this section wins.
   are yours alone; everything else is off limits, including `src/design/`,
   `src/platform/`, `src/render/`, `src/world/`, `src/kernel/` (beyond the
   `createRng` and `KernelEvent` type imports), `src/ui/`, `src/terminal/`.
+
+## Pre-flight decisions 2026-09-15
+
+The WP-16 agent's pre-flight mapped all twenty-seven acceptance criteria and
+the package's numbered sections against main, audited the DOM typings for
+every Web Audio interface it names, and raised twelve findings. The claims
+were checked (no `DUR.settle`, no voice field in `PROFILES`, forty-five
+variants in the frozen union, no root pitch on the frozen `Leg`, platform
+type-only for audio in the architecture matrix). Rulings follow; the
+variant count in the package text was corrected in this commit.
+
+- **C1, approved.** Layer gains ramp over `DUR.travel` with the `EASE.settle`
+  curve; cite both. No tokens amendment for a duration that already has a
+  usable pair.
+- **C2, approved.** `src/audio/VoiceBudget.ts` declares the 16/32/64 table
+  keyed by `import type { QualityTier }`, with the comment. Platform stays
+  type-only for audio, as the matrix says; the scope correction's "read the
+  field from quality.ts" was wrong and this ruling supersedes it.
+- **C3, corrected.** Forty-five variants; the package text now says so.
+- **C4, approved.** `src/audio/synth/constants.ts` holds the audio-only
+  numbers (400 ms duck, 1.2 s restore, 600 ms deadlock hold, the dirty-evict
+  extension, limiter attack 0.003, impulse lengths, pan clamp 0.7) as named
+  constants each commented with its package line; every shared motion beat
+  (`PANIC_POST.floodMs`, `DENIED_FLASH_MS`, `CORRUPTION.rampInMs`,
+  `FOCUS_DURATION_MS`, `DUR`, `PULSE`) comes from the tokens. The "no
+  duration outside the tokens" rule is read as "no shared beat outside the
+  tokens"; a synthesis constant that only audio uses lives with audio.
+- **C5, approved.** The boundary test allows exactly `createRng` from
+  `@kernel/index` as a value import and nothing else from kernel or game.
+- **C6, approved.** Local `src/audio/events/FrameEventQueue.ts` copying
+  architecture 3.4's shape and `COALESCE` table, with the marked switch-over.
+  WP-14 is defining the real one now; when it lands, the switch is a
+  one-import change and the coalescing behaviour must match, which the
+  shared table guarantees.
+- **C7 and D1, approved.** Sources start once at warm-up and run
+  continuously, gated by gain; `stop(when)` closes the envelope and parks the
+  voice with its nodes connected; `dispose()` disconnects and releases. The
+  release test asserts pool-baseline live count after 1,000 start and stop
+  cycles and zero after dispose. Measure the always-running pool's
+  audio-thread cost in the browser probe and report it at all three tiers;
+  if high tier's 64 always-running voices cost more than 2 ms of audio-thread
+  time per render quantum on the M3, say so rather than hide it.
+- **C8, approved.** `AudioEngine.setConvoyPids(pids)`, empty by default,
+  marked for WP-19.
+- **C9, approved.** `AudioEngine.setRoot(midi)` with a documented default;
+  WP-19 or a leg calls it. No `Leg` change.
+- **C10, approved.** CPU utilisation and context-switch rate derived from
+  `context.switch` and event ticks; `faultRate` from coalesced `faultCount`
+  through the WP-06 integer EWMA (`acc - (acc >> 3) + faults`, rate
+  `acc * 1000 / 8`), mirrored exactly; `setThresholds({ thrashingThreshold })`
+  fed by the loop from `KernelConfig`.
+- **C11, approved.** Injectable `PositionSource` with a centred default,
+  marked for WP-14.
+- **C12, approved.** A fifth volume, `alerts`.
+- **I1, approved.** Audio never subscribes to DOM events; `unlock()` is
+  called by the HUD or app from its own gesture handler; dropped events are
+  counted until then.
+- **Test split, approved** as proposed: the five Node files against
+  `tests/audio/fakeContext.ts`; one `audio.html` plus `audio.gpu.ts` under
+  `tests/render/gpu/` registered with one block in `run.mjs`, gesture by
+  `page.click`, the two-second render, `generateBuffers` timing on the main
+  thread and in a module Worker declared inside the probe, and the
+  always-running pool cost.
+- **AC20 note.** `'interrupted'` maps to `'suspended'` at the adapter, as
+  proposed.
+
+### Not granted
+
+- No tokens amendment, no `PROFILES` field, no `Leg` field, no dependency.
+- No DOM subscription anywhere under `src/audio/`.
+- Nothing outside `src/audio/`, `tests/audio/`, the one `run.mjs` block and
+  the two probe files.
 
