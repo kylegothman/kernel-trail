@@ -122,6 +122,65 @@ try {
       console.error(formatPageDiagnostics(diagnostics));failures.push(`${path}: ${error.stack||String(error)}`);
     } finally {await page.close();}
   }
+  // WP-16 audio probe. One page, a real click for the autoplay gesture, then
+  // the assertions the package sends to the browser: no context before the
+  // gesture, running after it, a two-second run with no page error, buffer
+  // timing on both threads, and the always-running pool's cost per quantum.
+  {
+    const audioPage = await browser.newPage({ viewport: { width: 800, height: 600 } });
+    const audioDiagnostics = capturePageDiagnostics(audioPage);
+    try {
+      console.log('Starting audio probe; waiting for readiness');
+      await audioPage.goto(`http://127.0.0.1:${address.port}/tests/render/gpu/audio.html`, { waitUntil: 'domcontentloaded', timeout: 60_000 });
+      await audioPage.waitForFunction(() => globalThis.__kernelTrailAudioProbe?.status === 'ready' || globalThis.__kernelTrailAudioProbe?.status === 'failed', undefined, { timeout: 60_000 });
+      const boot = await audioPage.evaluate(() => globalThis.__kernelTrailAudioProbe);
+      if (boot.status === 'failed') throw new Error(`Audio probe failed to initialise: ${boot.error?.message}\n${boot.error?.stack}`);
+      const before = await audioPage.evaluate(() => globalThis.__kernelTrailAudioProbe.api.info());
+      assert.equal(before.state, 'unstarted', 'no audio context may exist before the gesture');
+      assert.equal(before.constructions, 0, 'no audio context may be constructed before the gesture');
+      const droppedBefore = await audioPage.evaluate(() => globalThis.__kernelTrailAudioProbe.api.poke());
+      assert.equal(droppedBefore, 1, 'a cue before the gesture is dropped and counted');
+      await audioPage.click('#unlock');
+      await audioPage.waitForFunction(() => globalThis.__kernelTrailAudioProbe.api.info().state === 'running', undefined, { timeout: 10_000 });
+      const after = await audioPage.evaluate(() => globalThis.__kernelTrailAudioProbe.api.info());
+      console.log('Audio context after gesture:', JSON.stringify(after));
+      assert.equal(after.constructions, 1);
+      const run = await audioPage.evaluate(() => globalThis.__kernelTrailAudioProbe.api.run(2));
+      console.log('Audio two-second run:', JSON.stringify(run));
+      assert.equal(run.state, 'running', 'the context must stay running through the run');
+      assert.equal(run.consumerErrors, 0, 'the consumer must not record an error');
+      assert(run.cuesPlayed > 50, 'the run must play cues');
+      assert(run.voicesPeak <= 64, 'the high-tier voice cap');
+      const timing = await audioPage.evaluate(() => globalThis.__kernelTrailAudioProbe.api.timing());
+      console.log('generateBuffers timing (browser):', JSON.stringify(timing));
+      assert.equal(timing.identical, true, 'worker and main-thread buffers must be byte-identical');
+      const cost = {};
+      for (const tier of ['low', 'medium', 'high']) {
+        cost[tier] = await audioPage.evaluate(t => globalThis.__kernelTrailAudioProbe.api.cost(t), tier);
+        console.log(`Audio pool cost ${tier}:`, JSON.stringify(cost[tier]));
+        assert(cost[tier].peakSample > 0, `${tier}: the offline render must produce signal`);
+        // A DynamicsCompressorNode is not a brick wall: Chrome applies makeup gain
+        // past the threshold and the mandated 3 ms attack passes a transient's
+        // first samples, so a 500-cue-per-second burst overshoots by a fraction of
+        // a decibel before the destination clamps. Within 1 dB is the limiter working.
+        assert(cost[tier].peakSample <= 1.122, `${tier}: the limiter must hold peaks within 1 dB of full scale, got ${cost[tier].peakSample}`);
+      }
+      if (cost.high.msPerQuantum > 2) {
+        console.log(`WARNING: high tier always-running pool costs ${cost.high.msPerQuantum.toFixed(3)} ms per ${cost.high.quantumMs.toFixed(3)} ms render quantum, above the 2 ms line`);
+      }
+      results.push({ audio: { before, after, run, timing, cost } });
+      await audioPage.evaluate(() => globalThis.__kernelTrailAudioProbe.api.dispose());
+      assert.equal(audioDiagnostics.pageErrors.length, 0, 'Page errors during audio assertions');
+      assert.deepEqual(audioDiagnostics.messages.filter(message => message.startsWith('[console.error]')), []);
+      console.log('Audio probe passed');
+    } catch (error) {
+      console.error('Audio probe failed:', error.stack || String(error));
+      console.error(formatPageDiagnostics(audioDiagnostics));
+      failures.push(`audio: ${error.stack || String(error)}`);
+    } finally {
+      await audioPage.close();
+    }
+  }
   if (environmentDiagnostics.pageErrors.length) {
     failures.push('WebGPU environment page reported an error');
     console.error(formatPageDiagnostics(environmentDiagnostics));
