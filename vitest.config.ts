@@ -23,6 +23,11 @@ export default defineConfig({
       '@design': r('./src/design'),
       '@platform': r('./src/platform'),
       '@render': r('./src/render'),
+      '@ui': r('./src/ui'),
+      '@world': r('./src/world'),
+      '@audio': r('./src/audio'),
+      '@app': r('./src/app'),
+      '@terminal': r('./src/terminal'),
     },
   },
 });
