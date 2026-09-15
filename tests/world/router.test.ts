@@ -51,6 +51,18 @@ describe('WorldEventRouter', () => {
     expect(elapsed).toBeLessThan(20);
   });
 
+  it('uses no instrumented Three math allocations over 10,000 common-path events', () => {
+    const noop = () => {};
+    const router = new WorldEventRouter({ process: { onCreated: noop, onStateChanged: noop, onExited: noop, onReaped: noop, onStarving: noop, onThreadCreated: noop, onThreadJoined: noop }, scheduler: { onContextSwitch: noop, onQuantumExpired: noop }, memory: { onAccess: noop, onPageFault: noop, onPageLoaded: noop, onPageEvicted: noop, onAllocated: noop, onAllocationFailed: noop, onThrashing: noop, onTlbMiss: noop }, sync: { onAcquired: noop, onBlocked: noop, onReleased: noop, onRace: noop, onBusyWait: noop }, deadlock: { onRequested: noop, onGranted: noop, onDenied: noop, onBankers: noop, onDetected: noop, onResolved: noop }, storage: { onQueued: noop, onSeek: noop, onServed: noop, onRaidRebuild: noop }, io: { onRequest: noop, onInterrupt: noop, onDma: noop, onPollWasted: noop }, fs: { onBlockAllocated: noop, onFragmented: noop, onJournal: noop, onCorruption: noop, onRecovered: noop }, security: { onAccessDenied: noop, onEscalation: noop }, system: { onSyscall: noop, onPanic: noop } }, ctx);
+    const current = event('memory.access', 1, { pid: 1, page: 1, write: false, hit: true });
+    for (let i = 0; i < 100; i += 1) router.consume(current);
+    let allocations = 0;
+    const holder = globalThis as { __ktAlloc?: (name: string) => void };
+    const prior = holder.__ktAlloc; holder.__ktAlloc = () => { allocations += 1; };
+    try { for (let i = 0; i < 10000; i += 1) router.consume(current); } finally { if (prior) holder.__ktAlloc = prior; else delete holder.__ktAlloc; }
+    expect(allocations).toBe(0);
+  });
+
   it('routes every event in the frozen forty-five member union to an observable domain', () => {
     const domains = makeDomains();
     const router = new WorldEventRouter(domains, ctx);
