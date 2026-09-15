@@ -1,0 +1,805 @@
+{
+  "machine": {
+    "hostname": "MacBook-Air-5.local",
+    "cpu": "Apple M3",
+    "platform": "darwin",
+    "release": "25.6.0",
+    "arch": "arm64",
+    "node": "v22.23.2"
+  },
+  "browser": "153.0.8010.12",
+  "headed": false,
+  "webgpuAvailable": true,
+  "results": [
+    {
+      "environment": {
+        "status": "available",
+        "info": {
+          "vendor": "apple",
+          "architecture": "metal-3",
+          "device": "",
+          "description": ""
+        },
+        "lost": null
+      }
+    },
+    {
+      "path": "preferred",
+      "info": {
+        "backend": "webgpu",
+        "adapter": "metal-3 apple",
+        "capabilities": {
+          "backend": "webgpu",
+          "compute": true,
+          "storageBuffers": true,
+          "maxSamples": 4,
+          "float32Filterable": true,
+          "float16Renderable": true,
+          "hdr": true,
+          "maxTextureSize": 16384,
+          "maxInstances": 1000000,
+          "timestampQuery": true,
+          "deviceMemoryGb": 16,
+          "hardwareConcurrency": 8,
+          "adapterLabel": "metal-3 apple",
+          "isIntegrated": true,
+          "prefersReducedMotion": false,
+          "devicePixelRatio": 1
+        },
+        "stats": {
+          "drawCalls": 35,
+          "triangles": 8142,
+          "programs": 48,
+          "textures": 26,
+          "geometries": 8,
+          "gpuMs": null,
+          "targetMemoryBytes": 120308288
+        },
+        "passes": [
+          "scene_world.reflection",
+          "scene_world",
+          "scene_world.beam_depth",
+          "scene_world.effects",
+          "depth_resolve",
+          "depth_of_field",
+          "bright_pass",
+          "bloom_down.0",
+          "bloom_down.1",
+          "bloom_down.2",
+          "bloom_down.3",
+          "bloom_down.4",
+          "bloom_down.5",
+          "bloom_up.5",
+          "bloom_up.4",
+          "bloom_up.3",
+          "bloom_up.2",
+          "bloom_up.1",
+          "bloom_up.0",
+          "volumetric_scatter",
+          "composite",
+          "lens_output",
+          "scene_text",
+          "present"
+        ],
+        "plan": {
+          "width": 1440,
+          "height": 900,
+          "samples": 4,
+          "hdrFormat": "rgba16float",
+          "totalBytes": 120308288,
+          "clamped": []
+        }
+      }
+    },
+    {
+      "path": "preferred",
+      "tier": "low",
+      "stats": {
+        "drawCalls": 19,
+        "triangles": 2480,
+        "programs": 40,
+        "textures": 18,
+        "geometries": 5,
+        "gpuMs": null,
+        "targetMemoryBytes": 21919632
+      }
+    },
+    {
+      "path": "preferred",
+      "tier": "medium",
+      "stats": {
+        "drawCalls": 27,
+        "triangles": 5334,
+        "programs": 62,
+        "textures": 25,
+        "geometries": 5,
+        "gpuMs": null,
+        "targetMemoryBytes": 78183360
+      }
+    },
+    {
+      "path": "preferred",
+      "tier": "high",
+      "stats": {
+        "drawCalls": 30,
+        "triangles": 8088,
+        "programs": 63,
+        "textures": 26,
+        "geometries": 5,
+        "gpuMs": null,
+        "targetMemoryBytes": 120308288
+      }
+    },
+    {
+      "path": "preferred",
+      "frames": 300,
+      "allocations": {
+        "Matrix4": 0,
+        "Vector3": 0,
+        "Color": 0
+      }
+    },
+    {
+      "path": "preferred",
+      "timing": {
+        "scene_world.reflection": 0.022834,
+        "scene_world": 0.478201,
+        "scene_world.beam_depth": 0.101458,
+        "scene_world.effects": 0.359328,
+        "depth_resolve": 0.111623,
+        "depth_of_field": 0.108623,
+        "bright_pass": 0.026,
+        "bloom_down.0": 0.028583,
+        "bloom_down.1": 0.016583,
+        "bloom_down.2": 0.013542,
+        "bloom_down.3": 0.012291,
+        "bloom_down.4": 0.01175,
+        "bloom_down.5": 0.011291,
+        "bloom_up.5": 0.011,
+        "bloom_up.4": 0.011834,
+        "bloom_up.3": 0.013167,
+        "bloom_up.2": 0.014125,
+        "bloom_up.1": 0.020374,
+        "bloom_up.0": 0.042374,
+        "volumetric_scatter": 0.087165,
+        "composite": 0.08979,
+        "lens_output": 0.181788,
+        "scene_text": 0.011833,
+        "present": 0.093874
+      }
+    },
+    {
+      "path": "forced-webgl2",
+      "info": {
+        "backend": "webgl2",
+        "adapter": "ANGLE (Apple, ANGLE Metal Renderer: Apple M3, Unspecified Version)",
+        "capabilities": {
+          "backend": "webgl2",
+          "compute": false,
+          "storageBuffers": false,
+          "maxSamples": 4,
+          "float32Filterable": true,
+          "float16Renderable": true,
+          "hdr": true,
+          "maxTextureSize": 16384,
+          "maxInstances": 65536,
+          "timestampQuery": false,
+          "deviceMemoryGb": 16,
+          "hardwareConcurrency": 8,
+          "adapterLabel": "ANGLE (Apple, ANGLE Metal Renderer: Apple M3, Unspecified Version)",
+          "isIntegrated": true,
+          "prefersReducedMotion": false,
+          "devicePixelRatio": 1
+        },
+        "stats": {
+          "drawCalls": 35,
+          "triangles": 8142,
+          "programs": 48,
+          "textures": 26,
+          "geometries": 8,
+          "gpuMs": null,
+          "targetMemoryBytes": 120308288
+        },
+        "passes": [
+          "scene_world.reflection",
+          "scene_world",
+          "scene_world.beam_depth",
+          "scene_world.effects",
+          "depth_resolve",
+          "depth_of_field",
+          "bright_pass",
+          "bloom_down.0",
+          "bloom_down.1",
+          "bloom_down.2",
+          "bloom_down.3",
+          "bloom_down.4",
+          "bloom_down.5",
+          "bloom_up.5",
+          "bloom_up.4",
+          "bloom_up.3",
+          "bloom_up.2",
+          "bloom_up.1",
+          "bloom_up.0",
+          "volumetric_scatter",
+          "composite",
+          "lens_output",
+          "scene_text",
+          "present"
+        ],
+        "plan": {
+          "width": 1440,
+          "height": 900,
+          "samples": 4,
+          "hdrFormat": "rgba16float",
+          "totalBytes": 120308288,
+          "clamped": []
+        }
+      }
+    },
+    {
+      "path": "forced-webgl2",
+      "tier": "low",
+      "stats": {
+        "drawCalls": 19,
+        "triangles": 2480,
+        "programs": 40,
+        "textures": 18,
+        "geometries": 5,
+        "gpuMs": null,
+        "targetMemoryBytes": 21919632
+      }
+    },
+    {
+      "path": "forced-webgl2",
+      "tier": "medium",
+      "stats": {
+        "drawCalls": 25,
+        "triangles": 3172,
+        "programs": 58,
+        "textures": 25,
+        "geometries": 5,
+        "gpuMs": null,
+        "targetMemoryBytes": 78183360
+      }
+    },
+    {
+      "path": "forced-webgl2",
+      "tier": "high",
+      "stats": {
+        "drawCalls": 30,
+        "triangles": 8088,
+        "programs": 63,
+        "textures": 26,
+        "geometries": 5,
+        "gpuMs": null,
+        "targetMemoryBytes": 120308288
+      }
+    },
+    {
+      "path": "forced-webgl2",
+      "frames": 300,
+      "allocations": {
+        "Matrix4": 0,
+        "Vector3": 0,
+        "Color": 0
+      }
+    },
+    {
+      "path": "forced-webgl2",
+      "recovery": {
+        "attempts": [
+          true
+        ],
+        "outcome": "recovered_same",
+        "backend": "webgl2"
+      }
+    },
+    {
+      "path": "wp13-webgpu-low",
+      "result": {
+        "tier": "low",
+        "overlap": {
+          "layers": 3,
+          "channelSums": [
+            139,
+            277,
+            415
+          ],
+          "fourthRejected": true
+        },
+        "backend": "webgpu",
+        "frames": 300,
+        "instances": 400,
+        "allocations": {
+          "Matrix4": 0,
+          "Vector3": 0,
+          "Color": 0,
+          "Quaternion": 0
+        },
+        "frontPixels": 3164,
+        "occludedPixels": 0,
+        "releaseWeights": [
+          0.9984793530536867,
+          0.9935698896058709,
+          0.9846569437265137,
+          0.9709773424439768,
+          0.9515911153754113,
+          0.9253707560268796,
+          0.8910501315428399,
+          0.847422264459485,
+          0.793819947567545,
+          0.730915944757226,
+          0.6614063792982522,
+          0.5896355829273772,
+          0.5199891362459417,
+          0.4554325984194434,
+          0.39725163848456135,
+          0.34557914957655556,
+          0.2999792012065121,
+          0.25981673097564617,
+          0.22443868888380258,
+          0.19324711529319027,
+          0.16572063757801925,
+          0.14141418195485478,
+          0.11995079647584206,
+          0.10101157714404096,
+          0.08432606267633203,
+          0.06966388057177786,
+          0.05682777231302305,
+          0.045647879303244654,
+          0.035977098996006984,
+          0.02768731862180951,
+          0.020666356742254144,
+          0.014815471581113626,
+          0.010047322274018389,
+          0.006284292429202809,
+          0.003457104352450724,
+          0.0015036673849344595,
+          0.00036811567592542893,
+          0
+        ],
+        "geometry": {
+          "baseline": 1,
+          "beforeDispose": 6,
+          "afterDispose": 1
+        }
+      }
+    },
+    {
+      "path": "wp13-webgpu-medium",
+      "result": {
+        "tier": "medium",
+        "overlap": {
+          "layers": 3,
+          "channelSums": [
+            139,
+            277,
+            415
+          ],
+          "fourthRejected": true
+        },
+        "backend": "webgpu",
+        "frames": 300,
+        "instances": 400,
+        "allocations": {
+          "Matrix4": 0,
+          "Vector3": 0,
+          "Color": 0,
+          "Quaternion": 0
+        },
+        "frontPixels": 6043,
+        "occludedPixels": 0,
+        "releaseWeights": [
+          0.9984793530536867,
+          0.9935698896058709,
+          0.9846569437265137,
+          0.9709773424439768,
+          0.9515911153754113,
+          0.9253707560268796,
+          0.8910501315428399,
+          0.847422264459485,
+          0.793819947567545,
+          0.730915944757226,
+          0.6614063792982522,
+          0.5896355829273772,
+          0.5199891362459417,
+          0.4554325984194434,
+          0.39725163848456135,
+          0.34557914957655556,
+          0.2999792012065121,
+          0.25981673097564617,
+          0.22443868888380258,
+          0.19324711529319027,
+          0.16572063757801925,
+          0.14141418195485478,
+          0.11995079647584206,
+          0.10101157714404096,
+          0.08432606267633203,
+          0.06966388057177786,
+          0.05682777231302305,
+          0.045647879303244654,
+          0.035977098996006984,
+          0.02768731862180951,
+          0.020666356742254144,
+          0.014815471581113626,
+          0.010047322274018389,
+          0.006284292429202809,
+          0.003457104352450724,
+          0.0015036673849344595,
+          0.00036811567592542893,
+          0
+        ],
+        "geometry": {
+          "baseline": 1,
+          "beforeDispose": 6,
+          "afterDispose": 1
+        }
+      }
+    },
+    {
+      "path": "wp13-webgpu-high",
+      "result": {
+        "tier": "high",
+        "overlap": {
+          "layers": 3,
+          "channelSums": [
+            139,
+            277,
+            415
+          ],
+          "fourthRejected": true
+        },
+        "backend": "webgpu",
+        "frames": 300,
+        "instances": 400,
+        "allocations": {
+          "Matrix4": 0,
+          "Vector3": 0,
+          "Color": 0,
+          "Quaternion": 0
+        },
+        "frontPixels": 6429,
+        "occludedPixels": 0,
+        "releaseWeights": [
+          0.9984793530536867,
+          0.9935698896058709,
+          0.9846569437265137,
+          0.9709773424439768,
+          0.9515911153754113,
+          0.9253707560268796,
+          0.8910501315428399,
+          0.847422264459485,
+          0.793819947567545,
+          0.730915944757226,
+          0.6614063792982522,
+          0.5896355829273772,
+          0.5199891362459417,
+          0.4554325984194434,
+          0.39725163848456135,
+          0.34557914957655556,
+          0.2999792012065121,
+          0.25981673097564617,
+          0.22443868888380258,
+          0.19324711529319027,
+          0.16572063757801925,
+          0.14141418195485478,
+          0.11995079647584206,
+          0.10101157714404096,
+          0.08432606267633203,
+          0.06966388057177786,
+          0.05682777231302305,
+          0.045647879303244654,
+          0.035977098996006984,
+          0.02768731862180951,
+          0.020666356742254144,
+          0.014815471581113626,
+          0.010047322274018389,
+          0.006284292429202809,
+          0.003457104352450724,
+          0.0015036673849344595,
+          0.00036811567592542893,
+          0
+        ],
+        "geometry": {
+          "baseline": 1,
+          "beforeDispose": 6,
+          "afterDispose": 1
+        }
+      }
+    },
+    {
+      "path": "wp13-webgl2-low",
+      "result": {
+        "tier": "low",
+        "overlap": {
+          "layers": 3,
+          "channelSums": [
+            139,
+            277,
+            415
+          ],
+          "fourthRejected": true
+        },
+        "backend": "webgl2",
+        "frames": 300,
+        "instances": 400,
+        "allocations": {
+          "Matrix4": 0,
+          "Vector3": 0,
+          "Color": 0,
+          "Quaternion": 0
+        },
+        "frontPixels": 3155,
+        "occludedPixels": 0,
+        "releaseWeights": [
+          0.9984793530536867,
+          0.9935698896058709,
+          0.9846569437265137,
+          0.9709773424439768,
+          0.9515911153754113,
+          0.9253707560268796,
+          0.8910501315428399,
+          0.847422264459485,
+          0.793819947567545,
+          0.730915944757226,
+          0.6614063792982522,
+          0.5896355829273772,
+          0.5199891362459417,
+          0.4554325984194434,
+          0.39725163848456135,
+          0.34557914957655556,
+          0.2999792012065121,
+          0.25981673097564617,
+          0.22443868888380258,
+          0.19324711529319027,
+          0.16572063757801925,
+          0.14141418195485478,
+          0.11995079647584206,
+          0.10101157714404096,
+          0.08432606267633203,
+          0.06966388057177786,
+          0.05682777231302305,
+          0.045647879303244654,
+          0.035977098996006984,
+          0.02768731862180951,
+          0.020666356742254144,
+          0.014815471581113626,
+          0.010047322274018389,
+          0.006284292429202809,
+          0.003457104352450724,
+          0.0015036673849344595,
+          0.00036811567592542893,
+          0
+        ],
+        "geometry": {
+          "baseline": 1,
+          "beforeDispose": 6,
+          "afterDispose": 1
+        }
+      }
+    },
+    {
+      "path": "wp13-webgl2-medium",
+      "result": {
+        "tier": "medium",
+        "overlap": {
+          "layers": 3,
+          "channelSums": [
+            139,
+            277,
+            415
+          ],
+          "fourthRejected": true
+        },
+        "backend": "webgl2",
+        "frames": 300,
+        "instances": 400,
+        "allocations": {
+          "Matrix4": 0,
+          "Vector3": 0,
+          "Color": 0,
+          "Quaternion": 0
+        },
+        "frontPixels": 6052,
+        "occludedPixels": 0,
+        "releaseWeights": [
+          0.9984793530536867,
+          0.9935698896058709,
+          0.9846569437265137,
+          0.9709773424439768,
+          0.9515911153754113,
+          0.9253707560268796,
+          0.8910501315428399,
+          0.847422264459485,
+          0.793819947567545,
+          0.730915944757226,
+          0.6614063792982522,
+          0.5896355829273772,
+          0.5199891362459417,
+          0.4554325984194434,
+          0.39725163848456135,
+          0.34557914957655556,
+          0.2999792012065121,
+          0.25981673097564617,
+          0.22443868888380258,
+          0.19324711529319027,
+          0.16572063757801925,
+          0.14141418195485478,
+          0.11995079647584206,
+          0.10101157714404096,
+          0.08432606267633203,
+          0.06966388057177786,
+          0.05682777231302305,
+          0.045647879303244654,
+          0.035977098996006984,
+          0.02768731862180951,
+          0.020666356742254144,
+          0.014815471581113626,
+          0.010047322274018389,
+          0.006284292429202809,
+          0.003457104352450724,
+          0.0015036673849344595,
+          0.00036811567592542893,
+          0
+        ],
+        "geometry": {
+          "baseline": 1,
+          "beforeDispose": 6,
+          "afterDispose": 1
+        }
+      }
+    },
+    {
+      "path": "wp13-webgl2-high",
+      "result": {
+        "tier": "high",
+        "overlap": {
+          "layers": 3,
+          "channelSums": [
+            139,
+            277,
+            415
+          ],
+          "fourthRejected": true
+        },
+        "backend": "webgl2",
+        "frames": 300,
+        "instances": 400,
+        "allocations": {
+          "Matrix4": 0,
+          "Vector3": 0,
+          "Color": 0,
+          "Quaternion": 0
+        },
+        "frontPixels": 6449,
+        "occludedPixels": 0,
+        "releaseWeights": [
+          0.9984793530536867,
+          0.9935698896058709,
+          0.9846569437265137,
+          0.9709773424439768,
+          0.9515911153754113,
+          0.9253707560268796,
+          0.8910501315428399,
+          0.847422264459485,
+          0.793819947567545,
+          0.730915944757226,
+          0.6614063792982522,
+          0.5896355829273772,
+          0.5199891362459417,
+          0.4554325984194434,
+          0.39725163848456135,
+          0.34557914957655556,
+          0.2999792012065121,
+          0.25981673097564617,
+          0.22443868888380258,
+          0.19324711529319027,
+          0.16572063757801925,
+          0.14141418195485478,
+          0.11995079647584206,
+          0.10101157714404096,
+          0.08432606267633203,
+          0.06966388057177786,
+          0.05682777231302305,
+          0.045647879303244654,
+          0.035977098996006984,
+          0.02768731862180951,
+          0.020666356742254144,
+          0.014815471581113626,
+          0.010047322274018389,
+          0.006284292429202809,
+          0.003457104352450724,
+          0.0015036673849344595,
+          0.00036811567592542893,
+          0
+        ],
+        "geometry": {
+          "baseline": 1,
+          "beforeDispose": 6,
+          "afterDispose": 1
+        }
+      }
+    },
+    {
+      "path": "wp14-derezz-webgpu-low",
+      "result": {
+        "backend": "webgpu",
+        "drawCalls": 2,
+        "active": 2,
+        "cells": [
+          0.1296,
+          0.12953549983636728
+        ]
+      }
+    },
+    {
+      "path": "wp14-derezz-webgpu-medium",
+      "result": {
+        "backend": "webgpu",
+        "drawCalls": 2,
+        "active": 2,
+        "cells": [
+          0.12,
+          0.08815968460800003
+        ]
+      }
+    },
+    {
+      "path": "wp14-derezz-webgpu-high",
+      "result": {
+        "backend": "webgpu",
+        "drawCalls": 2,
+        "active": 2,
+        "cells": [
+          0.12,
+          0.0648
+        ]
+      }
+    },
+    {
+      "path": "wp14-derezz-webgl2-low",
+      "result": {
+        "backend": "webgl2",
+        "drawCalls": 2,
+        "active": 2,
+        "cells": [
+          0.1296,
+          0.12953549983636728
+        ]
+      }
+    },
+    {
+      "path": "wp14-derezz-webgl2-medium",
+      "result": {
+        "backend": "webgl2",
+        "drawCalls": 2,
+        "active": 2,
+        "cells": [
+          0.12,
+          0.08815968460800003
+        ]
+      }
+    },
+    {
+      "path": "wp14-derezz-webgl2-high",
+      "result": {
+        "backend": "webgl2",
+        "drawCalls": 2,
+        "active": 2,
+        "cells": [
+          0.12,
+          0.0648
+        ]
+      }
+    }
+  ],
+  "failures": [],
+  "environmentMessages": [
+    "[console.debug] [vite] connecting...\n  http://127.0.0.1:58593/@vite/client:858:8",
+    "[console.debug] [vite] connected.\n  http://127.0.0.1:58593/@vite/client:967:11",
+    "[console.error] Failed to load resource: the server responded with a status of 404 (Not Found)\n  http://127.0.0.1:58593/favicon.ico:0:0",
+    "[console.info] WebGPU preflight adapter: {\"vendor\":\"apple\",\"architecture\":\"metal-3\",\"device\":\"\",\"description\":\"\"}\n  :5:10",
+    "[console.info] [WebGPU device 1] requested; adapter={\"vendor\":\"apple\",\"architecture\":\"metal-3\",\"device\":\"\",\"description\":\"\"}\n  :23:14"
+  ],
+  "environmentLosses": []
+}
