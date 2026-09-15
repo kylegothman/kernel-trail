@@ -459,3 +459,236 @@ State:
 6. Confirmation that no man page text in this package was authored rather than
    sourced.
 7. Every `// TODO(astra):` left in the tree, with file and line.
+
+---
+
+## Scope correction against the shipped tree
+
+Written 2026-09-15, after WP-11 merged (main at `fe25ac6`) and before WP-15
+starts. Where this section disagrees with the text above, this section wins.
+Each numbered item is a decision; report against them by number. WP-17 runs at
+the same time on `wp-17` and owns `src/ui/` and `src/game/`; the two packages
+must not touch each other's files, and the one shared file is settled in T2.
+
+### T1. The kernel import is type-only, so runtime values arrive through a host
+
+Architecture 1.3 gives `terminal` a `T` against `kernel`: `import type` and
+nothing else. That rules out importing `CALL_SPECS`, `usage`, `SYSCALL_NAMES`,
+`ERRNO_SUBSTITUTIONS`, `createKernel` or any subsystem class into
+`src/terminal`, even though the package text says to build completion and the
+man pages from them. `game` has `Y` against `kernel`, so the values cross the
+boundary through one object built in the game layer.
+
+Create `src/terminal/host.ts` declaring the interface the shell runs against,
+with every kernel name imported as a type:
+
+```ts
+export interface TerminalHost {
+  readonly kernel: Kernel;                       // the frozen read interface
+  view(): InvariantView;                         // kernel.invariantState(), fresh on every call
+  pollTicks(pid: Pid): number;
+  spinTicks(pid: Pid): number;
+  readonly specs: {
+    readonly names: readonly SyscallName[];
+    readonly calls: Readonly<Record<SyscallName, CallSpec>>;
+    usage(name: SyscallName): string;
+    readonly substitutions: readonly ErrnoSubstitution[];
+  };
+  readonly sink: CommandSink;                    // T4
+  run(): Readonly<RunState>;
+}
+```
+
+Create `src/game/terminalHost.ts` exporting
+`createTerminalHost(kernel: ReturnType<typeof createKernel>, sink: CommandSink, run: () => Readonly<RunState>): TerminalHost`,
+which binds `view` to `kernel.invariantState()`, `pollTicks` to
+`kernel.ioSubsystem.pollTicks`, `spinTicks` to the getter granted in T3, and
+`specs` to the four exports of `@kernel/index`. This is the only file this
+package creates under `src/game/`; WP-17 does not touch it. `ShellContext`
+holds a `TerminalHost` plus the output sink and nothing else; commands never
+see a subsystem object.
+
+`Kernel` (the interface) has no subsystem accessors: its members are `config`,
+`tick`, `events`, `step`, `run`, `syscall`, `process`, `processes`, the four
+policy setters, `evaluateBankers`, `detectDeadlock`, `snapshot` and `restore`.
+Everything else the commands read comes from `view()`, whose `InvariantView`
+carries `processes`, `running`, `queues`, `schedulerId`, `schedulerParams`,
+`threads`, `frames`, `freeList`, `pageTables`, `tlb`, `cowRefCounts`,
+`metrics.scheduling`, `metrics.memory`, `busyTicks`, the sync tables,
+`resources`, `mailboxes`, `diskHead`, `diskQueue`, `devices`,
+`interruptLines`, `ioDebt`, `switchDebt` and `lastFrame`. `top` reads CPU
+utilisation from `view().metrics.scheduling.cpuUtilisation`; `vmstat` reads
+the fault rate and working sets from `view().metrics.memory`. Do not call
+`kernel.snapshot()` from a command; it is far more expensive than the view and
+it is not what the criterion "never from a copy taken at open time" is about.
+
+### T2. Test infrastructure has already landed on main; do not add it again
+
+`happy-dom` and `fake-indexeddb` are dev dependencies on main, and
+`vitest.config.ts` aliases `@ui`, `@world`, `@audio`, `@app` and `@terminal`.
+Do not edit `package.json`, `package-lock.json` or `vitest.config.ts`. DOM
+tests select the environment per file with `// @vitest-environment happy-dom`
+as the first line; the global environment stays `node`. `happy-dom` does not
+lay out, so nothing in this package asserts a bounding box; the DOM batching
+and scrollback cases count nodes and mutations, which it does support.
+
+### T3. One granted kernel edit: `SyncSubsystem.spinTicks(pid)`
+
+`IoSubsystem.pollTicks(pid)` exists (`src/kernel/io/IoSubsystem.ts:110`).
+There is no `spinTicks` accessor; the count lives in
+`SyncSubsystem`'s private `spins` map (`src/kernel/sync/SyncSubsystem.ts:153`).
+Add one public method `spinTicks(pid: Pid): number` returning the map's entry
+or 0, immediately after the existing public accessors, with no other change to
+the file. It is not a phase body and the file is not frozen. Land it in its own
+commit titled `WP-15: SyncSubsystem.spinTicks accessor for top`, with a unit
+test in `tests/terminal/liveState.test.ts` rather than under `tests/kernel/`.
+
+### T4. `CommandBus` does not exist yet; the terminal talks to a sink
+
+`src/game/CommandBus.ts` is a WP-17 deliverable and is not on main. Define in
+`src/terminal/commandSink.ts`:
+
+```ts
+export type TerminalCommandRequest =
+  | { readonly kind: 'set_scheduler'; readonly id: SchedulerId; readonly params?: Partial<SchedulerParams> }
+  | { readonly kind: 'set_replacement'; readonly id: PageReplacementId }
+  | { readonly kind: 'set_disk'; readonly id: DiskSchedulingId }
+  | { readonly kind: 'set_allocation'; readonly strategy: AllocationStrategy }
+  | { readonly kind: 'set_pace'; readonly pace: Pace }
+  | { readonly kind: 'set_rations'; readonly rations: Rations }
+  | { readonly kind: 'set_degree'; readonly degree: number }
+  | { readonly kind: 'syscall'; readonly request: SyscallRequest };
+
+export type SinkResult =
+  | { readonly ok: true; readonly syscall?: SyscallResult }
+  | { readonly ok: false; readonly message: string };
+
+export interface CommandSink {
+  dispatch(request: TerminalCommandRequest, origin: { readonly source: 'terminal'; readonly line: string }): SinkResult;
+}
+```
+
+Every write the terminal makes, including `kill`, `nice`, `wait` and every
+other syscall a command issues on the player's behalf, goes through
+`sink.dispatch`, never through `kernel.syscall` or a setter. The sink is what
+appends the `DecisionRecord` and calls the mutator; the terminal's obligation
+is to issue exactly one dispatch per policy command, and acceptance 8 is
+restated as that. `tests/terminal/` supplies a recording sink that applies the
+mutator to a real kernel and appends a record to a fixture `RunState`, so the
+"sched applies" case still proves the next dispatch follows SRTF. WP-17's
+`CommandBus` will implement `CommandSink` (it is told so in its handoff) and
+WP-19 wires the two together.
+
+### T5. There is no dispatch record; `gantt` rebuilds one from events
+
+Nothing under `src/` records scheduler dispatches. The golden format is
+`P1[0-24] P2[24-27]` from `tests/kernel/scheduler/workloadRunner.ts:61`
+(`renderGantt`), and the segments are built there from `context.switch` and
+`process.exited` events with `start = event.tick - 1`, which is the offset that
+lines the kernel's first decision at tick 1 up with the textbook's intervals
+starting at 0. The terminal cannot import from `tests/`, so
+`src/terminal/commands/scheduler.ts` keeps its own bounded segment builder fed
+by `host.kernel.events.on('context.switch', ...)` and
+`on('process.exited', ...)`, subscribed when the shell is created, capped at
+the last 512 segments, and renders with the identical string form. The
+`gantt format` case runs the `sched-fcfs-1` workload from
+`tests/kernel/scheduler/golden.test.ts` through a shell and asserts the output
+equals `tests/kernel/golden/sched-fcfs-1.gantt` byte for byte. Names are the
+process names from the PCB, as the runner uses.
+
+### T6. Which of the 49 commands this package implements
+
+All 49 names have a complete `TerminalCommandDef` in the curriculum map (the
+"no definition" branch of the package text does not fire). Implement every
+command whose reads and writes are satisfiable from `TerminalHost` today. In
+the pre-flight, list any command you believe is not satisfiable, with the
+missing datum named; the expected members of that list are `hyper`, `guest`
+and `migrate` (no hypervisor exists in the kernel) and possibly `belady`
+(which needs a reference-string replay under a second policy; say whether
+`view().pageTables` and the replacement registry give you enough). A command
+on that list gets no handler in this package: the registry accepts the
+definition and the leg that introduces it supplies the handler through
+`registerHandler(name, run)`. Any other command with no handler is an error at
+registration time, so the base shell can never print a canned response.
+
+The base shell registers exactly the fourteen names in design brief section 7.
+The other handlers ship in `src/terminal/commands/` and lie dormant until a
+leg registers the matching definition through `Leg.terminalCommands`.
+
+### T7. Man pages: three sources, stated precisely
+
+Command pages come from `TerminalCommandDef.manual` verbatim, as the package
+says. Syscall pages (`man fork` and the other 26 names) are assembled from
+`host.specs`: the `usage()` line, the `CallSpec.summary` sentence, the argument
+list with each `ArgSpec.kind` and role, and a `See also:` line naming the
+command that wraps the call where one exists. Errno pages are assembled from
+`host.specs.substitutions` and the eleven-member `Errno` union: for a native
+code, the name and the calls that can return it, taken from one table
+`ERRNO_CALLS: Readonly<Record<Errno, readonly SyscallName[]>>` in
+`errnoPages.ts` transcribed from sim spec 14.4 (`CALL_SPECS` carries no errno
+column, so the table cannot be derived), with a test asserting every listed
+call is a `SyscallName`; for a substituted code, the Unix name, the simulator's errno,
+the message prefix, and the sentence explaining the substitution. Both
+templates contain authored connective text. Quote both templates in full in
+the pre-flight; they are the only text in this package that is authored rather
+than sourced, and the report says so under item 6.
+
+The curriculum map has no concept pages. `man syscall` and `man mode` resolve
+as command pages because `syscall` and `mode` are commands in Leg 0. Any other
+concept topic resolves to the "no page" message naming the nearest command or
+errno topic by edit distance, until legs and the codex supply content. The
+`concept page` case therefore asserts `man syscall` returns the command manual
+verbatim, and the `unknown topic` case asserts the nearest-topic message.
+
+### T8. Citations
+
+Section 0.1 of the curriculum map is stale in its "cited" column: the frozen
+`types.ts` already says 8.6.1 and 8.7.1. The rule stands unchanged: nothing
+this package prints cites 5.3.4 for the quantum, 8.6.2 for the safe sequence
+or 8.3.2 for the cycle, and the `citations` case greps every assembled page.
+
+### T9. The boundary, stated precisely
+
+`src/terminal` may value-import from `@design`, `@game` and inside
+`src/terminal`; every `@kernel` import is `import type`; no `three`, no hex
+colour literal, no `localStorage`, no `innerHTML`, no `Math.random`, no
+`Date.now`, no import from `@world`, `@render`, `@audio`, `@ui`, `@app` or
+`@platform`. `tests/terminal/boundaries.test.ts` scans `src/terminal`
+recursively in the pattern of `tests/kernel/boundaries.test.ts` using
+`stripComments` from `tests/kernel/sourceScan.ts`, and also asserts the
+acceptance 7 rule (no call to the four setters, `restore` or `syscall` on a
+kernel) by scanning for `.setScheduler(`, `.setReplacementPolicy(`,
+`.setDiskPolicy(`, `.setAllocationStrategy(`, `.restore(` and `.syscall(` in
+stripped source. `tests/kernel/boundaries.test.ts` is not modified.
+
+### T10. Events
+
+`KernelEventStream` has `on(type, handler)`, `onAny(handler)` and `lastFrame`;
+there is no history buffer, and `lastFrame` is the live array, so copy it if
+you keep it. `trace` keeps its own bounded ring of `syscall.invoked` events
+(default 2000, matching `maxScrollbackLines`), subscribed at shell creation,
+and the `trace strace` case compares its line count with a parallel `onAny`
+counter over the same window. The `syscall.invoked` payload is `{ tick, seq,
+type, request, result }`; `result` is the union `{ ok: true; value } | { ok:
+false; errno; message }`, so the strace line prints the value or the errno and
+message from the arm that is present.
+
+### T11. Type scale
+
+`@design/typography` exports `FONT_STACK.mono`, `TYPE_SCALE` with `data`,
+`dataEmphasis` and `micro` as the mono entries (all `0.8125rem` against a
+16 px root, so 13 px), and `FONT_WEIGHTS.mono = [400, 700]`. The terminal body
+is `data`, the prompt is `dataEmphasis`, and status lines are `micro`.
+Colours come from `CYAN`, `AMBER`, `SLATE` and the semantic tokens; the only
+text tokens permitted are those `TEXT_CONTRAST` marks `any-size`.
+
+### T12. Pre-flight before writing
+
+Read this section, then send a pre-flight listing: the T3 diff; the T6 list of
+commands without a handler and why; the two T7 templates in full; the
+`TerminalHost` and `CommandSink` declarations as you will write them; the
+`errno pages` and `substituted codes` cases against the eleven native codes
+and the seven substitutions from `ERRNO_SUBSTITUTIONS`; and any finding of
+yours that needs a ruling, numbered. Wait for the reply before the first
+commit. Every commit passes all four gates on its own and ends with both
+attribution lines.

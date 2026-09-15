@@ -277,6 +277,27 @@ export class MemorySubsystem implements MemoryHooks {
       if (this.host.process(value.pid)?.addressSpaceId === space) this.pending.delete(key);
     }
   }
+  /**
+   * Anonymous growth or shrink of one address space (WP-11 decision D5). Growth
+   * appends invalid entries after the highest page, to be faulted in on demand,
+   * and returns the first new page. Shrink removes the highest `current - pages`
+   * entries, drops their translations and pending accesses, and returns the
+   * removed entries so the caller can apply the copy-on-write release rule,
+   * which lifecycle owns.
+   */
+  resizeAddressSpace(space: AddressSpaceId, pages: number): { readonly firstNewPage: PageId | null; readonly removed: readonly PageTableEntry[] } {
+    memorySpace(space, 'address space'); memoryInteger(pages, 'page count');
+    const entries = [...this.pageTables.pageTable(space).values()].sort((a, b) => a.page - b.page);
+    if (pages > entries.length) {
+      const first = asPageId(entries.length === 0 ? 0 : (entries[entries.length - 1]?.page ?? -1) + 1);
+      for (let offset = 0; offset < pages - entries.length; offset++) this.pageTables.ensure(space, asPageId(first + offset));
+      return { firstNewPage: first, removed: [] };
+    }
+    const removed = entries.slice(pages);
+    for (const entry of removed) { this.invalidatePendingAccess(space, entry.page); this.pageTables.deletePage(space, entry.page); }
+    if (removed.length > 0) this.flush(space);
+    return { firstNewPage: null, removed };
+  }
   freeAddressSpace(space: AddressSpaceId): void {
     this.detachAddressSpace(space);
     if (this.host.releaseAddressSpace !== undefined) { this.host.releaseAddressSpace(space); this.discardUnusedFrames(space); return; }

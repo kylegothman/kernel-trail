@@ -874,3 +874,64 @@ the following WP-13 implementation commit, not this contract-only commit.
 Hash regeneration was human-approved on 2026-09-15 for this addition only.
 Future changes to this interface require an exact patch, written approval and a
 contract-only amendment commit.
+
+## Amendment 14, 2026-09-15: WP-11 process snapshot completion
+
+**Approved by:** Kyle, for the exact single-hunk patch to `src/kernel/types.ts`
+(lines 2830 to 2902, 83 added, 3 removed) and hash regeneration for this one
+commit. The WP-11 pre-flight approval is recorded in commit 58e5007.
+**Status:** applied; number 14 follows amendment 13.
+
+### What was incomplete
+
+Amendment 1 typed `ProcessSnapshotState` before the process subsystem's side
+tables existed. Ten packages later the tables WP-02 through WP-10 built need
+eighteen values the shape could not carry, and the five process declarations
+were interfaces, which never satisfy `JsonValue` (the amendment 8 lesson).
+
+### What changed
+
+Every value is plain JSON. The version stays 1 because no version 1 payload
+was ever produced. Added, by owner:
+
+- `ProcessSnapshotState`: `namedPrograms`, `rawBursts`, `threadAccounting`,
+  `deliveryCursors`, `burstSizes`, `copyDebts`, `syscallResults`,
+  `createdEvents`.
+- `ThreadSnapshot`: `serviceRemaining`.
+- `IpcSnapshot.sharedRegions[]`: `space`, `pages`, `attachments`.
+- `IpcSnapshot.mailboxes[]`: `sendWaiters`, `recvWaiters`.
+- `IpcSnapshot`: `pending`, `completions`, `completedWaits`, `originalPins`.
+- `IdCounters.nextTid` is retained and gains its source through the granted
+  ThreadManager contribution.
+- Two named record types, `NamedProgramSnapshot` and
+  `ThreadAccountingSnapshot`.
+
+`ProcessSnapshotState`, `ProgramSnapshot`, `ThreadSnapshot`, `IdCounters` and
+`IpcSnapshot` change from `interface` to `type` aliases. Nothing outside
+`types.ts` references the five by name, so callers see no change.
+
+Existing fields whose stated source did not exist are defined in their doc
+comments rather than removed: `ProgramSnapshot.name` is the registered name
+whose program object it is, else the PCB name; `programCounter` is the lowest
+live tid's counter, informational; `repeating` is always false;
+`pendingChildReturns` holds fork return values not yet observed;
+`sharedRegions[].frames` and `attached` and `mailboxes[].waiters` are derived
+projections; `executionDebt` is the sum of `copyDebts`.
+
+### Why this shape
+
+A standalone strict check (`strict`, `exactOptionalPropertyTypes`,
+`noUncheckedIndexedAccess`, TypeScript 7.0.2, Node 22.23.2) proves the whole
+slot, each named type and a complete literal value extend `JsonValue`, with
+negative controls rejecting an embedded interface, a `ReadonlyMap`, a
+`ReadonlySet`, a function and an `undefined` field. The proof file is not part
+of the tree, in the pattern of amendments 7 to 13.
+
+### Consequences
+
+WP-11 populates every field from the granted `snapshotContribution` pairs on
+ThreadManager, IpcManager, ProcessLifecycle and ProcessTable, restores through
+the ordered pipeline of pre-flight decision D1, and replaces WP-02's init-only
+guard with the completeness check. Only the kernel contract hash changes; the
+game, design-token and focus-contract hashes are unchanged. No implementation
+accompanies this commit.

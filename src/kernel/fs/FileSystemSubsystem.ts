@@ -16,6 +16,7 @@ import { Journal, applyMetadataDelta, decodeFsRecord, emptyMetadataDelta, encode
   type JournalImage, type Mutable, type MutableFsPayload } from './journal';
 import { Recovery } from './recovery';
 import { crashFileSystem } from './crash';
+import { tooManyOpenFiles } from '../syscall/errno';
 import { prepareFsck, reservedFsBlocks, verifyFileSystem } from './fsck';
 
 export type FsSettings = FsSnapshotState['payload']['settings'];
@@ -37,6 +38,8 @@ export interface FsHost {
   emit(event: EmittableEvent): void;
   check(domain: DomainId, inode: FsInodeSnapshot, right: AccessRight): boolean;
   inodeCreated?(inode: FsInodeSnapshot): void;
+  /** Descriptors one process may hold open (sim spec 14.3); 32 when the host does not say. WP-11 decision D6. */
+  maxOpenFiles?(): number;
   storage: StorageSubsystem;
   io: IoSubsystem;
 }
@@ -161,6 +164,11 @@ export class FileSystemSubsystem {
     if (!this.host.enabled() || !this.mounted) return failure('EINVAL', 'filesystem is not mounted');
     const actor = this.host.actor(request.pid); if (actor === undefined) return failure('ESRCH', 'filesystem caller is missing');
     const existing = this.pending(actor); if (existing !== undefined) return existing.result ?? success();
+    // Mode 'wx' is create-exclusive (sim spec 14.3): an existing path is EEXIST, otherwise the call proceeds as 'w'. WP-11 decision D6.
+    if (request.name === 'open' && request.args[1] === 'wx' && request.args.length === 2 && typeof request.args[0] === 'string') {
+      if (this.resolve(request.args[0], request.pid).ok) return failure('EEXIST', `path exists: ${request.args[0]}`);
+      return this.syscall({ ...request, args: [request.args[0], 'w'] });
+    }
     const decoded = decodeFileCall(request); if (!decoded.ok) return decoded.result;
     const call = decoded.call;
     if (call.name === 'close') return this.close(request.pid, call.fd);
@@ -401,6 +409,8 @@ export class FileSystemSubsystem {
   private afterReads(op: Operation): void {
     const inode = this.inodeTable.get(op.inode!); if (inode?.generation !== op.inodeGeneration) { this.finish(op, failure('EINVAL', 'stale filesystem operation')); return; }
     if (op.call.name === 'open') {
+      const limit = this.host.maxOpenFiles?.() ?? 32, open = this.host.process(op.actor.pid)?.openFiles.length ?? 0;
+      if (open >= limit) { this.finish(op, tooManyOpenFiles(op.actor.pid)); return; }
       let fd = 0; while (this.data.descriptors.some(row => row.fd === fd)) fd++;
       op.descriptor = fd as FileDescriptor; this.applyOperationEffects(op); this.finish(op, success(fd)); return;
     }

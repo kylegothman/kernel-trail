@@ -694,7 +694,7 @@ describe('aggregate VM persistence', () => {
       expect(tid === undefined ? undefined : kernel.threads.table.get(tid)?.blockedOn).toEqual(wait);
       kernel.run(50); expect(kernel.memorySubsystem.isSuspended(middle)).toBe(false);
       expect(kernel.process(middle)?.state).toBe('ready');
-      expect(() => kernel.snapshot()).toThrow('snapshot');
+      expect(kernel.snapshot().completeness).toBe('full');
     });
   });
   it('rejects malformed in-flight stage, reservation and logical-reference bindings before commit', () => {

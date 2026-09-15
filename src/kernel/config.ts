@@ -62,6 +62,10 @@ export interface KernelTuning {
   readonly lwpPoolSize: number;
   readonly defaultSerialFraction: number;
   readonly degreeOfMultiprogramming: number;
+  /** Descriptors one process may hold open; open returns EAGAIN "too many open files: " above it (sim spec 14.3). */
+  readonly maxOpenFiles: number;
+  /** Pages one address space may grow to through mmap and brk; beyond it returns ENOMEM (sim spec 14.3). */
+  readonly maxPagesPerProcess: number;
   readonly checkInvariants: boolean;
 }
 
@@ -90,7 +94,7 @@ export const DEFAULT_TUNING: KernelTuning = Object.freeze({
   freeSpaceMethod: 'bitmap', linkedVariant: 'in_block', journalMode: 'metadata', accessModel: 'acl',
   contextSwitchTicks: 0, deadlockDetectionInterval: 20, threadModel: 'one_to_one',
   coreCount: 4, lwpPoolSize: 4, defaultSerialFraction: 0.25,
-  degreeOfMultiprogramming: 8, checkInvariants: true,
+  degreeOfMultiprogramming: 8, maxOpenFiles: 32, maxPagesPerProcess: 1024, checkInvariants: true,
 });
 
 const SCHEDULERS: readonly SchedulerId[] = ['fcfs', 'sjf', 'srtf', 'priority', 'priority_aging', 'rr', 'mlfq'];
@@ -179,6 +183,8 @@ export function resolveTuning(overrides: Partial<KernelTuning> = {}): KernelTuni
   integer('coreCount', tuning.coreCount, 1);
   integer('lwpPoolSize', tuning.lwpPoolSize, 1);
   integer('degreeOfMultiprogramming', tuning.degreeOfMultiprogramming, 1);
+  integer('maxOpenFiles', tuning.maxOpenFiles, 1);
+  integer('maxPagesPerProcess', tuning.maxPagesPerProcess, 1);
   if (!['many_to_one', 'one_to_one', 'many_to_many'].includes(tuning.threadModel)) throw new KernelConfigError('invalid thread model');
   if (!(tuning.defaultSerialFraction >= 0 && tuning.defaultSerialFraction <= 1)) throw new KernelConfigError('serial fraction must be in [0, 1]');
   return Object.freeze(tuning);

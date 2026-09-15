@@ -2830,72 +2830,152 @@ export type JsonValue =
  * shallow process snapshot was insufficient. Named rather than enveloped because
  * WP-11 has to reconstruct it exactly and a typed shape is what makes that
  * checkable at compile time.
+ *
+ * Amendment 14 (WP-11) completed the shape against the side tables WP-02
+ * through WP-10 actually built. The version stays 1 because no version 1
+ * payload was ever produced before this amendment. Every value is plain JSON.
  */
-export interface ProcessSnapshotState {
+export type ProcessSnapshotState = {
   readonly version: 1;
   /** Executable descriptions, so a restored process can keep running. */
   readonly programs: readonly ProgramSnapshot[];
+  /**
+   * Programs registered by name for exec, including the spawn names and the
+   * probe programs WP-10 re-registers on commit. `pid` names the process whose
+   * program object this is, or null when the program is registered only.
+   */
+  readonly namedPrograms: readonly NamedProgramSnapshot[];
   /** Thread control blocks, including each thread's program counter. */
   readonly threads: readonly ThreadSnapshot[];
   /** Pre-acceleration service, which the accelerated figure cannot recover. */
   readonly rawWork: readonly (readonly [Pid, number])[];
+  /** Pre-acceleration burst, the second half of the raw work pair (sim spec 4.3). */
+  readonly rawBursts: readonly (readonly [Pid, number])[];
+  /** Creation-debt accounting: overhead still owed and the core count the work was last priced at. */
+  readonly threadAccounting: readonly ThreadAccountingSnapshot[];
+  /** The last thread each process delivered a tick to, so round-robin delivery resumes in place. */
+  readonly deliveryCursors: readonly (readonly [Pid, Tid])[];
+  /** The declared burst per process, which reseats `rawBurst` at a burst boundary and seeds SJF. */
+  readonly burstSizes: readonly (readonly [Pid, number])[];
   /** Many-to-many light-weight process bindings, by tid. */
   readonly lwpBindings: readonly (readonly [Tid, number])[];
   /** Allocators, so a restored kernel never reissues a live id. */
   readonly counters: IdCounters;
-  /** Exit codes a parent has not yet collected through wait. */
+  /**
+   * Fork return values a child has not yet observed: 0 for every child created
+   * by fork and not yet dispatched. Uncollected exit codes live on zombie PCBs
+   * in the shared process table, so they need no separate entry here.
+   */
   readonly pendingChildReturns: readonly (readonly [Pid, number])[];
   /** Copy-on-write reference counts per frame. Ch. 10.3. */
   readonly cowRefCounts: readonly (readonly [FrameId, number])[];
+  /** Copy-on-write copy ticks still owed per process, consumed before its next instruction. */
+  readonly copyDebts: readonly (readonly [Pid, number])[];
+  /** The last syscall result recorded per process, including results delivered at wake. */
+  readonly syscallResults: readonly (readonly [Pid, SyscallResult])[];
+  /** Processes whose `process.created` event has been emitted, so restore never emits it twice. */
+  readonly createdEvents: readonly Pid[];
   /** Shared memory and message passing state. Ch. 3.5 and 3.6. */
   readonly ipc: IpcSnapshot;
   /** The immutable tuning object in force, since it changes computed service. */
   readonly tuning: JsonValue;
-  /** CPU spent on context switches and copies, charged to no process. */
+  /** The sum of `copyDebts`: CPU owed to copies and charged to no process. Context switch debt is in the scheduler slot. */
   readonly executionDebt: number;
 }
 
-export interface ProgramSnapshot {
+export type ProgramSnapshot = {
   readonly pid: Pid;
+  /** The registered name whose program object this is, else the PCB name. */
   readonly name: string;
   /** Instruction stream, as the program's own serialisable description. */
   readonly instructions: JsonValue;
+  /** Informational: the program counter of the lowest live tid. Thread control blocks are authoritative. */
   readonly programCounter: number;
+  /** Always false. A program pads past its length with compute; no repeating mode exists. */
   readonly repeating: boolean;
   /** Ch. 10.4 scenarios that drive memory from a fixed reference string. */
   readonly referenceString: readonly PageId[] | null;
   readonly serialFraction: number;
 }
 
-export interface ThreadSnapshot {
+/** Amendment 14. A program reachable by name for exec. */
+export type NamedProgramSnapshot = {
+  readonly name: string;
+  readonly pid: Pid | null;
+  readonly instructions: JsonValue;
+  readonly referenceString: readonly PageId[] | null;
+}
+
+/** Amendment 14. The creation-debt Amdahl side state per process (sim spec 4.3). */
+export type ThreadAccountingSnapshot = {
+  readonly pid: Pid;
+  readonly overheadRemaining: number;
+  readonly pricedCores: number | null;
+}
+
+export type ThreadSnapshot = {
   readonly tid: Tid;
   readonly pid: Pid;
   readonly programCounter: number;
   readonly state: ProcessState;
   readonly blockedOn: BlockReason | null;
+  /** Amendment 14. Ticks of work this thread still owes; the sum is the process serviceRemaining. */
+  readonly serviceRemaining: number;
 }
 
-export interface IdCounters {
+export type IdCounters = {
   readonly nextPid: number;
   readonly nextTid: number;
   readonly nextAddressSpace: number;
 }
 
-export interface IpcSnapshot {
+export type IpcSnapshot = {
   /** Shared regions and the address spaces attached to each. */
   readonly sharedRegions: readonly {
     readonly id: string;
+    /** Informational: frames of the currently valid backing entries, in page order. `space` and `pages` are authoritative. */
     readonly frames: readonly FrameId[];
+    /** Derived from `attachments`: the attaching address spaces in attachment order. */
     readonly attached: readonly AddressSpaceId[];
     readonly value: number;
+    /** Amendment 14. The backing address space and its pages, in region order. */
+    readonly space: AddressSpaceId;
+    readonly pages: readonly PageId[];
+    /** Amendment 14. Each attacher's pid, address space and the pages the region occupies there. */
+    readonly attachments: readonly {
+      readonly pid: Pid;
+      readonly space: AddressSpaceId;
+      readonly pages: readonly PageId[];
+    }[];
   }[];
   /** Message queues, in order, so delivery stays deterministic. */
   readonly mailboxes: readonly {
     readonly id: string;
     readonly capacity: number;
+    /** Each message is `{ from, tick, payload }`. */
     readonly messages: readonly JsonValue[];
+    /** Derived: `sendWaiters` followed by `recvWaiters`. */
     readonly waiters: readonly Pid[];
+    /** Amendment 14. The two wait queues, each in arrival order. */
+    readonly sendWaiters: readonly Pid[];
+    readonly recvWaiters: readonly Pid[];
   }[];
+  /** Amendment 14. Blocked mailbox operations, one per waiting process; a send carries its message. */
+  readonly pending: readonly {
+    readonly pid: Pid;
+    readonly kind: 'send' | 'recv';
+    readonly mailbox: string;
+    readonly message: { readonly from: Pid; readonly tick: Tick; readonly payload: number } | null;
+  }[];
+  /** Amendment 14. Results awaiting delivery in phase 4 to a woken mailbox waiter. */
+  readonly completions: readonly {
+    readonly pid: Pid;
+    readonly result: SyscallResult;
+  }[];
+  /** Amendment 14. The synthetic wait resource a completed operation still matches until phase 4 consumes it. */
+  readonly completedWaits: readonly (readonly [Pid, string])[];
+  /** Amendment 14. Pin flags shared-region frames carried before the region pinned them. */
+  readonly originalPins: readonly (readonly [FrameId, boolean])[];
 }
 
 /* ------------------------------------------------------------------ */
