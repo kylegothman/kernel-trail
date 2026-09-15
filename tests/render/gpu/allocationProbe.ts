@@ -17,7 +17,7 @@ function vlq(value: number): string {
 export function instrumentAllocations(code: string, id: string) {
   if (!id.includes('/three/')) return null;
   const edits: { offset: number; text: string }[] = [];
-  const expression = /(class (Matrix4|Vector3|Color)\b[\s\S]*?\bconstructor\s*\([^)]*\)\s*\{)/g;
+  const expression = /(class (Matrix4|Vector3|Color|Quaternion)\b[\s\S]*?\bconstructor\s*\([^)]*\)\s*\{)/g;
   const transformed = code.replace(expression, (match: string, _head: string, name: string, offset: number) => {
     const text = `globalThis.__ktAlloc?.('${name}');`;
     edits.push({ offset: offset + match.length, text });

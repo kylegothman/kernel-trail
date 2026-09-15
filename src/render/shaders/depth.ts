@@ -11,3 +11,13 @@ export function encodeDepth(z:Node<'float'>,far:Node<'float'>,hdr:boolean):Node<
 export function decodeDepth(sample:Node<'vec4'>):Node<'float'> {
   return mix(sample.r,sample.rgb.dot(vec3(65536,256,1)).mul(255/16777215).mul(depthFar),depthPacked);
 }
+
+/** Reconstruct positive view depth from an arbitrary projection's Z/W rows. */
+export function projectionDepth(depth:Node<'float'>, coefficients:Node<'vec4'>, depthScale:Node<'float'>, depthBias:Node<'float'>):Node<'float'> {
+  const ndc=depth.mul(depthScale).add(depthBias);
+  return coefficients.y.sub(ndc.mul(coefficients.w)).div(coefficients.x.sub(ndc.mul(coefficients.z)));
+}
+export function projectionDepthValue(depth:number, elements:readonly number[], webGL:boolean, reversed=false):number {
+  const ndc=webGL&&!reversed?depth*2-1:depth;
+  return (elements[14]!-ndc*elements[15]!)/(elements[10]!-ndc*elements[11]!);
+}

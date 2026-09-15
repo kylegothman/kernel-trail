@@ -4,7 +4,7 @@ import {
 } from 'three/webgpu';
 import type { BufferGeometry, Node, Texture } from 'three/webgpu';
 import { Fn, storage, instanceIndex, attribute, cameraPosition, cameraProjectionMatrix, modelViewMatrix, exp, float, fract, fwidth, max, min, mix, normalView, positionLocal, positionView, positionWorld, sin, smoothstep, texture, uniform, uv, screenUV, sRGBTransferOETF, vec2, vec3, vec4 } from 'three/tsl';
-import { SEMANTICS, CYAN, AMBER, MONOCHROME, NEUTRAL, VOID, LIGHTS, LINE, DASH, PULSE, PANEL, HATCH_ID, DISTANCE_ATTENUATION, CORRUPTION, linearColor, gainFor, resolveSemantic, DEFAULT_VISION_SETTINGS, LABEL_PLATE, type SemanticId, type VisionSettings } from '@design';
+import { FOCUS, SEMANTICS, CYAN, AMBER, MONOCHROME, NEUTRAL, VOID, LIGHTS, LINE, DASH, PULSE, PANEL, HATCH_ID, DISTANCE_ATTENUATION, CORRUPTION, linearColor, gainFor, resolveSemantic, DEFAULT_VISION_SETTINGS, LABEL_PLATE, type SemanticId, type VisionSettings } from '@design';
 import { PROFILES, type QualityTier } from '@platform';
 import { hash31, corrupt } from '../shaders/corruption.glsl';
 import { decodeDepth } from '../shaders/depth';
@@ -66,7 +66,8 @@ export function getMaterial(archetype: MaterialArchetype, semantic: SemanticId, 
   const hz=uniform(t.pulseHz);
   semanticUniforms.push({id:semantic,color,gain,hz});
   const pulse = sin(materialTime.mul(hz).mul(Math.PI * 2)).mul(pulseDepth).add(1);
-  const emission = color.mul(mix(gain, gainFor(t.family, 'critical'), materialPanic)).mul(pulse);
+  const perInstanceFocus=Fn(builder=>builder.geometry.hasAttribute('aStatePhase')?instanceData('aStatePhase').w:float(1))();
+  const emission = color.mul(mix(gain, gainFor(t.family, 'critical'), materialPanic)).mul(pulse).mul(perInstanceFocus);
   let m: TrailMaterial;
   switch (archetype) {
     case 'void-surface':
@@ -83,7 +84,12 @@ export function getMaterial(archetype: MaterialArchetype, semantic: SemanticId, 
       const state = instanceData('aStatePhase');
       const pattern = instanceData('aPatternId');
       const d = min(uv(), uv().oneMinus());
-      const edge = smoothstep(0, PANEL.edgeWidthM, min(d.x,d.y)).oneMinus();
+      const edge = Fn((builder) => {
+        if (!builder.geometry.hasAttribute('aBary')) return smoothstep(0, PANEL.edgeWidthM, min(d.x,d.y)).oneMinus();
+        const bary=attribute<'vec3'>('aBary','vec3'), mask=attribute<'vec3'>('aEdgeMask','vec3');
+        const lines=smoothstep(vec3(0),fwidth(bary).mul(1.4),bary).oneMinus().mul(mask);
+        return max(lines.x,max(lines.y,lines.z));
+      })();
       const stripe = (dir: Node<'vec2'>, period: number, duty: number, coords: Node<'vec2'> = uv()) => {
         const x = coords.dot(dir.normalize()).div(period); const w = fwidth(x).mul(1.5);
         return smoothstep(float(duty).sub(w), float(duty).add(w), fract(x)).oneMinus();
@@ -106,6 +112,7 @@ export function getMaterial(archetype: MaterialArchetype, semantic: SemanticId, 
       const radiance = semanticColor.mul(mix(semanticGain, critical, materialPanic)).mul(rhythm).mul(state.w)
         .mul(edge.mul(PANEL.edgeTerm).add(hatch.mul(PANEL.patternTerm)).add(PANEL.bodyTerm));
       m.emissiveNode = corrupt(radiance, positionWorld, materialCorruption, materialTime);
+      m.colorNode=uniform(linearColor(VOID.surface)).mul(float(1).sub(state.w.oneMinus().div(FOCUS.dimOthers).mul(1-FOCUS.matteDim)));
       const displacement=hash31(positionLocal.div(CORRUPTION.cellMetres).floor()).sub(0.5).mul(CORRUPTION.displaceMetres).mul(materialCorruption);
       m.positionNode = positionLocal.add(vec3(displacement,0,displacement));
       break;
@@ -127,7 +134,9 @@ export function getMaterial(archetype: MaterialArchetype, semantic: SemanticId, 
         m = new MeshStandardNodeMaterial({ color: linearColor(VOID.surface), roughness: 0.15, metalness: 0, transparent: true, opacity: 0.55, dithering: true });
         const fresnel = normalView.normalize().dot(positionView.normalize()).abs().oneMinus().pow(3);
         m.emissiveNode = emission.mul(fresnel.mul(1.6).add(0.18));
-      } break;
+      }
+      if(tier==='high') m.emissiveNode=uniform(linearColor(t.hex)).mul(gainFor(t.family,'active')).mul(perInstanceFocus);
+      break;
     }
     case 'holo-label': m = new MeshBasicNodeMaterial({ color: linearColor(t.hex), transparent: true, depthWrite: false }); break;
     case 'reflective-floor': {
@@ -221,6 +230,7 @@ export function createInstanceMaterial(base:TrailMaterial,attributes:readonly im
   const instanceData:InstanceNodes={aColorGain:storage(a,'vec4',a.count).toReadOnly().element(instanceIndex),
     aStatePhase:storage(b,'vec4',b.count).toReadOnly().element(instanceIndex),aPatternId:storage(c,'vec4',c.count).toReadOnly().element(instanceIndex)};
   if('emissiveNode' in material&&material.emissiveNode)material.emissiveNode=(material.emissiveNode as Node<'vec3'>).context({instanceData});
+  if(material.colorNode)material.colorNode=(material.colorNode as Node<'vec3'>).context({instanceData});
   material.name=base.name+'.batch';return material;
 }
 export function createDepthPrepassMaterial():MeshBasicNodeMaterial {
@@ -233,4 +243,38 @@ export function createLabelHairlineMaterial(semantic:SemanticId):MeshBasicNodeMa
   const material=new MeshBasicNodeMaterial({toneMapped:false});
   material.colorNode=uniform(linearColor(token.hex)).mul(token.gain);
   material.name='kt.emissive-line.label-hairline';return material;
+}
+
+/** Factory-owned specialization per focus group; the triple-key base cache is unchanged. */
+const focusGroups = new WeakMap<object, Map<import('three/webgpu').Material, TrailMaterial>>();
+const focusWeights = new WeakMap<import('three/webgpu').Material, { value: number }>();
+export function materialFocusUniform(material: import('three/webgpu').Material): {value:number} | undefined { return focusWeights.get(material); }
+export function acquireFocusMaterial(owner: object, base: import('three/webgpu').Material): import('three/webgpu').Material {
+  if (!('isNodeMaterial' in base) || !base.isNodeMaterial) return base;
+  let group=focusGroups.get(owner);
+  if(!group){group=new Map();focusGroups.set(owner,group);}
+  const hit=group.get(base); if(hit)return hit;
+  const material=(base as TrailMaterial).clone(), weight=uniform(1);
+  const matte=float(1).sub(float(1).sub(weight).div(FOCUS.dimOthers).mul(1-FOCUS.matteDim));
+  if(material.fragmentNode) {
+    const fragment=material.fragmentNode as Node<'vec4'>;
+    material.fragmentNode=vec4(fragment.rgb.mul(weight),fragment.a);
+  } else if('emissive' in material) {
+    const body=material.colorNode??uniform(material.color);
+    material.colorNode=(body as Node<'vec3'>).mul(matte);
+    const emission=material.emissiveNode??uniform(material.emissive).mul(material.emissiveIntensity);
+    material.emissiveNode=(emission as Node<'vec3'>).mul(weight);
+  } else {
+    const color=material.colorNode??uniform(material.color);
+    material.colorNode=base.name.includes('reflective-floor')
+      ? (color as Node<'vec3'>).sub(uniform(linearColor(VOID.floor)).rgb).mul(weight).add(uniform(linearColor(VOID.floor)).rgb.mul(matte))
+      : (color as Node<'vec3'>).mul(weight);
+  }
+  material.name=base.name+'.focus';group.set(base,material);focusWeights.set(material,weight);
+  return material;
+}
+export function releaseFocusMaterials(owner: object): void {
+  const group=focusGroups.get(owner); if(!group)return;
+  for(const material of group.values()){focusWeights.delete(material);material.dispose();}
+  group.clear();focusGroups.delete(owner);
 }

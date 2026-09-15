@@ -13,7 +13,7 @@ const machine = { hostname: os.hostname(), cpu: os.cpus()[0]?.model, platform: o
 console.log('GPU test machine:', JSON.stringify(machine));
 await build({ plugins: [allocationProbe], build: {
   outDir: '/private/tmp/kt-wp12-gpu-build', emptyOutDir: true,
-  rolldownOptions: { input: resolve('tests/render/gpu/probe.html') },
+  rolldownOptions: { input: [resolve('tests/render/gpu/probe.html'),resolve('tests/render/gpu/focus.html')] },
 } });
 if (process.argv.includes('--build-only')) process.exit(0);
 
@@ -99,6 +99,28 @@ try {
     } finally {
       await page.close();
     }
+  }
+  for (const force of webgpuAvailable ? [false, true] : [true]) for(const tier of ['low','medium','high']) {
+    const path=`wp13-${force?'webgl2':'webgpu'}-${tier}`;
+    const page=await browser.newPage({viewport:{width:1440,height:900}});
+    const diagnostics=capturePageDiagnostics(page);
+    await page.addInitScript(installWebGPUDiagnostics);
+    try {
+      await page.exposeFunction('__wp13Capture',async phase=>{assert(['front','occluded','released'].includes(phase));await page.screenshot({path:`/private/tmp/kt-${path}-${phase}.png`});});
+      console.log(`Starting ${path}`);
+      await navigateAndWaitForProbe(page,`http://127.0.0.1:${address.port}/tests/render/gpu/focus.html?tier=${tier}${force?'&webgl':''}`,diagnostics);
+      const info=await page.evaluate(()=>globalThis.__kernelTrailProbe.api.info());
+      assert.equal(info.backend,force?'webgl2':'webgpu');
+      const result=await page.evaluate(()=>globalThis.__kernelTrailProbe.api.run());
+      console.log(`${path}:`,JSON.stringify(result));results.push({path,result});
+      await page.screenshot({path:`/private/tmp/kt-${path}.png`});
+      assert.equal(diagnostics.pageErrors.length,0,'WP-13 page errors');
+      assert.deepEqual(diagnostics.messages.filter(message=>message.startsWith('[console.error]')),[]);
+      await page.evaluate(()=>globalThis.__kernelTrailProbe.api.dispose());
+    } catch(error) {
+      console.error(`GPU test failed on ${path}:`,error.stack||String(error));
+      console.error(formatPageDiagnostics(diagnostics));failures.push(`${path}: ${error.stack||String(error)}`);
+    } finally {await page.close();}
   }
   if (environmentDiagnostics.pageErrors.length) {
     failures.push('WebGPU environment page reported an error');
