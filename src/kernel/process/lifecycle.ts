@@ -192,7 +192,7 @@ export class ProcessLifecycle {
     const children = this.ctx.table.filterAscending(child =>
       this.ctx.table.parentOf(child.pid) === pcb.pid && child.state !== 'terminated');
     // Sim spec section 14 substitutes ESRCH because ECHILD is not in frozen Errno.
-    if (children.length === 0) return { ok: false, errno: 'ESRCH', message: 'no children' };
+    if (children.length === 0) return { ok: false, errno: 'ESRCH', message: `no children: ${pcb.pid}` };
     const candidates = pid === null ? children : children.filter(child => child.pid === pid);
     if (candidates.length === 0) return { ok: false, errno: 'ESRCH', message: 'not a child' };
     const zombie = candidates.find(child => child.state === 'zombie');

@@ -185,12 +185,6 @@ export class SecuritySubsystem {
     this.emit({ type: 'security.access_denied', domain: this.callerDomain(pid), object: alias?.region ?? `page:${pcb.addressSpaceId}:${page}`, right: write ? 'write' : 'read' });
     this.host.terminate(pid, 'protection_fault'); return false;
   }
-  validateByteCount(pid: Pid, count: unknown): SyscallResult | null {
-    // TODO(astra): WP-11 provides validateArgs.
-    const pcb = this.host.process(pid), ceiling = (pcb === undefined ? 0 : this.host.pages(pcb.addressSpaceId).length) * this.host.pageSize();
-    if (typeof count !== 'number' || !Number.isSafeInteger(count) || count < 0 || count > ceiling) return invalid('address out of range: byte count exceeds the caller address space');
-    return null;
-  }
   control(device: DeviceId, command: string, args: readonly (string | number | boolean)[], actor: IoSnapshotActor | undefined): SyscallResult | undefined {
     if (!this.host.enabled()) return undefined;
     if (device === 'kernel' && command === 'set_ring') {

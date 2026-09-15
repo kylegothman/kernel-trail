@@ -7,6 +7,8 @@ import { createSchedulerHooks } from './scheduler/starvation';
 import { SchedulingAccounting } from './scheduler/metrics';
 import { KernelConfigError, KernelInvariantError } from './errors';
 import { buildProcessState, checkCompleteness, hasWorkloadState, validateProcessState, type ValidatedProcessState } from './snapshot';
+import { dispatch } from './syscall/dispatch';
+import type { KernelState } from './syscall/table';
 import { DEFAULT_TUNING, resolveTuning, validateConfig, type KernelTuning } from './config';
 import { ProcessTable } from './process/ProcessTable';
 import { transition, type TransitionOptions } from './process/transitions';
@@ -16,7 +18,7 @@ import { generatedProgram, scriptedProgram, instructionProgram, type Program, ty
 import { IpcManager } from './process/ipc';
 import { MemorySubsystem } from './memory/MemorySubsystem';
 import { SyncSubsystem } from './sync/SyncSubsystem';
-import { DeadlockSubsystem, deadlockSettings, decodeResourceVector, type DeadlockStrategy } from './deadlock/DeadlockSubsystem';
+import { DeadlockSubsystem, deadlockSettings, type DeadlockStrategy } from './deadlock/DeadlockSubsystem';
 import { StorageSubsystem } from './storage/StorageSubsystem';
 import { IoSubsystem } from './io/IoSubsystem';
 import { FileSystemSubsystem } from './fs/FileSystemSubsystem';
@@ -60,7 +62,7 @@ import type {
   SyscallRequest,
   SyscallResult,
   Tick,
-  Tid, BlockReason, DomainId, FileDescriptor, DeviceId, AccessRight, Unsubscribe,
+  Tid, BlockReason, DomainId, FileDescriptor, DeviceId, AccessRight, Unsubscribe, TerminationReason,
 } from './types';
 import { asTick, asPid, asPageId } from './types';
 
@@ -523,7 +525,7 @@ export class KernelImpl implements Kernel {
           }
         }
       }, emit: event => this.publish(event), check: (domain, inode, right) => security.checkFile(domain, inode, right),
-      inodeCreated: inode => security.inodeCreated(inode), storage, io,
+      inodeCreated: inode => security.inodeCreated(inode), storage, io, maxOpenFiles: () => this.tuning.maxOpenFiles,
     }, { defaultAllocation: this.config.fileAllocation, maxSymlinkDepth: this.tuning.maxSymlinkDepth,
       dentryCacheEntries: this.tuning.dentryCacheEntries, fragmentationWarnExtents: this.tuning.fragmentationWarnExtents,
       freeSpaceMethod: this.tuning.freeSpaceMethod, linkedVariant: this.tuning.linkedVariant, journalMode: this.config.journalingEnabled ? this.tuning.journalMode : 'off' });
@@ -634,103 +636,111 @@ export class KernelImpl implements Kernel {
     for (let i = 0; i < ticks; i++) log.push(...this.step());
     return log;
   }
-  syscall(request: SyscallRequest): SyscallResult {
-    const pcb = this.table.get(request.pid);
-    const live = pcb !== undefined && pcb.state !== 'zombie' && pcb.state !== 'terminated';
-    const trap = live && this.enabled.has('security') ? this.securitySubsystem.enterTrap(pcb.pid) : null;
-    try {
-      const result = !live ? failure('ESRCH', 'process not found') : this.dispatchSyscall(pcb, request);
-      this.syscallResults.set(request.pid, result);
-      const actor = live ? this.ioActor(pcb) : undefined;
-      if (actor === undefined || !this.enabled.has('fs') || this.fileSystemSubsystem.pending(actor) === undefined) this.publish({ type: 'syscall.invoked', request, result });
-      return result;
-    } finally { if (live && this.enabled.has('security')) this.securitySubsystem.returnTrap(pcb.pid, trap); }
-  }
-  private dispatchSyscall(pcb: ProcessControlBlock, request: SyscallRequest): SyscallResult {
-    const arg = request.args[0];
-    switch (request.name) {
-      case 'getpid': return { ok: true, value: pcb.pid };
-      case 'fork': return this.lifecycle.fork(pcb);
-      case 'exec': {
-        if (pcb.state === 'waiting') return failure('EBUSY', 'cannot exec a blocked process');
-        const target = typeof arg === 'string' && this.enabled.has('fs') && this.fileSystemSubsystem.mounted && !this.namedPrograms.has(arg)
-          ? this.fileSystemSubsystem.execTarget(pcb.pid, arg) : undefined;
-        if (target !== undefined && !target.result.ok) return target.result;
-        const result = typeof arg === 'string' ? this.lifecycle.exec(pcb, target?.programName ?? arg) : failure('EINVAL', 'exec requires a program name');
-        if (result.ok) { this.threads.recompute(pcb); this.securitySubsystem.commitExec(pcb.pid, target?.inode); }
+  /** Executes the call immediately and synchronously, outside the tick loop (sim spec 14.1). */
+  syscall(request: SyscallRequest): SyscallResult { return dispatch(request, this.syscallState); }
+  /**
+   * The narrow kernel view the syscall table works through. Public so a test can
+   * hand it to `dispatch` with a substituted table (decision D13). Every operation
+   * delegates to the subsystem that owns the logic.
+   */
+  readonly syscallState: KernelState = this.buildSyscallState();
+  private buildSyscallState(): KernelState {
+    const kernel = this;
+    return {
+      get tick() { return kernel.tick; }, get config() { return kernel.config; }, get tuning() { return kernel.tuning; },
+      enabled: id => kernel.enabled.has(id),
+      pcb: pid => kernel.table.get(pid),
+      parentOf: pid => kernel.table.parentOf(pid),
+      pageCount: space => kernel.pageTables.get(space)?.length ?? 0,
+      rings: {
+        enter: pid => (kernel.enabled.has('security') ? kernel.securitySubsystem.enterTrap(pid) : null),
+        leave: (pid, trap) => { if (kernel.enabled.has('security')) kernel.securitySubsystem.returnTrap(pid, trap); },
+      },
+      callerDomain: pid => kernel.securitySubsystem.callerDomain(pid),
+      callerRing: pid => kernel.securitySubsystem.identity(pid)?.ring ?? 3,
+      checkAccess: (domain, object, right) => kernel.securitySubsystem.check(domain, object, right),
+      record: (pid, request, result) => {
+        kernel.syscallResults.set(pid, result);
+        const pcb = kernel.table.get(pid); const actor = pcb === undefined ? undefined : kernel.ioActor(pcb);
+        // A pending file call publishes its own syscall.invoked when it completes (WP-10), so it is not emitted twice.
+        if (actor === undefined || !kernel.enabled.has('fs') || kernel.fileSystemSubsystem.pending(actor) === undefined) kernel.publish({ type: 'syscall.invoked', request, result });
+      },
+      emit: event => kernel.publish(event),
+      fork: pcb => kernel.lifecycle.fork(pcb),
+      exec: (pcb, name) => kernel.execProgram(pcb, name),
+      exit: (pcb, code) => kernel.exitProcess(pcb, code),
+      wait: (pcb, child) => kernel.waitFor(pcb, child),
+      kill: (target, byParent) => kernel.exitProcess(target, 137, byParent ? 'killed_by_parent' : 'killed_by_user'),
+      setPriority: (pcb, priority) => { pcb.priority = priority; },
+      regionExists: id => kernel.ipc.sharedRegion(id) !== undefined,
+      mapRegion: (pid, id, writable) => kernel.ipc.mmap(pid, id, writable),
+      unmapRange: (pid, first, pages) => kernel.ipc.munmapRange(pid, first, pages),
+      growAddressSpace: (pcb, pages) => {
+        const current = kernel.pageTables.get(pcb.addressSpaceId)?.length ?? 0;
+        if (!Number.isSafeInteger(current + pages)) return null;
+        return kernel.memorySubsystem.resizeAddressSpace(pcb.addressSpaceId, current + pages).firstNewPage;
+      },
+      shrinkAddressSpace: (pcb, pages) => kernel.releaseTail(pcb, pages),
+      file: request => kernel.fileSystemSubsystem.syscall(request),
+      syncFiles: pcb => {
+        if (kernel.enabled.has('fs') && kernel.fileSystemSubsystem.mounted) return kernel.fileSystemSubsystem.syscall({ name: 'sync', pid: pcb.pid, args: [] });
+        return kernel.enabled.has('io') ? kernel.ioSubsystem.sync(kernel.ioActor(pcb)) : failure('EINVAL', 'I/O is disabled');
+      },
+      primitiveKind: resource => kernel.syncSubsystem.get(resource)?.kind,
+      syncCall: (pid, operation, resource) => kernel.syncSubsystem.syscall(pid, operation, resource),
+      resourceExists: id => kernel.deadlockSubsystem.owns(id),
+      request: (pid, vector) => kernel.deadlockSubsystem.requestVector(pid, vector),
+      release: (pid, vector) => kernel.deadlockSubsystem.releaseVector(pid, vector),
+      deviceExists: id => kernel.ioSubsystem.devices.some(device => device.id === id),
+      ioctl: (pcb, device, command, args) => {
+        if (device === 'kernel' && command === 'tlb_flush') { kernel.memorySubsystem.flush(); return { ok: true, value: null }; }
+        if (!kernel.enabled.has('io')) return failure('EINVAL', 'unknown kernel ioctl subcommand');
+        const result = kernel.ioSubsystem.control(device, command, args, kernel.ioActor(pcb));
+        if (result.ok && command === 'set_policy') kernel.currentConfig = cloneConfig({ ...kernel.config, diskPolicy: kernel.storageSubsystem.activePolicy });
         return result;
-      }
-      case 'exit': return typeof arg === 'number' && Number.isSafeInteger(arg)
-        ? this.exitProcess(pcb, arg) : failure('EINVAL', 'exit requires an integer code');
-      case 'wait': {
-        if (arg !== undefined && (typeof arg !== 'number' || !Number.isSafeInteger(arg) || arg < 0)) return failure('EINVAL', 'invalid child pid');
-        const child = typeof arg === 'number' ? asPid(arg) : null;
-        if (child !== null && (this.table.parentOf(child) !== pcb.pid || this.table.get(child)?.state === 'terminated')) return failure('ESRCH', 'not a child');
-        if (pcb.state !== 'running' && !this.lifecycle.hasExitedChild(pcb.pid, child)) {
-          const hasChildren = this.table.filterAscending(p => this.table.parentOf(p.pid) === pcb.pid && p.state !== 'terminated').length > 0;
-          if (hasChildren) return failure('EBUSY', 'blocking wait requires a running caller');
-        }
-        return this.lifecycle.wait(pcb, child);
-      }
-      case 'kill': {
-        if (typeof arg !== 'number' || !Number.isSafeInteger(arg)) return failure('EINVAL', 'invalid target pid');
-        const target = this.table.get(asPid(arg));
-        if (target === undefined || target.pid === asPid(0)) return failure('ESRCH', 'process not found');
-        return this.exitProcess(target, 137, target.parent === pcb.pid ? 'killed_by_parent' : 'killed_by_user');
-      }
-      case 'ioctl':
-        // TODO(astra): WP-11 validates ioctl arguments.
-        if (arg !== 'tlb_flush') {
-          if (!this.enabled.has('io') || typeof arg !== 'string' || typeof request.args[1] !== 'string') return failure('EINVAL', 'unknown kernel ioctl subcommand');
-          const result = this.ioSubsystem.control(arg as DeviceId, request.args[1], request.args.slice(2), this.ioActor(pcb));
-          if (result.ok && request.args[1] === 'set_policy') this.currentConfig = cloneConfig({ ...this.config, diskPolicy: this.storageSubsystem.activePolicy });
-          return result;
-        }
-        this.memorySubsystem.flush(); return { ok: true, value: null };
-      case 'sync':
-        // TODO(astra): WP-11 validates sync arguments.
-        if (this.enabled.has('fs') && this.fileSystemSubsystem.mounted) return this.fileSystemSubsystem.syscall(request);
-        return this.enabled.has('io') ? this.ioSubsystem.sync(this.ioActor(pcb)) : failure('EINVAL', 'I/O is disabled');
-      case 'read': case 'write': {
-        // TODO(astra): WP-11 validates read and write arguments; the byte-count bound below is the SEC-ARG-1 check it takes over.
-        const invalid = this.securitySubsystem.validateByteCount(pcb.pid, request.args[1]);
-        if (invalid !== null) return invalid;
-        return this.fileSystemSubsystem.syscall(request);
-      }
-      case 'open': case 'close': case 'seek': case 'stat': case 'unlink': case 'mkdir': case 'chmod':
-        // TODO(astra): WP-11 validates open, close, seek, stat, unlink, mkdir and chmod arguments.
-        return this.fileSystemSubsystem.syscall(request);
-      case 'sem_wait':
-        // TODO(astra): WP-11 validates sem_wait arguments.
-        return typeof arg === 'string' && request.args.length === 1 ? this.syncSubsystem.syscall(pcb.pid, 'sem_wait', arg as ResourceId) : failure('EINVAL', 'expected a synchronization resource');
-      case 'sem_post':
-        // TODO(astra): WP-11 validates sem_post arguments.
-        return typeof arg === 'string' && request.args.length === 1 ? this.syncSubsystem.syscall(pcb.pid, 'sem_post', arg as ResourceId) : failure('EINVAL', 'expected a synchronization resource');
-      case 'mutex_lock':
-        // TODO(astra): WP-11 validates mutex_lock arguments.
-        return typeof arg === 'string' && request.args.length === 1 ? this.syncSubsystem.syscall(pcb.pid, 'mutex_lock', arg as ResourceId) : failure('EINVAL', 'expected a synchronization resource');
-      case 'mutex_unlock':
-        // TODO(astra): WP-11 validates mutex_unlock arguments.
-        return typeof arg === 'string' && request.args.length === 1 ? this.syncSubsystem.syscall(pcb.pid, 'mutex_unlock', arg as ResourceId) : failure('EINVAL', 'expected a synchronization resource');
-      case 'request': {
-        // TODO(astra): WP-11 validates request arguments.
-        const vector = decodeResourceVector(request.args);
-        return vector === undefined ? failure('EINVAL', 'expected resource/count pairs') : this.deadlockSubsystem.requestVector(pcb.pid, vector);
-      }
-      case 'release': {
-        // TODO(astra): WP-11 validates release arguments.
-        const vector = decodeResourceVector(request.args);
-        return vector === undefined ? failure('EINVAL', 'expected resource/count pairs') : this.deadlockSubsystem.releaseVector(pcb.pid, vector);
-      }
-      case 'nice':
-        if (typeof arg !== 'number' || !Number.isSafeInteger(arg) || arg < 0 || arg > 39) return failure('EINVAL', 'priority must be in [0, 39]');
-        pcb.priority = arg; return { ok: true, value: arg };
-      default:
-        // TODO(astra): WP-11 completes the syscall table.
-        return failure('EINVAL', 'not implemented in WP-02');
-    }
+      },
+    };
   }
-  private exitProcess(pcb: ProcessControlBlock, code: number, reason: import('./types').TerminationReason = 'normal_exit'): SyscallResult {
+  private execProgram(pcb: ProcessControlBlock, name: string): SyscallResult {
+    if (pcb.state === 'waiting') return failure('EBUSY', 'cannot exec a blocked process');
+    const target = this.enabled.has('fs') && this.fileSystemSubsystem.mounted && !this.namedPrograms.has(name)
+      ? this.fileSystemSubsystem.execTarget(pcb.pid, name) : undefined;
+    if (target !== undefined && !target.result.ok) return target.result;
+    const result = this.lifecycle.exec(pcb, target?.programName ?? name);
+    if (result.ok) { this.threads.recompute(pcb); this.securitySubsystem.commitExec(pcb.pid, target?.inode); }
+    return result;
+  }
+  private waitFor(pcb: ProcessControlBlock, child: Pid | null): SyscallResult {
+    if (child !== null && (this.table.parentOf(child) !== pcb.pid || this.table.get(child)?.state === 'terminated')) return failure('ESRCH', 'not a child');
+    if (pcb.state !== 'running' && !this.lifecycle.hasExitedChild(pcb.pid, child)) {
+      const hasChildren = this.table.filterAscending(p => this.table.parentOf(p.pid) === pcb.pid && p.state !== 'terminated').length > 0;
+      if (hasChildren) return failure('EBUSY', 'blocking wait requires a running caller');
+    }
+    return this.lifecycle.wait(pcb, child);
+  }
+  /**
+   * Release the highest `pages` pages of an anonymous address space through the
+   * copy-on-write rule lifecycle uses on exit: a frame shared by copy-on-write
+   * loses one reference and its last alias regains write permission; a frame
+   * pinned by a shared region stays mapped for its attachers; an exclusively
+   * owned frame is freed.
+   */
+  private releaseTail(pcb: ProcessControlBlock, pages: number): readonly FrameId[] {
+    const current = this.pageTables.get(pcb.addressSpaceId)?.length ?? 0;
+    const removed = this.memorySubsystem.resizeAddressSpace(pcb.addressSpaceId, Math.max(0, current - pages)).removed;
+    const freed: FrameId[] = [];
+    for (const entry of removed) {
+      if (!entry.valid || entry.frame === null) continue;
+      const frame = entry.frame;
+      if (this.frames[frame]?.pinned === true) continue;
+      const remaining = (this.lifecycle.cowRefCount.get(frame) ?? 1) - 1;
+      if (remaining <= 0) { this.lifecycle.cowRefCount.delete(frame); this.memory.freeFrame(frame); freed.push(frame); continue; }
+      this.lifecycle.cowRefCount.set(frame, remaining);
+      if (remaining === 1) for (const table of this.pageTables.values()) for (const pte of table) if (pte.valid && pte.frame === frame) pte.writable = true;
+    }
+    return freed;
+  }
+  private exitProcess(pcb: ProcessControlBlock, code: number, reason: TerminationReason = 'normal_exit'): SyscallResult {
     if (pcb.pid === asPid(0)) return failure('EPERM', 'idle cannot exit');
     if (pcb.state === 'new') {
       pcb.exitCode = code; pcb.terminationReason = reason; this.move(pcb, 'terminated');
