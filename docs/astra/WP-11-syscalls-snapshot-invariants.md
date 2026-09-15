@@ -995,3 +995,109 @@ future; where this section disagrees with them, this section wins.
   markers outside `types.ts`; every one of them is yours. This package ends
   with zero.
 
+## Pre-flight decisions 2026-09-15
+
+The WP-11 agent's pre-flight mapped all thirty acceptance criteria against
+cb08cce, listed the fourteen markers with resolutions, proposed the amendment
+14 field list, and raised seventeen decisions and three protected-test
+migrations. The code claims were checked (the dispatcher accepts any live
+process at Kernel.ts:639-641, `nice` is absolute at 725-727 against a
+readonly `basePriority`, the wait message is at lifecycle.ts:176,
+`DiskQueue` rebuilds a map per transfer, sync validates actors against live
+tables at SyncSubsystem.ts:626-628). Rulings follow.
+
+### Amendment 14, approved as listed
+
+Every field in the pre-flight's table is approved, with version staying 1
+(no v1 payload was ever produced) and the D15 definitions written into the
+patch comments. Send the exact patch with the standalone strict JsonValue
+proof; the contract-only commit passes all four gates on its own.
+
+### Decisions D1 to D17
+
+- **D1, approved.** Stage the process channel into live tables first, then
+  run each registered hook prepare-then-commit in registration order
+  (memory, sync, deadlock, storage and io, fs and security). Completeness,
+  version and process-payload validation run before any mutation; any
+  failure after staging rolls back from an entry snapshot, recursion
+  guarded, both errors rethrown if the rollback fails. The "one invalid
+  contribution changes nothing" guarantee is kept by that rollback.
+- **D2, approved.** `nice(delta)` relative to the current priority, clamped
+  to [0, 39], returns the new priority, negative delta needs `control` on
+  `process:<self>` when security is enabled; `exit` enforces [0, 255];
+  `wait(-1)` means any child; `kill` implements signals 0 and 9, EINVAL
+  otherwise, EPERM unless parent, self or `control` on `process:<pid>`,
+  checked only with security enabled. If any protected test asserts the old
+  absolute `nice`, quote-and-wait.
+- **D3, approved.** WP-02's live-process rule stands (ESRCH for zombie,
+  terminated or unknown; EBUSY where a call would block a non-running
+  caller). The package's "non-running caller returns EPERM" test row is
+  withdrawn; spec 14.1 is corrected by this section.
+- **D4, approved.** Object rights stay with their owners so
+  `security.access_denied` is emitted once; the gate checks `kill` and
+  `nice` only; `CallSpec.requiredRight` is null for owner-checked rights.
+- **D5 and D7, approved on the alternative.** One method
+  `MemorySubsystem.resizeAddressSpace(space, pages)` for anonymous grow and
+  shrink (page-table construction shared with spawn, frame release and COW
+  counts handled as `releaseAddressSpace` does), used by `mmap`, `munmap`
+  and `brk`; region cases go through `ipc.mmap` and `munmapRange`. Two
+  tuning keys in `config.ts`: `maxOpenFiles` 32 and `maxPagesPerProcess`
+  1024, both integer-validated. WP-05 and WP-06 tests untouched.
+- **D6, approved.** Gate-level ENOENT for an unknown resource, primitive,
+  region or device and EPERM for releasing more than held, before
+  delegation. Over-post stays EINVAL (WP-07 S2). Two narrow fs edits are
+  granted because they are spec rows with no other owner left: `open` mode
+  `'wx'` returning EEXIST, and `maxOpenFiles` enforcement returning EAGAIN,
+  both in `FileSystemSubsystem.ts` with WP-10's tests untouched. Spec 14.3
+  and 14.4 are corrected by this section for the rows the code settled
+  (EINVAL over-post, EBUSY for blocking non-running callers).
+- **D8, approved.** `(device, command, ...args)` with the `kernel`
+  pseudo-device is canonical, and the bare `['tlb_flush']` is accepted as an
+  alias for `['kernel', 'tlb_flush']` so `tlb.test.ts` stays untouched.
+- **D9, approved.** One-line edit at lifecycle.ts:176 to
+  `no children: ${pcb.pid}` with the quoted process.test.ts:222 replacement.
+- **D10, approved.** The sweep workload as proposed, with its own timeout
+  and reported wall time. If the 252 combinations exceed 120 s on the CI
+  runner, halve the tick count and say so in the report rather than
+  raising the timeout further.
+- **D11, approved.** Grant `SecuritySubsystem.secretAppearsIn(text)` as a
+  boolean predicate (it reveals nothing). I-36's negative test goes through
+  the public restore path with a hand-built payload if validation admits
+  it; if not, I-36 and I-37 are reported as invariants without negative
+  tests, with the reason.
+- **D12, approved.** The four `snapshotContribution`/`restoreContribution`
+  pairs (ThreadManager, IpcManager, ProcessLifecycle, ProcessTable) are the
+  granted additions; list their line ranges.
+- **D13, approved.** Public readonly `syscallState`, `invariantState()`, and
+  an exported `dispatch(request, state, table)`.
+- **D14.** Leave `determinism.test.ts` untouched, including the stale
+  comment; note it in the report.
+- **D15, approved** as the patch comments.
+- **D16, approved.** Delete `validateByteCount` and its marker once
+  `validate.ts` carries the SEC-ARG-1 check with the exact prefix.
+- **D17, approved.** Persisted sorted array, private `Map<lba, number[]>`
+  mirror rebuilt on restore and updated per write, array regenerated in
+  `saveState`.
+
+### Quote-and-wait, approved
+
+All three replacements as quoted: process.test.ts:222; stepOrder.test.ts
+106-109 with the retitled case; stepOrder.test.ts 181-185 with the retitled
+case. No `tlb.test.ts` change (D8 alias).
+
+### Corrections this section makes to the spec
+
+Spec 14.1: a non-running live caller is not refused with EPERM; zombie,
+terminated and unknown callers get ESRCH and calls that would block a
+non-running caller get EBUSY. Spec 14.3 and 14.4: `sem_post` over-post is
+EINVAL; `open` gains mode `'wx'`; `nice` takes a delta and returns the new
+priority; `wait(-1)` is any child. The package's I-13 wording follows the
+code (ready processes only).
+
+### Not granted
+
+- No subsystem edit beyond D5's one method, D6's two fs edits, D11's
+  predicate, D16's deletion, D17's map, and the four D12 pairs.
+- No change to `determinism.test.ts` or `tlb.test.ts`.
+- No phase body or `step()` edit.
+
