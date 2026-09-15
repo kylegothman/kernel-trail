@@ -8,12 +8,13 @@ const rng = (seed = 1) => ({ next: () => { seed = (seed * 1664525 + 1013904223) 
 describe('derezz fracture', () => {
   it('is deterministic and carries all fracture attributes', () => {
     const source = new BoxGeometry(1, 1, 1);
-    const a = fracture(source, 0.12, rng(42));
-    const b = fracture(source, 0.12, rng(42));
+    const runs = Array.from({ length: 10 }, () => fracture(source, 0.12, rng(42)));
+    const a = runs[0]!;
+    const b = runs[1]!;
     for (const name of ['position', 'aCentroid', 'aRandom', 'aSeed', 'aSurface']) expect(Array.from(a.geometry.getAttribute(name).array as ArrayLike<number>)).toEqual(Array.from(b.geometry.getAttribute(name).array as ArrayLike<number>));
     expect(a.geometry.getAttribute('position').count).toBe(a.cubes * 36);
     expect(a.geometry.getAttribute('aSurface').count).toBe(a.cubes * 36);
-    source.dispose(); a.geometry.dispose(); b.geometry.dispose();
+    source.dispose(); for (const run of runs) run.geometry.dispose();
   });
 
   it('uses named and anonymous cells, scales to tier caps, and marks interior cubes', () => {

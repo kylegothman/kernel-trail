@@ -34,6 +34,21 @@ describe('EffectPool', () => {
     expect(drop.spawn(spawn())).toBeNull();
   });
 
+  it('does not allocate Three math objects after construction', () => {
+    const pool = new EffectPool({ capacity: 1000, overflow: 'drop' });
+    let allocations = 0;
+    const spec = spawn();
+    const prior = (globalThis as { __ktAlloc?: (name: string) => void }).__ktAlloc;
+    (globalThis as { __ktAlloc?: (name: string) => void }).__ktAlloc = () => { allocations += 1; };
+    try {
+      for (let i = 0; i < 100000; i += 1) { pool.spawn(spec); pool.update(2); }
+    } finally {
+      if (prior) (globalThis as { __ktAlloc?: (name: string) => void }).__ktAlloc = prior;
+      else delete (globalThis as { __ktAlloc?: (name: string) => void }).__ktAlloc;
+    }
+    expect(allocations).toBe(0);
+  });
+
   it('does not grow and clears back to a reusable fixed stack', () => {
     const pool = new EffectPool({ capacity: 1000, overflow: 'drop' });
     for (let i = 0; i < 100000; i += 1) { pool.spawn(spawn()); pool.update(2); }

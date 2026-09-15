@@ -40,6 +40,21 @@ describe('FrameEventQueue', () => {
     expect(aggregates.syscallCount).toBe(200);
   });
 
+  it('matches the 500-page-fault worked example', () => {
+    const memory = new MemoryVisuals();
+    const noop = () => {};
+    const router = new WorldEventRouter({ process: { onCreated: noop, onStateChanged: noop, onExited: noop, onReaped: noop, onStarving: noop, onThreadCreated: noop, onThreadJoined: noop }, scheduler: { onContextSwitch: noop, onQuantumExpired: noop }, memory, sync: { onAcquired: noop, onBlocked: noop, onReleased: noop, onRace: noop, onBusyWait: noop }, deadlock: { onRequested: noop, onGranted: noop, onDenied: noop, onBankers: noop, onDetected: noop, onResolved: noop }, storage: { onQueued: noop, onSeek: noop, onServed: noop, onRaidRebuild: noop }, io: { onRequest: noop, onInterrupt: noop, onDma: noop, onPollWasted: noop }, fs: { onBlockAllocated: noop, onFragmented: noop, onJournal: noop, onCorruption: noop, onRecovered: noop }, security: { onAccessDenied: noop, onEscalation: noop }, system: { onSyscall: noop, onPanic: noop } }, { elapsedSeconds: 0, tick: 0, suppressEffects: false });
+    const queue = new FrameEventQueue(router);
+    for (let i = 0; i < 500; i += 1) queue.push([event('memory.page_fault', i, { pid: 1, page: i, major: i % 2 === 0 })]);
+    const aggregates = queue.drain();
+    expect(aggregates.faultCount).toBe(500);
+    expect(memory.reactions.filter((reaction) => reaction.kind === 'fault_mote')).toHaveLength(12);
+    const surges = memory.reactions.filter((reaction) => reaction.kind === 'fault_surge');
+    expect(surges).toHaveLength(1);
+    expect(surges[0]?.effect?.intensity).toBe(1);
+    expect(surges[0]?.effect?.a).toBe(500);
+  });
+
   it('lets the world turn a sampled syscall stream into one rate treatment', () => {
     const system = new SystemVisuals();
     const router = new WorldEventRouter({ process: new ProcessVisuals(), scheduler: new SchedulerVisuals(), memory: new MemoryVisuals(), sync: new SyncVisuals(), deadlock: new DeadlockVisuals(), storage: new StorageVisuals(), io: new IoVisuals(), fs: new FsVisuals(), security: new SecurityVisuals(), system }, { elapsedSeconds: 0, tick: 0, suppressEffects: false });
