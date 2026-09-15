@@ -32,74 +32,19 @@
  * top of RendererBackend.ts.
  */
 
-import { Matrix4, Quaternion, Vector2, Vector3 } from 'three/webgpu';
+import { Matrix4, Quaternion, Vector2, Vector3, WebGLCoordinateSystem } from 'three/webgpu';
 import type { Material, Object3D, PerspectiveCamera, Scene } from 'three/webgpu';
 
-import { CAMERA, EASE, FOCUS, FOCUS_DURATION_MS, MIN_GLYPH_PX } from '@design/tokens';
+import { CAMERA, FOCUS, MIN_GLYPH_PX } from '@design/tokens';
+import { EASE, FOCUS_DURATION_MS } from '@design/motion';
+import { acquireFocusMaterial, releaseFocusMaterials, materialFocusUniform } from '../materials';
 
 /* ------------------------------------------------------------------------- */
 /* Types (03-VISUAL-BIBLE 6.2)                                                */
 /* ------------------------------------------------------------------------- */
 
-export type FocusMode = 'free' | 'engaging' | 'locked' | 'releasing';
-
-/**
- * A diegetic structure the camera can lock onto. Legs register these from
- * `createStage` and address them by the same string that `InteractionDef.anchor`
- * uses, which is what keeps a lock target and an interaction target from drifting
- * apart as a leg is edited.
- */
-export interface FocusTarget {
-  readonly id: string;
-  /** The object whose transform defines the reading plane. */
-  readonly anchor: Object3D;
-  /** Outward normal of the reading plane, in the anchor's local space. */
-  readonly planeNormal: Vector3;
-  /** Which way is up on the reading plane, in the anchor's local space. */
-  readonly planeUp: Vector3;
-  /** World-space size of the region to frame, on the plane's axes. */
-  readonly extents: Vector2;
-  /** Extra framing margin as a fraction of extents. FOCUS.padding by default. */
-  readonly padding: number;
-  /**
-   * Objects that stay at full brightness during the lock. The anchor's subtree
-   * is included automatically; add cross-references such as the beams into a
-   * wait-for graph, which are not children of the structure they describe.
-   */
-  readonly focusSet: readonly Object3D[];
-  /** How far everything outside the focus set is pushed down. 0 none, 1 dark. */
-  readonly dimOthers: number;
-  /** Whether world-space labels inside the focus set snap to the plane. */
-  readonly labelPlane: 'billboard-to-focus' | 'billboard-to-camera';
-  /**
-   * Minimum world height a glyph must subtend, in metres, at the framed
-   * distance. If the structure's label density would push text below this, the
-   * framing expands to a sub-region and the lock gains a pan affordance rather
-   * than shrinking the type. Text never scales below MIN_GLYPH_PX in this game.
-   */
-  readonly minGlyphHeight: number;
-}
-
-export interface CameraPose {
-  readonly position: Vector3;
-  readonly quaternion: Quaternion;
-  /** Perspective vertical FOV in radians. Ignored when the ortho blend is 1. */
-  readonly fov: number;
-  /** Orthographic frustum height in world units at the focus plane. */
-  readonly orthoHeight: number;
-}
-
-export interface FocusCameraState {
-  readonly mode: FocusMode;
-  readonly target: FocusTarget | null;
-  /** Raw transition progress, 0..1, linear in time. */
-  readonly t: number;
-  /** Eased progress. This is what every consumer reads. */
-  readonly blend: number;
-  readonly from: CameraPose;
-  readonly to: CameraPose;
-  readonly durationMs: number;
-}
+import type { FocusMode, FocusTarget, CameraPose, FocusCameraState } from './focusContract';
+export type { FocusMode, FocusTarget, CameraPose, FocusCameraState } from './focusContract';
 
 /**
  * Where the free camera wants to be. Supplied by the game layer once per frame:
@@ -140,63 +85,8 @@ export type FocusCamera = FocusCameraController;
 /* Projection blending (6.3)                                                  */
 /* ------------------------------------------------------------------------- */
 
-const _persp = new Matrix4();
-const _ortho = new Matrix4();
-
-/**
- * Blend perspective into orthographic on a single camera.
- *
- * There is exactly one `PerspectiveCamera` in the scene. Swapping to an
- * `OrthographicCamera` at the end of the transition produces a visible pop,
- * because the two projections disagree everywhere except at one depth. Instead
- * both matrices are built each frame and blended element-wise.
- *
- * The blend is artefact-free at the focus plane because the orthographic frustum
- * height is chosen so the two projections agree exactly there: with
- * `orthoHeight = 2 * d * tan(fov/2)` both matrices map the focus plane to
- * identical screen coordinates, so the element-wise lerp introduces no
- * distortion where the player is looking. Off the plane the lerp is a smooth (if
- * not projectively exact) morph, which is what reads as the world flattening out.
- *
- * `Frustum.setFromProjectionMatrix` still works on the blended matrix, so culling
- * behaves throughout the transition. That is not an accident of the maths; it is
- * why the blend is done on the matrix rather than by interpolating a projection
- * parameter.
- */
-export function blendProjection(
-  cam: PerspectiveCamera,
-  aspect: number,
-  fov: number,
-  focusDistance: number,
-  near: number,
-  far: number,
-  blend: number,
-): void {
-  const halfH = Math.tan(fov * 0.5) * focusDistance;
-  const halfW = halfH * aspect;
-  const k = near / focusDistance;
-
-  _persp.makePerspective(
-    -halfW * k,
-    halfW * k,
-    halfH * k,
-    -halfH * k,
-    near,
-    far,
-    cam.coordinateSystem,
-  );
-  _ortho.makeOrthographic(-halfW, halfW, halfH, -halfH, near, far, cam.coordinateSystem);
-
-  const p = _persp.elements;
-  const o = _ortho.elements;
-  const e = cam.projectionMatrix.elements;
-  for (let i = 0; i < 16; i++) {
-    // TypeScript 7 widens typed-array reads to number | undefined. Every index
-    // here is 0..15 on three 16-element matrices, so the coalesce never fires.
-    e[i] = (p[i] ?? 0) + ((o[i] ?? 0) - (p[i] ?? 0)) * blend;
-  }
-  cam.projectionMatrixInverse.copy(cam.projectionMatrix).invert();
-}
+export { blendProjection } from './projection';
+import { blendProjection, BlendedPerspectiveCamera, commitProjection, convertDepthConvention } from './projection';
 
 /* ------------------------------------------------------------------------- */
 /* Framing and path (6.4)                                                     */
@@ -213,14 +103,15 @@ const _lookAt = new Matrix4();
  *
  * The stand-off distance is derived from the ortho height rather than chosen,
  * which is what makes the projection blend exact at the plane (see
- * `blendProjection`). It also guarantees the perspective start pose is outside
- * the structure and that near-plane clipping cannot occur during the arc.
+ * `blendProjection`). It supplies the prescribed stand-off; it is not a collision
+ * proof for arbitrary intervening geometry.
  */
-export function computeLockedPose(t: FocusTarget, aspect: number, fov: number): CameraPose {
+export function computeLockedPose(t: FocusTarget, aspect: number, fov: number, out: MutablePose = makePose()): CameraPose {
+  t.anchor.updateWorldMatrix(true, false);
   const m = t.anchor.matrixWorld;
-  const centre = new Vector3().setFromMatrixPosition(m);
-  const n = t.planeNormal.clone().transformDirection(m).normalize();
-  const up = t.planeUp.clone().transformDirection(m).normalize();
+  const centre = _centre.setFromMatrixPosition(m);
+  const n = _normal.copy(t.planeNormal).transformDirection(m).normalize();
+  const up = _up.copy(t.planeUp).transformDirection(m).normalize();
 
   // Frame the larger of the two constraints: width against aspect, or height.
   const pad = 1 + t.padding;
@@ -229,11 +120,11 @@ export function computeLockedPose(t: FocusTarget, aspect: number, fov: number): 
   const orthoHeight = Math.max(needH, needW / aspect) / FOCUS.fillFraction;
 
   const distance = orthoHeight * 0.5 / Math.tan(fov * 0.5);
-  const position = centre.clone().addScaledVector(n, distance);
-  const quaternion = new Quaternion().setFromRotationMatrix(
+  const position = out.position.copy(centre).addScaledVector(n, distance);
+  out.quaternion.setFromRotationMatrix(
     _lookAt.lookAt(position, centre, up),
   );
-  return { position, quaternion, fov, orthoHeight };
+  out.fov = fov; out.orthoHeight = orthoHeight; return out;
 }
 
 const _p1 = new Vector3();
@@ -323,6 +214,8 @@ export interface FocusUniformHandle {
 }
 
 function setFocusWeight(material: Material, weight: number): void {
+  const node = materialFocusUniform(material);
+  if (node) { node.value = weight; return; }
   const bearing = material as unknown as UniformsBearing;
   const direct = bearing.uniforms?.['uFocusWeight'];
   if (direct !== undefined) {
@@ -350,12 +243,8 @@ function materialsOf(o: Object3D, into: Set<Material>): void {
 /* The rig                                                                    */
 /* ------------------------------------------------------------------------- */
 
-const IDENTITY_POSE: CameraPose = {
-  position: new Vector3(),
-  quaternion: new Quaternion(),
-  fov: (CAMERA.fovDeg * Math.PI) / 180,
-  orthoHeight: 1,
-};
+type MutablePose = { position: Vector3; quaternion: Quaternion; fov: number; orthoHeight: number };
+function makePose(): MutablePose { return { position: new Vector3(), quaternion: new Quaternion(), fov: CAMERA.fovDeg * Math.PI / 180, orthoHeight: 1 }; }
 
 const DEG = Math.PI / 180;
 
@@ -390,12 +279,21 @@ export class FocusCameraRig implements FocusCameraController {
   // Explicitly number: the token object is `as const`, so an inferred type would
   // narrow to the engage literal and reject the release duration.
   private durationMs: number = FOCUS_DURATION_MS.engage;
-  private from: CameraPose = IDENTITY_POSE;
-  private to: CameraPose = IDENTITY_POSE;
+  private readonly from = makePose();
+  private readonly to = makePose();
+  private readonly trackedPose = makePose();
+  private readonly stateView: FocusCameraState = { mode: 'free', target: null, t: 1, blend: 0, from: this.from, to: this.to, durationMs: FOCUS_DURATION_MS.engage };
+  private pathProgress = 0;
+  private fromFocus = 0;
+  private readonly fromProjection = new Matrix4();
+  private projectionCoordinate: number = WebGLCoordinateSystem;
+  private projectionReverse = false;
+  private readonly labelPlaneQuaternion = new Quaternion();
+  private readonly glyphHeights = new Map<string, number>();
+  private readonly materialAssignments: { object: Object3D; original: Material | Material[] }[] = [];
   private lift = 0;
 
   /** Ortho blend, 0 perspective, 1 orthographic. Derived, but cached per frame. */
-  private orthoBlend = 0;
   /** Distance to the reading plane, metres. Feeds the projection blend. */
   private focusDistance = 1;
 
@@ -406,6 +304,7 @@ export class FocusCameraRig implements FocusCameraController {
 
   /** Free camera state, tracked continuously including through a lock. */
   private freeTarget: FreeCameraTarget | null = null;
+  private readonly freeInput = { focus: new Vector3(), yawRad: 0, pitchRad: 0, distanceM: 6 };
   private readonly freePos = new Vector3();
   private readonly freeVel = new Vector3();
   private readonly freeQuat = new Quaternion();
@@ -424,6 +323,8 @@ export class FocusCameraRig implements FocusCameraController {
     this.aspect = opts.aspect;
     this.viewportHeightPx = opts.viewportHeightPx;
 
+    this.camera.aspect = opts.aspect;
+    this.freePos.copy(this.camera.position); this.freeQuat.copy(this.camera.quaternion);
     this.camera.fov = CAMERA.fovDeg;
     this.camera.near = CAMERA.near;
     this.camera.far = CAMERA.far;
@@ -435,16 +336,10 @@ export class FocusCameraRig implements FocusCameraController {
     this.camera.updateProjectionMatrix();
   }
 
-  get state(): FocusCameraState {
-    return {
-      mode: this.mode,
-      target: this.target,
-      t: this.t,
-      blend: this.blend,
-      from: this.from,
-      to: this.to,
-      durationMs: this.durationMs,
-    };
+  get state(): FocusCameraState { this.publishState(); return this.stateView; }
+  private publishState(): void {
+    const state = this.stateView as { -readonly [K in keyof FocusCameraState]: FocusCameraState[K] };
+    state.mode=this.mode; state.target=this.target; state.t=this.t; state.blend=this.blend; state.durationMs=this.durationMs;
   }
 
   setViewport(aspect: number, heightPx: number): void {
@@ -454,9 +349,10 @@ export class FocusCameraRig implements FocusCameraController {
     // Reframing on resize keeps the 78% fill promise, which a locked read
     // depends on: a window drag that pushed a page table off frame would be a
     // worse bug than a one-frame reframe.
-    if (this.target !== null && this.mode !== 'free') {
-      this.to = computeLockedPose(this.target, aspect, this.camera.fov * DEG);
+    if (this.mode==='engaging'||this.mode==='releasing') {
+      const remaining=this.durationMs*(1-this.t);this.captureTransition();this.t=0;this.durationMs=Math.max(remaining,Number.EPSILON);
     }
+    if (this.target !== null && (this.mode === 'locked' || this.mode === 'engaging')) this.refreshLockedPose();
   }
 
   /* --- registration ----------------------------------------------------- */
@@ -466,7 +362,7 @@ export class FocusCameraRig implements FocusCameraController {
   }
 
   unregister(id: string): void {
-    this.targets.delete(id);
+    this.targets.delete(id); this.glyphHeights.delete(id);
     if (this.target?.id === id) this.release();
   }
 
@@ -495,7 +391,7 @@ export class FocusCameraRig implements FocusCameraController {
   setFreeTarget(t: FreeCameraTarget): void {
     const pitch = clamp(t.pitchRad, CAMERA.pitchMinDeg * DEG, CAMERA.pitchMaxDeg * DEG);
     const distance = clamp(t.distanceM, CAMERA.distanceMinM, CAMERA.distanceMaxM);
-    this.freeTarget = { focus: t.focus, yawRad: t.yawRad, pitchRad: pitch, distanceM: distance };
+    this.freeInput.focus.copy(t.focus); this.freeInput.yawRad=t.yawRad; this.freeInput.pitchRad=pitch; this.freeInput.distanceM=distance; this.freeTarget=this.freeInput;
   }
 
   /* --- transitions ------------------------------------------------------ */
@@ -516,31 +412,33 @@ export class FocusCameraRig implements FocusCameraController {
     // something updates it, and the framing would put the camera at the origin.
     target.anchor.updateWorldMatrix(true, false);
 
+    this.captureTransition();
     this.target = target;
     this.mode = 'engaging';
     this.t = 0;
-    this.blend = 0;
     this.durationMs = FOCUS_DURATION_MS.engage;
-    this.from = this.currentPose();
-    this.to = computeLockedPose(target, this.aspect, this.camera.fov * DEG);
+    this.refreshLockedPose();
     this.panOffset.set(0, 0);
     this.zoomFactor = 1;
 
-    const topY = target.anchor.position.y + target.extents.y * 0.5;
+    const m = target.anchor.matrixWorld;
+    _up.copy(target.planeUp).transformDirection(m); _normal.copy(target.planeNormal).transformDirection(m);
+    _delta.copy(_up).cross(_normal).normalize();
+    const topY = m.elements[13]! + Math.abs(_up.y)*target.extents.y*0.5 + Math.abs(_delta.y)*target.extents.x*0.5;
     this.lift = arcLift(this.from, this.to, topY);
 
-    this.resolveFocusSet(target);
+    this.resolveFocusSet(target);this.publishState();
     return true;
   }
 
   release(): void {
-    if (this.mode === 'free') return;
+    if (this.mode === 'free' || this.mode === 'releasing') return;
+    this.captureTransition();
     this.mode = 'releasing';
     this.t = 0;
     this.durationMs = FOCUS_DURATION_MS.release;
-    this.from = this.currentPose();
-    this.to = this.freePose();
-    this.lift = arcLift(this.from, this.to, this.from.position.y);
+    this.copyPose(this.to, this.freePose());
+    this.lift = arcLift(this.from, this.to, this.from.position.y);this.publishState();
   }
 
   /* --- locked-mode input ------------------------------------------------ */
@@ -548,15 +446,15 @@ export class FocusCameraRig implements FocusCameraController {
   /**
    * Pan within the reading plane, in metres. Clamped so the structure never
    * leaves frame: the pan range is whatever the framing does not already show,
-   * which is zero for a structure that fits and grows as the player zooms in.
+   * using the free margin when it fits, or a bounded sub-region when cropped.
    * Rotation is deliberately absent. That is the point of the lock.
    */
   pan(dxMetres: number, dyMetres: number): void {
     if (this.mode !== 'locked' || this.target === null) return;
     const orthoH = this.to.orthoHeight * this.zoomFactor;
     const orthoW = orthoH * this.aspect;
-    const maxX = Math.max(0, (this.target.extents.x - orthoW) * 0.5);
-    const maxY = Math.max(0, (this.target.extents.y - orthoH) * 0.5);
+    const maxX = Math.abs(this.target.extents.x - orthoW) * 0.5;
+    const maxY = Math.abs(this.target.extents.y - orthoH) * 0.5;
     this.panOffset.set(
       clamp(this.panOffset.x + dxMetres, -maxX, maxX),
       clamp(this.panOffset.y + dyMetres, -maxY, maxY),
@@ -574,6 +472,7 @@ export class FocusCameraRig implements FocusCameraController {
   /* --- per-frame -------------------------------------------------------- */
 
   update(dtSeconds: number): void {
+    if(!Number.isFinite(dtSeconds)||dtSeconds<0)throw new Error('Invalid frame delta');
     this.integrateFree(dtSeconds);
 
     switch (this.mode) {
@@ -582,6 +481,7 @@ export class FocusCameraRig implements FocusCameraController {
         break;
 
       case 'engaging':
+        this.refreshLockedPose();
         this.advance(dtSeconds, EASE.focusIn);
         this.applyTransition();
         if (this.t >= 1) {
@@ -600,7 +500,7 @@ export class FocusCameraRig implements FocusCameraController {
         // the convoy is still walking. Retargeting mid-transition would normally
         // produce a visible kink; it does not here because the release is short
         // and the free pose moves slowly relative to the camera's own travel.
-        this.to = this.freePose();
+        this.copyPose(this.to, this.freePose());
         this.advance(dtSeconds, EASE.focusOut);
         this.applyTransition();
         if (this.t >= 1) {
@@ -613,13 +513,17 @@ export class FocusCameraRig implements FocusCameraController {
       }
     }
 
+    this.camera.updateMatrix();
     this.camera.updateMatrixWorld();
     this.broadcastFocusWeights();
+    this.publishState();
   }
 
   private advance(dtSeconds: number, ease: (x: number) => number): void {
-    this.t = Math.min(1, this.t + (dtSeconds * 1000) / this.durationMs);
-    this.blend = ease(this.t);
+    const next=this.t+(dtSeconds*1000)/this.durationMs;
+    this.t = next>=1-Number.EPSILON*8?1:Math.min(1,next);
+    this.pathProgress = ease(this.t);
+    this.blend = this.mode === 'releasing' ? this.fromFocus * (1-this.pathProgress) : this.fromFocus + (1-this.fromFocus)*this.pathProgress;
   }
 
   /**
@@ -633,7 +537,7 @@ export class FocusCameraRig implements FocusCameraController {
    * overshoots.
    */
   private applyTransition(): void {
-    focusPath(this.from, this.to, this.lift, this.blend, _scratchPos);
+    focusPath(this.from, this.to, this.lift, this.pathProgress, _scratchPos);
 
     const rotT = Math.min(1, this.t * FOCUS.rotationLead);
     const rotEase = this.mode === 'releasing' ? EASE.focusOut(rotT) : EASE.focusIn(rotT);
@@ -646,23 +550,22 @@ export class FocusCameraRig implements FocusCameraController {
     // constant at CAMERA.fovDeg through the whole transition: the flattening
     // comes entirely from the projection blend, and animating the FOV as well
     // would produce a dolly-zoom, which is a different and much louder effect.
-    this.orthoBlend = this.mode === 'releasing' ? 1 - this.blend : this.blend;
     this.focusDistance = this.measureFocusDistance();
-    blendProjection(
-      this.camera,
-      this.aspect,
-      this.camera.fov * DEG,
-      this.focusDistance,
-      this.camera.near,
-      this.camera.far,
-      this.orthoBlend,
-    );
+    const destinationDistance = this.to.orthoHeight * 0.5 / Math.tan(this.camera.fov*DEG*0.5);
+    blendProjection(this.camera, this.aspect, this.camera.fov*DEG, Math.max(destinationDistance,this.camera.near), this.camera.near, this.camera.far, this.mode === 'releasing' ? 0 : 1);
+    convertDepthConvention(this.fromProjection,this.projectionCoordinate,this.projectionReverse,this.camera.coordinateSystem,this.camera.reversedDepth);
+    this.projectionCoordinate=this.camera.coordinateSystem; this.projectionReverse=this.camera.reversedDepth;
+    const e=this.camera.projectionMatrix.elements, f=this.fromProjection.elements;
+    for(let i=0;i<16;i++) e[i]=f[i]!+(e[i]!-f[i]!)*this.pathProgress;
+    commitProjection(this.camera);
   }
 
   private applyLocked(): void {
     const t = this.target;
     if (t === null) return;
 
+    this.refreshLockedPose();
+    this.pan(0,0);
     // Pan moves the camera within the plane rather than shifting the projection,
     // so the reading plane stays exactly perpendicular to the view direction and
     // labels stay square-on. Shifting the frustum instead would introduce a
@@ -679,7 +582,6 @@ export class FocusCameraRig implements FocusCameraController {
 
     this.camera.position.copy(_scratchPos);
     this.camera.quaternion.copy(this.to.quaternion);
-    this.orthoBlend = 1;
     this.focusDistance = this.measureFocusDistance();
 
     // Zoom scales the ortho height, and the projection blend derives that height
@@ -690,7 +592,7 @@ export class FocusCameraRig implements FocusCameraController {
       this.camera,
       this.aspect,
       this.camera.fov * DEG,
-      this.focusDistance * this.zoomFactor,
+      this.to.orthoHeight * 0.5 / Math.tan(this.camera.fov*DEG*0.5) * this.zoomFactor,
       this.camera.near,
       this.camera.far,
       1,
@@ -700,12 +602,12 @@ export class FocusCameraRig implements FocusCameraController {
   private applyPose(pose: CameraPose, orthoBlend: number): void {
     this.camera.position.copy(pose.position);
     this.camera.quaternion.copy(pose.quaternion);
-    this.orthoBlend = orthoBlend;
     if (orthoBlend === 0) {
       // Pure perspective. Let Three build the matrix so that any future change
       // to its projection maths (a different reversed-Z convention, say) reaches
       // the free camera without this file being edited.
-      this.camera.updateProjectionMatrix();
+      if (this.camera instanceof BlendedPerspectiveCamera) this.camera.usePerspective();
+      else this.camera.updateProjectionMatrix();
       return;
     }
     this.focusDistance = this.measureFocusDistance();
@@ -722,17 +624,17 @@ export class FocusCameraRig implements FocusCameraController {
 
   /**
    * Distance from the camera to the reading plane, measured along the plane
-   * normal rather than to the anchor's origin. The two differ once the player
-   * pans, and using the origin distance would make the projection blend
-   * inexact exactly where they are looking.
+   * view axis at the anchor. An oblique reading plane does not share one
+   * perspective depth; exact plane-wide agreement is asserted only when the
+   * plane is parallel to the image plane.
    */
   private measureFocusDistance(): number {
     const t = this.target;
     if (t === null) return this.to.orthoHeight * 0.5 / Math.tan(this.camera.fov * DEG * 0.5);
     const m = t.anchor.matrixWorld;
     _centre.setFromMatrixPosition(m);
-    _normal.copy(t.planeNormal).transformDirection(m).normalize();
-    _planeToCam.copy(this.camera.position).sub(_centre);
+    _normal.set(0,0,-1).applyQuaternion(this.camera.quaternion);
+    _planeToCam.copy(_centre).sub(this.camera.position);
     const d = Math.abs(_planeToCam.dot(_normal));
     // A degenerate distance (camera exactly on the plane) would make the
     // perspective matrix singular. The floor is the near plane, which is the
@@ -740,14 +642,36 @@ export class FocusCameraRig implements FocusCameraController {
     return Math.max(d, this.camera.near * 2);
   }
 
-  private currentPose(): CameraPose {
-    return {
-      position: this.camera.position.clone(),
-      quaternion: this.camera.quaternion.clone(),
-      fov: this.camera.fov * DEG,
-      orthoHeight: this.to.orthoHeight,
-    };
+  private copyPose(out: MutablePose, pose: CameraPose): void { out.position.copy(pose.position); out.quaternion.copy(pose.quaternion); out.fov=pose.fov; out.orthoHeight=pose.orthoHeight; }
+  private captureTransition(): void {
+    this.from.position.copy(this.camera.position); this.from.quaternion.copy(this.camera.quaternion);
+    this.from.fov=this.camera.fov*DEG; this.from.orthoHeight=this.to.orthoHeight*this.zoomFactor;
+    this.fromFocus=this.blend; this.fromProjection.copy(this.camera.projectionMatrix);
+    this.projectionCoordinate=this.camera.coordinateSystem; this.projectionReverse=this.camera.reversedDepth;
+    this.pathProgress=0;
   }
+  private refreshLockedPose(): void {
+    if (!this.target) return;
+    computeLockedPose(this.target,this.aspect,this.camera.fov*DEG,this.to);
+    this.labelPlaneQuaternion.copy(this.to.quaternion);
+    const glyph=this.glyphHeights.get(this.target.id);
+    if (glyph !== undefined) {
+      const height=Math.min(this.to.orthoHeight,glyph*this.viewportHeightPx/MIN_GLYPH_PX/FOCUS.zoomMax);
+      if(height<this.to.orthoHeight) {
+        this.to.orthoHeight=height;
+        _normal.copy(this.target.planeNormal).transformDirection(this.target.anchor.matrixWorld);
+        this.to.position.setFromMatrixPosition(this.target.anchor.matrixWorld).addScaledVector(_normal,height*0.5/Math.tan(this.to.fov*0.5));
+      }
+    }
+  }
+  /** Placement owns density; the frozen target shape remains unchanged. */
+  setLabelGlyphHeight(id: string, height: number): void {
+    if (!(height>0)) throw new Error('Glyph height must be positive');
+    this.glyphHeights.set(id,height);
+    if(this.target?.id===id) this.refreshLockedPose();
+  }
+  get focusDistanceM(): number { return this.measureFocusDistance(); }
+  dispose(): void { this.clearFocusSet(); this.targets.clear(); this.glyphHeights.clear(); this.extraUniforms.clear(); this.target=null; this.mode='free'; this.blend=0; this.publishState(); }
 
   /* --- free camera integration ------------------------------------------ */
 
@@ -793,12 +717,9 @@ export class FocusCameraRig implements FocusCameraController {
   }
 
   private freePose(): CameraPose {
-    return {
-      position: this.freePos,
-      quaternion: this.freeQuat,
-      fov: this.camera.fov * DEG,
-      orthoHeight: this.to.orthoHeight,
-    };
+    this.trackedPose.position.copy(this.freePos); this.trackedPose.quaternion.copy(this.freeQuat);
+    this.trackedPose.fov=this.camera.fov*DEG; this.trackedPose.orthoHeight=this.to.orthoHeight;
+    return this.trackedPose;
   }
 
   /* --- dimming (6.5) ---------------------------------------------------- */
@@ -839,35 +760,19 @@ export class FocusCameraRig implements FocusCameraController {
   private resolveFocusSet(target: FocusTarget): void {
     this.clearFocusSet();
 
-    target.anchor.traverse((o) => {
-      this.focusIds.add(o.id);
-      materialsOf(o, this.focusedMaterials);
+    this.focusIds.add(target.anchor.id);
+    for(const extra of target.focusSet) this.focusIds.add(extra.id);
+    this.scene.traverse((object) => {
+      const drawable=object as Object3D & {material?: Material | Material[]};
+      if(!drawable.material) return;
+      const focused=this.isInFocusSet(object);
+      const originals=drawable.material;
+      const group=focused?this.focusedMaterials:this.otherMaterials;
+      const wrap=(material:Material):Material=>acquireFocusMaterial(group,material);
+      drawable.material=Array.isArray(originals)?originals.map(wrap):wrap(originals);
+      this.materialAssignments.push({object,original:originals});
+      materialsOf(object,group);
     });
-    for (const extra of target.focusSet) {
-      extra.traverse((o) => {
-        this.focusIds.add(o.id);
-        materialsOf(o, this.focusedMaterials);
-      });
-    }
-
-    this.scene.traverse((o) => {
-      if (this.focusIds.has(o.id)) return;
-      materialsOf(o, this.otherMaterials);
-    });
-    // A material shared between a focused object and an unfocused one cannot be
-    // dimmed correctly. It is resolved in favour of the focus set, and flagged,
-    // because the fix is a second cache entry in the material factory rather
-    // than anything this file can do.
-    for (const m of this.focusedMaterials) {
-      if (this.otherMaterials.delete(m) && import.meta.env.DEV) {
-        console.warn(
-          `[kt] focus target "${target.id}" shares material "${m.name || m.uuid}" with ` +
-            'geometry outside the focus set. It will stay lit. Give the focused structure ' +
-            'its own material cache key. See 03-VISUAL-BIBLE 6.5.',
-        );
-      }
-    }
-
     this.lastBroadcastWeight = Number.NaN;
   }
 
@@ -876,6 +781,9 @@ export class FocusCameraRig implements FocusCameraController {
     // lock leaves the world at 18% until something else touches the uniform.
     for (const m of this.otherMaterials) setFocusWeight(m, 1);
     for (const u of this.extraUniforms) u.value = 1;
+    for(const entry of this.materialAssignments) (entry.object as Object3D & {material: Material | Material[]}).material=entry.original;
+    this.materialAssignments.length=0;
+    releaseFocusMaterials(this.focusedMaterials); releaseFocusMaterials(this.otherMaterials);
     this.focusIds.clear();
     this.focusedMaterials.clear();
     this.otherMaterials.clear();
@@ -920,7 +828,7 @@ export class FocusCameraRig implements FocusCameraController {
       return out.copy(billboardToCamera);
     }
     const s = smoothstep(FOCUS.labelPlaneBlend, 1, this.blend);
-    return out.copy(billboardToCamera).slerp(this.to.quaternion, EASE.settle(s));
+    return out.copy(billboardToCamera).slerp(this.labelPlaneQuaternion, EASE.settle(s));
   }
 
   /**
@@ -939,8 +847,10 @@ export class FocusCameraRig implements FocusCameraController {
    * by shrinking the type.
    */
   needsSubRegion(target: FocusTarget): boolean {
-    const pose = computeLockedPose(target, this.aspect, this.camera.fov * DEG);
-    return lockedCapHeight(pose.orthoHeight, this.viewportHeightPx) < target.minGlyphHeight;
+    const glyph=this.glyphHeights.get(target.id);
+    if(glyph===undefined) return false;
+    computeLockedPose(target,this.aspect,this.camera.fov*DEG,this.trackedPose);
+    return glyph*this.viewportHeightPx/this.trackedPose.orthoHeight < MIN_GLYPH_PX;
   }
 }
 

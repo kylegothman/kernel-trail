@@ -1,3 +1,5 @@
+import { Vector4, WebGLCoordinateSystem } from 'three/webgpu';
+import { projectionDepth } from './shaders/depth';
 import { RenderPipeline, DepthTexture, NoToneMapping, SRGBColorSpace, Vector2, Vector3, UnsignedByteType } from 'three/webgpu';
 import type { Camera, Scene, WebGPURenderer, RenderTarget, Node } from 'three/webgpu';
 import { texture, uniform, uv, vec3, vec4, mix, float, reinhardToneMapping } from 'three/tsl';
@@ -52,6 +54,9 @@ export class PostChain {
   private readonly vignettePower=uniform(VIGNETTE.power as number);
   private readonly fade=uniform(1);
   private readonly panicAmount=uniform(0);
+  private readonly projectionCoefficients=uniform(new Vector4());
+  private readonly projectionDepthScale=uniform(1);
+  private readonly projectionDepthBias=uniform(0);
   private readonly near=uniform(0.1);
   private readonly far=uniform(2000);
   readonly source=uniform(new Vector2(0.5,0.5));
@@ -137,10 +142,14 @@ export class PostChain {
         r.autoClear=false;
       }
       r.render(this.scene,this.camera);r.autoClear=true;this.camera.layers.mask=mask;
+      const e=this.camera.projectionMatrix.elements;
+      this.projectionCoefficients.value.set(e[10]!,e[14]!,e[11]!,e[15]!);
+      const gl=this.camera.coordinateSystem===WebGLCoordinateSystem&&!this.camera.reversedDepth;
+      this.projectionDepthScale.value=gl?2:1; this.projectionDepthBias.value=gl?-1:0;
     }});
     const depth=this.target('depth_resolve');
     const d=texture(world.depthTexture,uv()).r;
-    const z=this.near.mul(this.far).div(this.far.sub(d.mul(this.far.sub(this.near))));
+    const z=projectionDepth(d,this.projectionCoefficients,this.projectionDepthScale,this.projectionDepthBias);
     const beamDepth=this.target('beam_depth');
     beamSceneDepth.value=beamDepth.texture;textSceneDepth.value=depth.texture;
     this.add('scene_world.beam_depth',beamDepth,encodeDepth(z,this.far,this.options.capabilities.hdr));

@@ -838,3 +838,39 @@ Only the kernel contract hash changes. The frozen hashes for
 `src/design/tokens.ts` and `src/game/types.ts` are unchanged. The three-file
 freeze, source scanner, zero skip budget and all guard policies remain intact.
 No filesystem or security implementation accompanies this amendment commit.
+
+## Amendment 12, 2026-09-15: WP-13 cubicBezier correction
+
+**Approved by:** Kyle, for the exact solver-only patch and hash regeneration.
+**Status:** applied; number 12 is provisional against WP-10's amendment 11.
+
+Only `cubicBezier` in the frozen `src/design/tokens.ts` changes. All other token
+content is identical. Kernel and game hashes remain unchanged. The reviewed
+replacement token file has SHA-256:
+
+`e4e2fe11ac7a2c8f85b24cad9a65f73408cdd99ffc0d4980e28eeb2641faf260`
+
+Reproduction: `cubicBezier(0, 0, 0, 1)(0.001)` returned about -13709 in the old
+solver. Clamped Newton iteration with a bisection fallback now returns 0.028.
+The four named curves are unchanged within 1e-12; the pre-submission comparison
+across 1,001 samples per curve measured a maximum change of 3.33e-16. Kyle
+independently checked six curves including degenerate control points.
+
+Regeneration was human-approved on 2026-09-15 for this exact change only. The
+file remains frozen. General solver property assertions join acceptance 10 in
+the following WP-13 implementation commit, not this contract-only commit.
+
+## Amendment 13, 2026-09-15: WP-13 focus camera contract freeze
+
+**Approved by:** Kyle, for the exact focus camera contract content and hash regeneration.
+**Status:** applied; number 13 follows amendment 12.
+
+`src/render/camera/focusContract.ts` is now frozen. It defines `FocusMode`,
+`FocusTarget`, `CameraPose` and `FocusCameraState`, the interface every leg's
+`createStage` and interaction anchor depends on. The reviewed SHA-256 is:
+
+`a787a2811b48d339ba43f809abfe737139abaccb4db9cc8d8f649408d09c610a`
+
+Hash regeneration was human-approved on 2026-09-15 for this addition only.
+Future changes to this interface require an exact patch, written approval and a
+contract-only amendment commit.

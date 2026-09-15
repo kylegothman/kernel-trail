@@ -251,7 +251,7 @@ export class ManagedBatch implements InstancedBatchHandle {
   }
   clamp(p:RenderQualityProfile):void {
     const g=this.desc.geometry;
-    this.ceiling=g==='slab'?p.maxInstances.page_frames:g==='chit'?p.maxInstances.queue_entries:g==='sector'?p.maxInstances.disk_sectors:g==='beam'?p.concurrentBeams:g==='ring'?p.maxInstances.domain_rings:p.maxParticles;
+    this.ceiling=g==='slab'?p.maxInstances.page_frames:g==='chit'?p.maxInstances.queue_entries:g==='sector'?p.maxInstances.disk_sectors:g==='beam'?p.maxInstances.beams:g==='ring'?p.maxInstances.domain_rings:p.maxParticles;
     this.object.count=Math.min(this.requested,this.ceiling,this.capacity);
   }
   dispose():void{if(this.ownsMaterial){const m=this.object.material;if(!Array.isArray(m))m.dispose();}this.object.dispose();this.object.geometry.dispose();this.object.removeFromParent();this.release();}

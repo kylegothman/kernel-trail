@@ -46,3 +46,8 @@ export function createProbeScene(tier:QualityTier='high',slabCount=180,beamCount
   return {scene,camera,slabs,beams,declared,update(){scene.updateMatrixWorld();},
     dispose(){floorGeometry.dispose();geometry.dispose();beamGeometry.dispose();poolGeometry.dispose();poolMaterial.dispose();pools.dispose();proxy?.dispose();proxyMaterial?.dispose();slabs.dispose();beams.dispose();scene.clear();}};
 }
+export { FocusCameraRig, computeLockedPose, focusPath, arcLift, lockedCapHeight } from './camera/FocusCamera';
+export type { FocusCamera, FocusCameraController, FocusCameraOptions, FreeCameraTarget } from './camera/FocusCamera';
+export type { FocusMode, FocusTarget, CameraPose, FocusCameraState } from './camera/focusContract';
+export { TravelCamera } from './camera/TravelCamera';
+export { BlendedPerspectiveCamera, blendProjection, projectionRay } from './camera/projection';

@@ -30,3 +30,12 @@ it('storage specialization remains per batch while archetype stays cached',async
  expect(batch.object.geometry.getAttribute('aColorGain')).toHaveProperty('isStorageInstancedBufferAttribute',true);
  expect(materials.getMaterial('emissive-panel','page_clean','high')).toBe(m);batch.dispose();g.dispose();
 });
+
+it('factory focus groups preserve cache identity and independent uniforms for every archetype',()=>{
+ const inside={},outside={};
+ for(const archetype of materials.ARCHETYPES){const base=materials.getMaterial(archetype,'running','high');const a=materials.acquireFocusMaterial(inside,base),b=materials.acquireFocusMaterial(outside,base);
+  expect(a).not.toBe(b);expect(materials.acquireFocusMaterial(inside,base)).toBe(a);expect(materials.getMaterial(archetype,'running','high')).toBe(base);
+  materials.materialFocusUniform(b)!.value=.18;expect(materials.materialFocusUniform(a)!.value).toBe(1);expect(materials.materialFocusUniform(b)!.value).toBe(.18);
+ }
+ materials.releaseFocusMaterials(inside);materials.releaseFocusMaterials(outside);
+});
