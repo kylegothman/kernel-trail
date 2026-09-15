@@ -859,3 +859,18 @@ independently checked six curves including degenerate control points.
 Regeneration was human-approved on 2026-09-15 for this exact change only. The
 file remains frozen. General solver property assertions join acceptance 10 in
 the following WP-13 implementation commit, not this contract-only commit.
+
+## Amendment 13, 2026-09-15: WP-13 focus camera contract freeze
+
+**Approved by:** Kyle, for the exact focus camera contract content and hash regeneration.
+**Status:** applied; number 13 follows amendment 12.
+
+`src/render/camera/focusContract.ts` is now frozen. It defines `FocusMode`,
+`FocusTarget`, `CameraPose` and `FocusCameraState`, the interface every leg's
+`createStage` and interaction anchor depends on. The reviewed SHA-256 is:
+
+`a787a2811b48d339ba43f809abfe737139abaccb4db9cc8d8f649408d09c610a`
+
+Hash regeneration was human-approved on 2026-09-15 for this addition only.
+Future changes to this interface require an exact patch, written approval and a
+contract-only amendment commit.
