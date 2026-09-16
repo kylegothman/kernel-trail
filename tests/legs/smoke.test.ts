@@ -14,7 +14,7 @@ import { LEG_ORDER, type Leg, type Pace } from '@game/types';
 import { assertClean, runLeg, withInertPoison } from './harness/LegHarness';
 import { loadShippedSet, skipLine } from './harness/loadLeg';
 import { makeRunState } from './harness/makeRunState';
-import { REQUIRED_EVENTS } from './harness/requiredEvents';
+import { REQUIRED_EVENTS, runForRequiredEvents } from './harness/requiredEvents';
 
 const CI = process.env.CI !== undefined && process.env.CI !== '';
 export const TICK_BUDGET_MS = CI ? 7 : 2;
@@ -62,7 +62,7 @@ describe('every leg runs headlessly to completion', () => {
       }
 
       it('emits the events its objectives claim to assess', async () => {
-        const result = await runLeg(leg, { seed: 4, policy: 'chaotic' });
+        const result = await runForRequiredEvents(leg);
         for (const required of REQUIRED_EVENTS[leg.id]) {
           expect(result.eventTypes.has(required), `${leg.id} never emitted ${required}`).toBe(true);
         }
