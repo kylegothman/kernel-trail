@@ -65,6 +65,10 @@ export interface DirectorSnapshot {
   readonly previousQuantum: number;
 }
 export type InteractionHandler = (run: RunState, at: Tick) => void;
+/** The record kinds `dispatch` replays; a non-command record of any other kind is leg data and rides through resume verbatim (WP-20 W9). */
+export const DIRECTOR_OWNED_KINDS: ReadonlySet<string> = new Set([
+  'travel_resume', 'depot_open', 'crossing_open', 'crossing', 'depot', 'reclamation_open', 'reclamation', 'interaction', 'checkpoint_rollback', 'use_ability', 'terminal',
+]);
 const POLICY = new Set<Command['kind']>(['set_scheduler', 'set_replacement', 'set_disk_policy', 'set_allocation', 'set_deadlock_strategy', 'set_pace', 'set_rations', 'set_degree']);
 const MEMBERS: readonly ConvoyMemberId[] = ['kestrel', 'lumen', 'orrery', 'sable', 'vesper'];
 
@@ -351,6 +355,7 @@ export class RunDirector {
   }
   /** Replay only owned action kinds; command records stay on CommandBus's road. */
   dispatch(record: DecisionRecord): boolean {
+    if (!DIRECTOR_OWNED_KINDS.has(record.kind)) return false;
     this.replayingAction = true;
     let owned = false;
     try {

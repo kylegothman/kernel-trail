@@ -8,6 +8,7 @@ import { initialRunState, runReplay } from '../../src/game/replay/runReplay';
 import { createRunStreams, saveRunStreams, type ReplayRequest } from '../../src/game/replay/types';
 import { resolveHeadlessLeg } from '../../src/game/replay/headlessLegs';
 import { hashEventLog } from '../../src/game/replay/hash';
+import { buildSaveFile } from '../../src/game/save';
 import type { EpitaphCopySource } from '../../src/game/convoy/derezz';
 import type { DecisionRecord, Leg, ResourceLedger, RunState } from '../../src/game/types';
 import { createSyntheticLeg } from './fixtures/syntheticLeg';
@@ -778,5 +779,54 @@ describe('replay boundary score parity', () => {
       expect(replay.score.throughput).toBe(200);
       expect(replay.diagnostics.legs[1]?.eventLogHash).toBe(hashEventLog(r.runner.director!.allEvents));
     }
+  });
+});
+
+
+describe('hand-off records survive resume (WP-20 W9)', () => {
+  const ringLeg = () => travelLeg({ interactions: [{ id: 'close_ring', label: 'Close the ring', description: '', anchor: 'ring', cost: {}, enabledWhen: () => true }] });
+  // The leg writes its hand-off through an interaction handler on the transaction draft, the only mid-leg write a leg has.
+  const closeRing = (runner: LegRunner) => runner.registerInteraction('close_ring', (run, at) => {
+    run.decisions.push({ tick: at, legId: 'fork_fields', kind: 'ring_closed', choice: String(at), outcome: 'good', relatedObjective: null });
+  });
+  it('carries a leg-written ring_closed record through a provisional resume verbatim', () => {
+    const boot = createSyntheticLeg(); const leg = ringLeg(); const original = rig(21);
+    original.runner.enter(boot, options); original.runner.exit(); original.runner.enter(leg, options); closeRing(original.runner);
+    for (let i = 0; i < 3; i++) tick(original);
+    expect(original.bus.apply({ kind: 'interaction', id: 'close_ring', anchor: 'ring' }, { source: 'world', legId: leg.id }, original.runner.kernel!.tick).refused).toBeNull();
+    for (let i = 0; i < 3; i++) tick(original);
+    expect(original.store.get().decisions.filter(record => record.kind === 'ring_closed'))
+      .toEqual([{ tick: 3, legId: 'fork_fields', kind: 'ring_closed', choice: '3', outcome: 'good', relatedObjective: null }]);
+    const saved = original.runner.saveProvisional();
+    const restored = rig(21);
+    expect(restored.runner.resume(saved, [boot, leg], options, (runner, current) => { if (current.id === leg.id) closeRing(runner); }), JSON.stringify(restored.failure.mock.calls)).toBe(true);
+    expect(restored.store.get().decisions).toEqual(saved.run.decisions);
+    expect(restored.store.get().decisions.filter(record => record.kind === 'ring_closed')).toHaveLength(1);
+    expect(restored.runner.kernel!.snapshot()).toEqual(saved.kernel);
+    tick(original); tick(restored);
+    expect(restored.store.get()).toEqual(original.store.get());
+    expect(restored.runner.kernel!.snapshot()).toEqual(original.runner.kernel!.snapshot());
+  });
+  it('carries the record across a boundary resume into the next leg, and still refuses an owned action it cannot dispatch', () => {
+    const boot = createSyntheticLeg(); const leg = ringLeg(); const next = createSyntheticLeg({ id: 'the_weave', index: 2 });
+    const original = rig(22); original.runner.enter(boot, options); original.runner.exit(); original.runner.enter(leg, options); closeRing(original.runner);
+    tick(original);
+    expect(original.bus.apply({ kind: 'interaction', id: 'close_ring', anchor: 'ring' }, { source: 'world', legId: leg.id }, original.runner.kernel!.tick).refused).toBeNull();
+    finish(original);
+    const boundary = original.persist.mock.calls.at(-1)?.[0];
+    if (boundary === undefined) throw new Error('missing boundary save');
+    expect(boundary.kernel).toBeNull();
+    const file = buildSaveFile(boundary);
+    const restored = rig(22);
+    expect(restored.runner.resume(file, [boot, leg, next], options, (runner, current) => { if (current.id === leg.id) closeRing(runner); }), JSON.stringify(restored.failure.mock.calls)).toBe(true);
+    expect(restored.store.get().legIndex).toBe(2);
+    expect(restored.runner.currentLeg?.id).toBe('the_weave'); expect(restored.runner.kernel).not.toBeNull();
+    expect(restored.store.get().decisions.filter(record => record.kind === 'ring_closed')).toEqual([expect.objectContaining({ kind: 'ring_closed', legId: 'fork_fields', choice: '1' })]);
+    const tampered = buildSaveFile({ ...boundary, run: { ...boundary.run, decisions: [
+      { tick: asTick(0), legId: 'fork_fields', kind: 'crossing_open', choice: 'unregistered', outcome: 'pending', relatedObjective: null }, ...boundary.run.decisions,
+    ] } });
+    const refused = rig(22);
+    expect(refused.runner.resume(tampered, [boot, leg, next], options, (runner, current) => { if (current.id === leg.id) closeRing(runner); })).toBe(false);
+    expect(refused.failure.mock.calls.at(-1)?.[0]).toMatch(/Resume cannot dispatch crossing_open/);
   });
 });
