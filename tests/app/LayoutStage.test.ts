@@ -291,6 +291,18 @@ function framingHarness() {
 }
 
 describe('browser layout presentation', () => {
+  it('exposes the live Boot Sector batch under the structure-owned name used by the GPU fixture', async () => {
+    const { layout } = await import('@legs/boot_sector/stage');
+    const harness = setup();
+    const stage = build(harness, layout);
+    await stage.ready;
+    stage.update(0, 0);
+    const batch = harness.scene.getObjectByName('kt.structures.layout-slab-instances.batch');
+    expect(batch).toBeInstanceOf(InstancedMesh);
+    if (!(batch instanceof InstancedMesh)) throw new Error('Expected the Boot Sector stand-in batch');
+    expect(batch.count).toBeGreaterThan(8);
+  });
+
   it('keeps a layout floor within one module and retains the separate environment ground', async () => {
     const { GRID, MODULE_PITCH_M } = await import('@design');
     const harness = setup();

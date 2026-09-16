@@ -178,7 +178,7 @@ async function initialize(): Promise<void> {
     session = active;
     // Real Boot Sector data exercises the same instanced stand-ins as browser play.
     controlled.step(0);
-    const openingBatch = captured.scene?.getObjectByName('kt.structures.layout.slab.batch');
+    const openingBatch = captured.scene?.getObjectByName('kt.structures.layout-slab-instances.batch');
     assert(openingBatch instanceof InstancedMesh && openingBatch.count > 8, 'Boot Sector must exercise a live stand-in batch');
     await assertNoRenderErrors();
     const phase = () => active.runner.phase;
