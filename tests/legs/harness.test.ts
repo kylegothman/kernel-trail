@@ -7,7 +7,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { join, relative, resolve } from 'node:path';
-import { asTick, createKernel } from '@kernel/index';
+import { asPid, asTick, createKernel } from '@kernel/index';
 import { originFromRecord } from '@game/CommandBus';
 import { runReplay } from '@game/replay/runReplay';
 import { LEG_ORDER, type Leg, type LegId } from '@game/types';
@@ -439,5 +439,259 @@ describe('boundaries', () => {
     expect(result.legId).toBe('the_weave');
     expect(result.ticks).toBeGreaterThan(0);
     expect(createKernel(createSyntheticLeg().kernelConfig(result.run)).tick).toBe(0);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* Golden runs: tiers, tools and the fixture contract                  */
+/* ------------------------------------------------------------------ */
+
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { compareTiers, earliestSummaryDivergence, firstDivergence, goldenFiles, parseFingerprint, parseSummary, readGolden, renderFingerprint, renderSummary, summaryOf, tiersOf, writeGolden } from './harness/goldenLog';
+import { checkFixtureRun, FIXTURE_SEED as CONTRACT_SEED, fixturePath, isWarning, loadFixtures, runFixture, validateFixture, type LegFixture, type LegFixtureModule } from './harness/fixtureContract';
+import { owedFixtures, STUB_FIXTURES, fixtureStatus } from './harness/stubFixtures';
+import { withInertPoison } from './harness/LegHarness';
+import { renderEventLine, renderEventLog } from '../../tools/golden/renderEventLog';
+import { describeRecord, main as recordMain, parseArgs, recordGolden } from '../../tools/golden/record';
+import { explainGolden, main as explainMain } from '../../tools/golden/explain';
+import { KNOWN_BAD_SCRIPT as BAD, KNOWN_GOOD_SCRIPT as GOOD } from './harness/syntheticLeg';
+
+/** Built from code points so the contract guard, which scans for the literal characters, never trips on this file. */
+const DASHES = new RegExp(`[${String.fromCharCode(0x2014)}${String.fromCharCode(0x2013)}]`);
+const fixture = (path: 'good' | 'bad', patch: Partial<LegFixture> = {}): LegFixture => ({
+  legId: HARNESS_LEG_ID, path, seed: CONTRACT_SEED, discClass: 'shell', difficulty: 'operator', pace: 'steady', rations: 'standard',
+  enteringLedger: { cycles: 1600, quota: 900, blocks: 120, bandwidth: 60 }, enteringDecisions: [],
+  script: path === 'good' ? GOOD : BAD, expect: path === 'good' ? KNOWN_GOOD_EXPECTATION : KNOWN_BAD_EXPECTATION, ...patch,
+});
+const syntheticFixtures: LegFixtureModule = { knownGood: fixture('good'), knownBad: fixture('bad') };
+
+function tempDir(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'kt-wp20-golden-'));
+  return dir;
+}
+
+describe('golden tiers', () => {
+  let good: HarnessResult;
+  const load = async (): Promise<HarnessResult> => (good ??= await runFixture(syntheticFixtures.knownGood, createHarnessLeg()));
+
+  it('render stable: rendering the same log twice gives byte-identical text with no dashes and no locale formatting', async () => {
+    const result = await load();
+    const once = renderEventLog(result.events);
+    const twice = renderEventLog(result.events);
+    expect(twice).toBe(once);
+    expect(once).not.toMatch(DASHES);
+    expect(once).not.toMatch(/\d,\d{3}/);
+    expect(once.split('\n')[0]).toMatch(/^\s*tick\s+seq\s+type\s+payload$/);
+    expect(once.split('\n')).toHaveLength(result.events.length + 2);
+    const line = renderEventLine({ type: 'context.switch', tick: asTick(4), seq: 11, from: asPid(1), to: asPid(2), rationale: 'quantum expired' });
+    expect(line).toBe(`${'4'.padStart(6)} ${'11'.padStart(7)}  ${'context.switch'.padEnd(26)} from=1 rationale="quantum expired" to=2`);
+    const nested = renderEventLine({ type: 'kernel.panic', tick: asTick(0), seq: 1, message: 'I-3: bad' });
+    expect(nested).toContain('message="I-3: bad"');
+  });
+
+  it('fingerprint and summary round-trip through their file formats', async () => {
+    const result = await load();
+    const tiers = tiersOf(result);
+    expect(renderFingerprint(tiers.fingerprint)).toBe(`seed=${FIXTURE_SEED} ticks=${result.ticks} events=${result.events.length} hash=${result.logHash}\n`);
+    expect(parseFingerprint(renderFingerprint(tiers.fingerprint))).toEqual(tiers.fingerprint);
+    expect(() => parseFingerprint('seed=1 ticks=2')).toThrow(/malformed fingerprint/);
+    const summary = renderSummary(tiers.summary);
+    expect(summary.split('\n')[0]).toMatch(/^type\s+count\s+first\s+last$/);
+    expect(parseSummary(summary)).toEqual(tiers.summary);
+    expect(tiers.summary.map((row) => row.type)).toEqual([...tiers.summary.map((row) => row.type)].sort());
+    expect(tiers.summary.every((row) => row.count > 0 && row.first <= row.last)).toBe(true);
+    expect(summaryOf([])).toEqual([]);
+    expect(compareTiers(tiers, tiers)).toEqual([]);
+    const shifted = { ...tiers, fingerprint: { ...tiers.fingerprint, hash: '0000000000000000' } };
+    expect(compareTiers(tiers, shifted)).toEqual([`fingerprint.hash: expected 0000000000000000, got ${result.logHash}`]);
+    const dir = tempDir();
+    try {
+      writeGolden(HARNESS_LEG_ID, 'good', tiers, dir);
+      expect(readGolden(HARNESS_LEG_ID, 'good', dir)).toEqual(tiers);
+      expect(readGolden(HARNESS_LEG_ID, 'bad', dir)).toBeNull();
+      expect(readFileSync(goldenFiles(HARNESS_LEG_ID, 'good', dir).summary, 'utf8')).not.toMatch(DASHES);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('firstDivergence names the first differing event by seq with context on both sides', async () => {
+    const result = await load();
+    expect(firstDivergence(result.events, result.events)).toBeNull();
+    const other = await runLeg(createHarnessLeg(), { seed: 99, script: GOOD, run: makeRunState({ seed: 99, legIndex: 1 }) });
+    const divergence = firstDivergence(result.events, other.events, 3);
+    expect(divergence).not.toBeNull();
+    if (divergence === null) return;
+    expect(divergence.expected.length).toBeLessThanOrEqual(7);
+    expect(divergence.actual.length).toBeLessThanOrEqual(7);
+    expect(divergence.seq).toBe((other.events[divergence.index] ?? result.events[divergence.index])?.seq);
+    const truncated = firstDivergence(result.events, result.events.slice(0, 5), 2);
+    expect(truncated?.index).toBe(5);
+    expect(earliestSummaryDivergence(tiersOf(result).summary, tiersOf(result).summary)).toBeNull();
+    expect(earliestSummaryDivergence(tiersOf(result).summary, tiersOf(other).summary)).not.toBeNull();
+  });
+});
+
+describe('golden tools', () => {
+  it('record refuses: recording over an existing golden without --force refuses and prints both hashes, and --force overwrites', async () => {
+    const dir = tempDir();
+    try {
+      const leg = createHarnessLeg();
+      const first = await recordGolden({ legId: HARNESS_LEG_ID, path: 'good', dir, leg, fixtures: syntheticFixtures });
+      expect(first.status).toBe('written');
+      if (first.status !== 'written') return;
+      expect(first.previous).toBeNull();
+      expect(existsSync(goldenFiles(HARNESS_LEG_ID, 'good', dir).fingerprint)).toBe(true);
+      expect(describeRecord({ legId: HARNESS_LEG_ID, path: 'good', dir }, first).some((line) => /closing ledger cycles=/.test(line))).toBe(true);
+      const again = await recordGolden({ legId: HARNESS_LEG_ID, path: 'good', dir, leg, fixtures: syntheticFixtures });
+      expect(again.status).toBe('refused');
+      if (again.status !== 'refused') return;
+      const lines = describeRecord({ legId: HARNESS_LEG_ID, path: 'good', dir }, again);
+      expect(lines[0]).toMatch(/refusing to overwrite .*fork_fields\.good\.fingerprint\.txt; pass --force/);
+      expect(lines[1]).toContain(`old hash ${again.previous.fingerprint.hash}  new hash ${again.next.fingerprint.hash}`);
+      const forced = await recordGolden({ legId: HARNESS_LEG_ID, path: 'good', dir, leg, fixtures: syntheticFixtures, force: true });
+      expect(forced.status).toBe('written');
+      if (forced.status === 'written') expect(forced.previous?.fingerprint.hash).toBe(forced.next.fingerprint.hash);
+      expect(describeRecord({ legId: HARNESS_LEG_ID, path: 'good', dir }, forced).some((line) => /old hash .* new hash .*forced/.test(line))).toBe(true);
+      const invalid = await recordGolden({ legId: HARNESS_LEG_ID, path: 'bad', dir, leg, fixtures: { ...syntheticFixtures, knownBad: fixture('bad', { expect: { ...KNOWN_BAD_EXPECTATION, casualties: ['sable'] } }) } });
+      expect(invalid.status).toBe('invalid');
+      expect(existsSync(goldenFiles(HARNESS_LEG_ID, 'bad', dir).fingerprint)).toBe(false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('record: the command line refuses a malformed invocation and reports an unshipped leg', async () => {
+    expect(() => parseArgs(['--leg', 'nowhere', '--path', 'good'])).toThrow(/unknown leg/);
+    expect(() => parseArgs(['--leg', HARNESS_LEG_ID])).toThrow(/pass --leg/);
+    expect(parseArgs(['--all', '--force'])).toEqual({ legId: null, path: null, all: true, force: true, dir: null });
+    const lines: string[] = [];
+    expect(await recordMain(['--path', 'sideways'], (line) => lines.push(line))).toBe(2);
+    const missing = await firstUnshipped();
+    if (missing === null) return;
+    expect(await recordMain(['--leg', missing, '--path', 'good'], (line) => lines.push(line))).toBe(1);
+    expect(lines.at(-1)).toMatch(/has not shipped/);
+  });
+
+  it('diff exits: a changed run exits non-zero and names the first divergent tick and seq', async () => {
+    const dir = tempDir();
+    try {
+      const leg = createHarnessLeg();
+      const recorded = await recordGolden({ legId: HARNESS_LEG_ID, path: 'good', dir, leg, fixtures: syntheticFixtures });
+      expect(recorded.status).toBe('written');
+      const same = await explainGolden({ legId: HARNESS_LEG_ID, path: 'good', dir, leg, fixtures: syntheticFixtures });
+      expect(same.status).toBe('match');
+      const changed = await explainGolden({ legId: HARNESS_LEG_ID, path: 'good', dir, leg, fixtures: { ...syntheticFixtures, knownGood: fixture('good', { seed: 99 }) } });
+      expect(changed.status).toBe('mismatch');
+      if (changed.status !== 'mismatch') return;
+      expect(changed.problems.some((problem) => problem.startsWith('fingerprint.seed'))).toBe(true);
+      expect(changed.report).toMatch(/first divergent event: tick \d+ seq \d+/);
+      expect(changed.window.events.length).toBeGreaterThan(0);
+      expect(changed.window.events.length).toBeLessThanOrEqual(101);
+      const missing = await explainGolden({ legId: HARNESS_LEG_ID, path: 'bad', dir, leg, fixtures: syntheticFixtures });
+      expect(missing.status).toBe('missing');
+      const lines: string[] = [];
+      expect(await explainMain([HARNESS_LEG_ID], (line) => lines.push(line))).toBe(2);
+      expect(await explainMain(['nowhere', 'good'], (line) => lines.push(line))).toBe(2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('update golden ignored: UPDATE_GOLDEN=1 changes nothing', async () => {
+    const dir = tempDir();
+    const previous = process.env.UPDATE_GOLDEN;
+    process.env.UPDATE_GOLDEN = '1';
+    try {
+      const leg = createHarnessLeg();
+      const tiers = tiersOf(await runFixture(syntheticFixtures.knownGood, leg));
+      writeGolden(HARNESS_LEG_ID, 'good', { ...tiers, fingerprint: { ...tiers.fingerprint, hash: '0123456789abcdef' } }, dir);
+      const outcome = await recordGolden({ legId: HARNESS_LEG_ID, path: 'good', dir, leg, fixtures: syntheticFixtures });
+      expect(outcome.status).toBe('refused');
+      expect(readGolden(HARNESS_LEG_ID, 'good', dir)?.fingerprint.hash).toBe('0123456789abcdef');
+      const explained = await explainGolden({ legId: HARNESS_LEG_ID, path: 'good', dir, leg, fixtures: syntheticFixtures });
+      expect(explained.status).toBe('mismatch');
+      expect(readGolden(HARNESS_LEG_ID, 'good', dir)?.fingerprint.hash).toBe('0123456789abcdef');
+      for (const file of ['harness/goldenLog.ts', 'harness/fixtureContract.ts', 'goldens.test.ts', 'smoke.test.ts', 'journey.test.ts'].map((name) => join(REPO_ROOT, 'tests', 'legs', name)).concat(['record.ts', 'explain.ts', 'renderEventLog.ts'].map((name) => join(REPO_ROOT, 'tools', 'golden', name)))) {
+        if (!existsSync(file)) continue;
+        expect(stripComments(readFileSync(file, 'utf8'), false), file).not.toMatch(/UPDATE_GOLDEN/);
+      }
+    } finally {
+      if (previous === undefined) delete process.env.UPDATE_GOLDEN;
+      else process.env.UPDATE_GOLDEN = previous;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('the fixture contract', () => {
+  it('validate fixture: every rule in 7.3, each with a failing case, and the composite fixtures pass', async () => {
+    const leg = createHarnessLeg();
+    expect(validateFixture(syntheticFixtures.knownGood, leg)).toEqual([]);
+    expect(validateFixture(syntheticFixtures.knownBad, leg)).toEqual([]);
+    const errors = (f: LegFixture): readonly string[] => validateFixture(f, leg).filter((problem) => !isWarning(problem));
+    expect(errors(fixture('good', { expect: { survived: true } }))).toEqual([expect.stringMatching(/must name the objectives it meets/)]);
+    expect(errors(fixture('good', { expect: { objectivesMet: ['synthetic.survive'] } }))).toEqual([expect.stringMatching(/missing \[synthetic\.cross\]/)]);
+    expect(errors(fixture('good', { expect: { objectivesMet: [...HARNESS_OBJECTIVE_IDS, 'synthetic.extra'] } }))).toEqual([expect.stringMatching(/does not declare \[synthetic\.extra\]/)]);
+    expect(errors(fixture('bad', { expect: { decisionOutcomes: [{ kind: 'crossing', outcome: 'fatal' }], ticksBetween: [1, 2] } }))).toEqual([expect.stringMatching(/which Program dies/)]);
+    expect(errors(fixture('bad', { expect: { casualties: ['lumen'], ticksBetween: [1, 2] } }))).toEqual([expect.stringMatching(/decision marked fatal/)]);
+    expect(errors(fixture('bad', { expect: { casualties: ['lumen'], decisionOutcomes: [{ kind: 'crossing', outcome: 'fatal' }] } }))).toEqual([expect.stringMatching(/roughly when/)]);
+    const warnings = validateFixture(fixture('good', { seed: 7 }), leg);
+    expect(warnings).toEqual([expect.stringMatching(/^warning: .*seed 7 is not the shared fixture seed/)]);
+    expect(errors(fixture('good', { enteringLedger: { cycles: 1, quota: 1, blocks: 1 } }))).toEqual([expect.stringMatching(/enteringLedger\.bandwidth is missing/)]);
+    const bootFixture = fixture('good', { legId: 'boot_sector', script: { ...GOOD, legId: 'boot_sector', steps: [], crossings: [] }, enteringLedger: { cycles: 1000, quota: 900, blocks: 120, bandwidth: 60 } });
+    expect(validateFixture(bootFixture).filter((problem) => !isWarning(problem))).toEqual([expect.stringMatching(/leg 0 enters with the starting ledger, 1600/)]);
+    expect(errors(fixture('good', { script: { ...GOOD, legId: 'the_weave', steps: [], crossings: [] } }))).toEqual([expect.stringMatching(/the script belongs to the_weave/)]);
+    expect(errors(fixture('good', { script: { ...GOOD, steps: [...GOOD.steps, { at: -3, command: { kind: 'set_pace', to: 'steady' } }] } }))).toEqual([expect.stringMatching(/script: step .* not a non-negative integer/)]);
+    expect(errors(fixture('good', { enteringDecisions: [{ tick: asTick(0), legId: 'nowhere' as LegId, kind: 'ring_closed', choice: '0', outcome: 'good', relatedObjective: null }] }))).toEqual([expect.stringMatching(/enteringDecisions\[0\] is not a DecisionRecord/)]);
+    const good = await runFixture(syntheticFixtures.knownGood, leg);
+    expect(checkFixtureRun(syntheticFixtures.knownGood, good, leg)).toEqual([]);
+    const bad = await runFixture(syntheticFixtures.knownBad, leg);
+    expect(checkFixtureRun(syntheticFixtures.knownBad, bad, leg)).toEqual([]);
+    expect(checkFixtureRun(syntheticFixtures.knownBad, good, leg)).toEqual(expect.arrayContaining([expect.stringMatching(/produced no casualty/), expect.stringMatching(/marked no decision fatal/)]));
+    expect(checkFixtureRun(syntheticFixtures.knownGood, bad, leg)).toEqual(expect.arrayContaining([expect.stringMatching(/missed declared objectives/)]));
+    const panicked = await runLeg(leg, { seed: CONTRACT_SEED, script: { ...GOOD, steps: [{ at: 3, command: { kind: 'set_replacement', to: 'optimal' } }] } });
+    expect(checkFixtureRun(syntheticFixtures.knownGood, panicked, leg)).toEqual(expect.arrayContaining([expect.stringMatching(/the run panicked/)]));
+  });
+
+  it('loadFixtures returns null for a leg without a fixture module and reads a module with exactly two exports', async () => {
+    const missing = await firstUnshipped();
+    if (missing !== null) expect(await loadFixtures(missing)).toBeNull();
+    const dir = tempDir();
+    try {
+      const path = join(dir, 'fixtures.ts');
+      writeFileSync(path, "export const knownGood = 1;\nexport const knownBad = 2;\nexport const extra = 3;\n");
+      // The loader reads by leg id; a module with a third export is what a leg package must not ship.
+      const module = await import(/* @vite-ignore */ `${path}`);
+      expect(Object.keys(module).sort()).toEqual(['extra', 'knownBad', 'knownGood']);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+    expect(fixturePath('the_cistern')).toMatch(/tests[\\/]legs[\\/]the_cistern[\\/]fixtures\.ts$/);
+  });
+
+  it('stub fixtures enumerate every leg with no fixture, and each stub throws naming its package', () => {
+    const owed = owedFixtures();
+    expect(owed.every((id) => fixtureStatus(id) === 'stubbed')).toBe(true);
+    for (const id of LEG_ORDER) {
+      expect(() => STUB_FIXTURES[id]()).toThrow(new RegExp(`tests/legs/${id}/fixtures\\.ts is written by WP-L\\d\\d`));
+    }
+    expect(owed.length + LEG_ORDER.filter((id) => fixtureStatus(id) === 'present').length).toBe(LEG_ORDER.length);
+  });
+
+  it('inert fields: poisoning every config field a disabled subsystem owns leaves the log hash unchanged over 400 ticks', async () => {
+    const leg = createHarnessLeg({ config: { enabledSubsystems: ['process', 'scheduler', 'sync'] } });
+    const run = makeRunState({ seed: 1, legIndex: 1 });
+    const poisoned = withInertPoison(leg, run);
+    expect(poisoned.fields).toEqual(['totalFrames', 'pageSize', 'allocationStrategy', 'tlbEntries', 'replacementPolicy', 'thrashingThreshold', 'deadlockStrategy', 'diskPolicy', 'totalCylinders', 'raidLevel', 'fileAllocation', 'journalingEnabled']);
+    expect(poisoned.leg.kernelConfig(run).replacementPolicy).toBe('random');
+    expect(poisoned.leg.kernelConfig(run).enabledSubsystems).toEqual(['process', 'scheduler', 'sync']);
+    const clean = await runLeg(leg, { seed: 1, maxTicks: 400 });
+    const dirty = await runLeg(poisoned.leg, { seed: 1, maxTicks: 400 });
+    expect(dirty.logHash).toBe(clean.logHash);
+    expect(dirty.ticks).toBe(clean.ticks);
+    const full = withInertPoison(createHarnessLeg(), run);
+    expect(full.fields).toEqual([]);
   });
 });

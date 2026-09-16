@@ -17,7 +17,7 @@
  * re-entered from `replayEntry`, then `kernel.restore`, `director.restore`,
  * the store from `file.run` and the streams from `file.rngStates`.
  */
-import { createKernel, type KernelEvent } from '@kernel/index';
+import { createKernel, type KernelConfig, type KernelEvent, type SubsystemId } from '@kernel/index';
 import { CommandBus, type KernelMutators } from '@game/CommandBus';
 import type { EpitaphCopySource } from '@game/convoy/derezz';
 import type { CrossingDef, CrossingResult } from '@game/crossing/Crossing';
@@ -433,6 +433,56 @@ export async function runLeg(leg: Leg, opts: HarnessOptions): Promise<HarnessRes
 /** The hash of an uninterrupted run's events above `seq`, for comparison with a restored run's remainder. */
 export function remainderHashAfter(result: HarnessResult, seq: number): string {
   return hashEventLog(result.events.filter((event) => event.seq > seq));
+}
+
+/**
+ * Override members of a leg without spreading it, so a leg written as a class
+ * instance keeps its prototype methods. Used by the inert-field test.
+ */
+export function overrideLeg(leg: Leg, overrides: Partial<Leg>): Leg {
+  return new Proxy(leg, {
+    get(target, key, receiver): unknown {
+      if (typeof key === 'string' && key in overrides) return overrides[key as keyof Leg];
+      return Reflect.get(target, key, receiver);
+    },
+  });
+}
+
+/**
+ * Section 6, inert fields: a different valid value for every `KernelConfig`
+ * field a disabled subsystem owns. Every leg enables `process` and
+ * `scheduler`, so those two rows are empty by construction.
+ */
+export const INERT_POISON: Readonly<Record<SubsystemId, Partial<KernelConfig>>> = {
+  process: {},
+  scheduler: {},
+  memory: { totalFrames: 48, pageSize: 8192, allocationStrategy: 'worst_fit', tlbEntries: 4 },
+  vm: { replacementPolicy: 'random', thrashingThreshold: 999_999 },
+  sync: {},
+  deadlock: { deadlockStrategy: 'ignore' },
+  storage: { diskPolicy: 'fcfs', totalCylinders: 50, raidLevel: 0 },
+  io: {},
+  fs: { fileAllocation: 'contiguous', journalingEnabled: false },
+  security: {},
+};
+
+/** The poison patch for every subsystem the config leaves disabled, and the fields it touches. */
+export function inertPoison(config: KernelConfig): { readonly patch: Partial<KernelConfig>; readonly fields: readonly string[] } {
+  const enabled = new Set(config.enabledSubsystems);
+  let patch: Partial<KernelConfig> = {};
+  const fields: string[] = [];
+  for (const subsystem of Object.keys(INERT_POISON) as SubsystemId[]) {
+    if (enabled.has(subsystem)) continue;
+    patch = { ...patch, ...INERT_POISON[subsystem] };
+    fields.push(...Object.keys(INERT_POISON[subsystem]));
+  }
+  return { patch, fields };
+}
+
+/** The leg with every inert config field poisoned; its log hash must not move (section 6). */
+export function withInertPoison(leg: Leg, run: RunState): { readonly leg: Leg; readonly fields: readonly string[] } {
+  const { patch, fields } = inertPoison(leg.kernelConfig(run));
+  return { leg: overrideLeg(leg, { kernelConfig: (state) => ({ ...leg.kernelConfig(state), ...patch }) }), fields };
 }
 
 /** Throws when a run panicked, a leg failed or the runner reported a failure; a suite that finds any of them fails. */

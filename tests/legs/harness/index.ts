@@ -7,3 +7,6 @@ export * from './LegHarness';
 export * from './expectOutcome';
 export * from './requiredEvents';
 export * from './syntheticLeg';
+export * from './goldenLog';
+export * from './fixtureContract';
+export * from './stubFixtures';

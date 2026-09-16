@@ -23,8 +23,7 @@ import type { OutcomeExpectation } from './expectOutcome';
 
 export const HARNESS_LEG_ID: LegId = 'fork_fields';
 export const HARNESS_LEG_INDEX = 1;
-/** Every shipped leg package names this seed in its golden fixture (section 7.3). */
-export const FIXTURE_SEED = 0x4b54524c;
+export { FIXTURE_SEED } from './fixtureContract';
 
 export const HARNESS_ANCHORS: readonly string[] = ['vault', 'console', 'gate'];
 export const HARNESS_OBJECTIVE_IDS: readonly string[] = ['synthetic.survive', 'synthetic.cross'];
