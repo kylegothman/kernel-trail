@@ -1736,3 +1736,357 @@ State:
    followed.
 10. Confirmation that no frozen contract was edited, extended or shadowed, and
     that no file outside the owned list was created or modified.
+
+---
+
+## Scope correction against the shipped tree
+
+Written 2026-09-16, after WP-18 merged (main at `07c03df`) and before WP-19
+starts. Where this section disagrees with the text above, this section wins.
+Each numbered item is a decision; report against them by number. Nothing
+else is in flight; this package is alone on the tree.
+
+### V1. Files: what exists, what does not, and the owned list restated
+
+`src/game/index.ts`, `src/game/store/`, `src/game/RunDirector.ts`,
+`src/game/LegRunner.ts`, `src/game/LegSandbox.ts` and
+`tests/game/run-mutation.test.ts` do not exist, whatever architecture 4.2,
+4.3 and 10.5 say. The store is `src/game/store.ts` (`createStore`, `Store<T>`
+with `get`, `version`, `mutate`, `watch`, `subscribe`, `flush`) and the run
+store factory is `src/game/runStore.ts` (`createRunStore`,
+`createTelemetryStore`, `HudTelemetry`, `HudLeg`). Create `src/game/index.ts`
+as the barrel and create `tests/game/run-mutation.test.ts` yourself (V21).
+
+`src/app/loop.ts` is not modified. Its `SimHost` has one simulation hook,
+`fixedUpdate(tick)`, plus `applyPendingCommands(tick)`, and no
+`preTick`/`postTick` seam; the ordering of architecture 2.2 is realised inside
+the host, not the loop (V2). `src/main.ts` is a self-contained placeholder
+boot that imports none of the shipped packages; leave it alone.
+
+Owned files beyond the package list: `src/game/index.ts`,
+`src/game/travel/policyBinding.ts` (V3), `src/game/travel/workload.ts` (V5),
+`src/app/RunHost.ts` (V2), `src/app/commandSinkAdapter.ts` (V12),
+`src/game/tiers.ts` (V16), `tests/game/run-mutation.test.ts` and
+`tests/game/boundaries.test.ts` (V21), `tests/game/runHost.test.ts`. Granted
+edits to other packages' files, each exact and quoted in the pre-flight:
+`src/game/CommandBus.ts` (V12), `src/game/replay/types.ts` and
+`src/game/replay/headlessLegs.ts` and `src/game/replay/runReplay.ts` (V3, V5).
+Nothing else outside the create list.
+
+### V2. The frame seam lives in a headless host, and the browser boot is not this package
+
+Create `src/app/RunHost.ts` exporting `createRunHost(deps): RunHost`, where
+`RunHost implements SimHost` for the game layer only:
+`applyPendingCommands(tick)` calls `bus.drain(tick)` and hands the outcomes to
+the director (V16); `fixedUpdate(tick)` calls `director.preTick(tick)`,
+`const events = kernel.step()`, `queue.push(events)`,
+`director.postTick(tick, events)`, in that order; `flushState()` flushes the
+run store and the telemetry store and fills `HudTelemetry` from
+`kernel.invariantState()` (tick, `metrics.scheduling.cpuUtilisation`,
+`metrics.memory.faultRate`, `config.thrashingThreshold`, the four policy ids,
+the quantum, and `HudLeg` from the current leg); `routeEvents()` calls
+`queue.drain(...)`; `variableUpdate`, `render`, `onFrameMetrics` and
+`onRunStateChanged` forward to injected optional hooks and do nothing
+headless. `queue` is `FrameEventQueue` from `@world`; consumers are
+registered by the host's caller through `host.queue`. Nothing in `src/app`
+constructs a renderer, a DOM element, an audio engine or a terminal in this
+package. Assembling the browser application over this host (replacing
+`src/main.ts`, wiring `createHud`, `createCodex`, `createTerminal`,
+`AudioEngine`, `StageBuilder`, `createBackend` and the cards) is a separate
+package that follows WP-20; write nothing toward it and list every host duty
+you discovered for it under handoffs.
+
+### V3. The dials write through a `PolicyBinding`, and it is the one replay uses
+
+There is no `setSchedulerParams`. The quantum write is
+`kernel.setScheduler(view.schedulerId, { quantum })`, where `schedulerId`
+comes from `kernel.invariantState()` (not `kernel.config.scheduler`, which is
+never updated by `setScheduler`). WP-18 defined `PolicyBinding` in
+`src/game/replay/types.ts` with a `DEFAULT_POLICY_BINDING` that handles the
+degree only and carries `// TODO(astra): WP-19 supplies the pace and rations
+binding and replay must use the same one`. Create
+`src/game/travel/policyBinding.ts` exporting `livePolicyBinding: PolicyBinding`
+implementing pace (quantum through `setScheduler` as above), rations (V4) and
+degree (`kernel.setDegreeOfMultiprogramming`), and replace the body of
+`DEFAULT_POLICY_BINDING` in `replay/types.ts` with a re-export of it, removing
+the marker. That is the granted edit to `replay/types.ts`. The `RunDirector`
+applies the binding once after `populate` and again after every drained
+command whose kind is `set_pace`, `set_rations` or `set_degree`, which is the
+schedule `runReplay` already follows. At leg entry the config is also
+pre-set (step 4 of entry) so the kernel is built with the right quantum;
+applying the binding after `populate` is then a no-op and the test asserts it.
+
+### V4. Rations: the kernel has no per-process reservation, so the binding is economic only
+
+The kernel's `src/kernel/memory/rations.ts` exports `framesPerProcess` and
+`validateFrameBudget` as pure functions and nothing in `src/kernel` calls
+them; `FrameTable.allocate(space, page, pinned)` is internal; there is no
+per-process floor, reservation or pin API on `Kernel` or `KernelImpl`. So the
+"ceil(framesPerProgram) frames, pinned" write in section 4 has no target.
+Ruling: the rations half of `livePolicyBinding` performs no kernel write in
+this package and carries `// TODO(astra): kernel track adds a per-process frame
+floor API; rations then reserves ceil(framesPerProgram) per bound Program`.
+Rations remain fully real on the economy side: quota burn, integrity cost,
+affliction rolls, and the forced-`starved` rule. The `two tables stay
+separate` case still asserts the kernel table's values differ from the
+game's, and the report states that `rations.ts` is unreferenced by the kernel.
+
+### V5. Pace scales workload arrivals through a spawn transform shared with replay
+
+`populate` is the only place workload processes are created, through
+`LegSetupContext.spawn`, and the live runner must build that context with
+WP-18's `createHeadlessSetupContext(kernel, run, rng, bindings)` (WP-18
+ruling 8) so live and replay spawn identically. Arrival scaling therefore
+goes into that function: add an optional fifth parameter
+`transform?: (spec: ProcessSpec) => ProcessSpec` applied to every spec before
+`kernel.spawn`, and create `src/game/travel/workload.ts` exporting
+`paceSpawnTransform(pace): (spec) => spec` which returns the spec with
+`arrival: Math.round(spec.arrival / PACE_TABLE[pace].workloadArrivalRate)`
+(an arrival of 0 stays 0, so convoy Programs spawned at tick 0 are
+unaffected). `runReplay` passes `paceSpawnTransform(policy.pace)` when it
+builds its context. Those are the granted edits to `headlessLegs.ts` and
+`runReplay.ts`; quote both. The "spawn or hold this tick's workload arrivals"
+step in `preTick` is deleted: arrivals are the kernel's, fixed at spawn time.
+
+### V6. The degree controller wraps the kernel's admission control, which decides the order
+
+`kernel.setDegreeOfMultiprogramming(target)` reaches
+`thrashing.ts:setDegree`, which throws above the configured admission ceiling
+(`maximumDegree`), suspends the process with the largest working set first
+(ties to the highest pid) until the active count fits, and never admits on a
+raise: resumption happens in the pager's own update, one process per
+`thrashingSuspendInterval` once the fault band has been healthy for
+`thrashingRecoveryTicks`. There is no per-pid suspend or resume API.
+`DegreeController` is therefore a thin wrapper: `set(target, at)` clamps to
+`[1, ceiling]`, calls the kernel, and reports `admitted` and `suspended` by
+diffing `view.suspended(pid)` over the workload pids before and after. The
+ascending and descending pid rules in section 7 are dropped; the
+`deterministic order` case becomes "the same request from the same state
+moves the same processes", and `framesAvailableToConvoy` is
+`totalFrames - sum(workingSet of active workload pids)` from
+`view.metrics.memory.workingSets`. Report the ceiling's source and value.
+
+### V7. Derezz terminates through the lifecycle with a reason, not through `kill`
+
+The `kill` syscall always yields `killed_by_user` or `killed_by_parent` and
+cannot carry a reason. `KernelImpl.lifecycle.exit(pcb, code, reason)` is the
+function every kernel death path calls, including `kill`, so its accounting
+is the kernel's own. `derezz` terminates the bound pid with
+`kernel.lifecycle.exit(kernel.process(pid), 137, reason)` after the epitaph
+is built. Define `TERMINATION_FOR_AFFLICTION: Readonly<Record<AfflictionId,
+TerminationReason>>` in `afflictions/table.ts` (propose the mapping in the
+pre-flight; the closed union has no `livelock`, `bit_rot` or `interrupt_storm`
+reasons, so those map to the nearest member) and `drainDeathReason(member)`,
+which picks the reason of the highest-drain affliction the Program carries,
+or `starvation` when it carries none (the only afflictionless drains are the
+`starved` rations cost and the emergency credit). The `pid terminated` case
+asserts a `process.exited` event with the chosen reason. Because game-layer
+deaths must replay, the same code runs in `RunDirector.postTick` and in the
+`afterStep` hook the director registers through `registerHeadlessLeg` (V13).
+
+### V8. Contention: `meanHoldTicks` has no data source; redefine the term
+
+The sync subsystem records no acquisition history and no `servedAtTick`; the
+snapshot carries `SyncPrimitive { id, kind, displayName, value, capacity,
+holders, waitQueue (pids), ordered }` on `KernelSnapshot.syncPrimitives` and
+the live waits on `InvariantView.syncWaits` as `{ generation, actor,
+resource, operation, requestedAt, ... }`. Rule: `holdPressure` uses
+`meanWaitAge(view, lock.id)`, the mean of `view.tick - wait.requestedAt` over
+the waits currently queued on that primitive, 0 when none, capped at one
+quantum as the bible caps hold time. It is snapshot-consistent, so a
+provisional resume before a crossing quotes the same contention. `contention`
+takes `InvariantView` rather than `KernelSnapshot` (the view is the cheap
+per-frame read; `KernelSnapshot` is a full serialisation) and the six
+hand-built fixtures are views. Report it as a document disagreement against
+narrative 12.1 and file the last-sixteen ring against the kernel track; do
+not add tracking to the sync subsystem in this package.
+
+### V9. Streams come from `createRunStreams`, and the Rng API is `save`/`restore`/`fork`
+
+`createRng(seed, label)` returns an `Rng` with `next`, `int(minInclusive,
+maxExclusive)`, `chance`, `pick`, `shuffle`, `fork(label)`, `save()`,
+`restore(state)`; forks are labelled `parent/label`. WP-18's
+`createRunStreams(seed)` already builds `run`, `run/leg`, `run/events`,
+`run/crossing`, `run/reclamation`, and `saveRunStreams` and
+`restoreRunStreams` fix the order. `LegRunnerDeps.rng` becomes
+`streams: RunStreams`; nothing in this package calls `createRng` or `fork`.
+Note `int` is exclusive at the top, so the deck's `r = rng.int(1, total)` in
+section 10 is `rng.int(1, total + 1)`.
+
+### V10. The kernel surface the runner holds
+
+The runner holds `ReturnType<typeof createKernel>` (`KernelImpl`), as
+`terminalHost.ts` and the replay do, because `Kernel` (the interface) exposes
+none of `invariantState`, `lifecycle`, `setDegreeOfMultiprogramming`,
+`declareResource`, `spawn`, `allProgramsScripted` or the subsystems.
+`LegRunnerDeps.createKernel` returns that type and is called with
+`REPLAY_KERNEL_OPTIONS` overridden to `devBuild: true` and the invariant
+harness on for the live run (WP-18's constraint: the live runner keeps
+`devBuild` true; a live run that panicked is not replayable byte for byte,
+which is expected). Spawn validation in `KernelImpl.spawn` requires `burst`
+and `service` at least 1, `priority` at most 39 and integer fields; the
+synthetic leg respects that.
+
+### V11. Epitaphs: forty-eight templates exist in the bible, keyed by reason
+
+Narrative 9 defines `EpitaphTemplate { id, reason, inscription, cause,
+codexEntry, member?, legId? }` and the selection rule: uniform among
+templates matching `reason`, filtered by `member` and `legId` where present,
+drawn from the run's seeded stream. `EpitaphCopySource` is therefore
+`{ templates(reason: TerminationReason): readonly EpitaphTemplate[] }` and
+the selection rule lives in `convoy/derezz.ts`, drawing from `run/leg`. The
+package still ships no copy: the injected source throws with a
+`// TODO(astra): epitaph copy package transcribes narrative 9` marker and the
+tests inject two templates per reason. Report the interface.
+
+### V12. The bus, the sink and the deadlock strategy
+
+`CommandBus.apply` records then mutates; `KernelMutators` has the four
+setters and `syscall`; `Command` has `set_scheduler` (with `to` and
+`quantum`), `set_replacement`, `set_disk_policy`, `set_allocation`,
+`set_pace`, `set_rations`, `set_degree`, `use_ability`, `syscall`,
+`interaction`, `terminal`. WP-15's `CommandSink` uses different field names
+and has `set_deadlock_strategy`, which `Command` lacks. Granted edit to
+`CommandBus.ts`: add `{ kind: 'set_deadlock_strategy'; to: DeadlockStrategy }`
+to `Command`, `setDeadlockStrategy(strategy)` to `KernelMutators`, the
+`describeChoice` and `commandFromRecord` branches, and extend the
+`commandFromRecord` round-trip case in `tests/game/commandBus.test.ts`
+(protected; quote-and-wait, ruled approved now, quote the insertion in the
+commit message). `commandFromRecord` replays it; `scheduleDecisions` in
+`runReplay` needs no change. Then create `src/app/commandSinkAdapter.ts`
+exporting `sinkOverBus(bus, legId): CommandSink`, mapping each
+`TerminalCommandRequest` to its `Command` with `origin { source: 'terminal',
+legId }` and returning `{ ok: false, message }` when `dispatch` reports the
+queue full. `CommandHandlers` is yours: `interaction(id, anchor, at)` looks
+the `InteractionDef` up on the current leg, checks `enabledWhen` through the
+sandbox, charges `cost` through `applyDelta` and refuses on an empty ledger
+(V16); `useAbility` records nothing beyond the bus's own record and carries
+`// TODO(astra): the abilities package implements convoy abilities`; `terminal`
+is a no-op, since the terminal's effect was dispatched as its own command.
+
+### V13. Replay identity: the director's headless half is registered, not duplicated
+
+`RunDirector` exposes its per-tick work as `ReplayHooks` (`beforeStep`,
+`afterStep`, `isComplete`) and the runner registers the current leg through
+`registerHeadlessLeg(id, () => headlessOf(leg, director.hooks()))` at entry
+and undoes it at exit. `beforeStep` is the `preTick` body (travel charge,
+rations and affliction ticks, credit drain, event draws) driven from the
+`streams` and `store` it is handed; `afterStep` is `postTick` minus the
+score recompute and the decision resolution, which the live side keeps.
+`initialRunState(seed, discClass, difficulty)` is the run's starting state
+with `startingLedger` applied by the runner on top (it ships a zero ledger);
+`noteExits`, `applyLegOutcome`, `observeLeg`, `startReplayRecord`,
+`recordLegEntry` and `recordLegHash` are called as WP-18's handoff
+prescribes, and `DecisionRecord.tick` is the kernel's leg-local tick. The
+`determinism` case in `legRunner.test.ts` runs the same leg live and through
+`runReplay` and asserts equal event log hashes; that is acceptance 43
+restated and it is the assertion that keeps the counterfactual honest.
+
+### V14. The counterfactual flow, against the shipped API
+
+At exit: `observed = observeLeg(kernel.snapshot(), legEvents, bindings)`;
+`plans = planCounterfactuals({ legId, seed, discClass, difficulty,
+decisions, observed, kernel, policy, maxTicks })` (at most two, run
+sequentially, each against `ReplayWorkerHandle.run(request, 1500)`);
+`phraseCounterfactual({ baseline: observed, alternative, request, floor })`
+for the first successful one. `DebriefView` gains
+`counterfactual: Promise<string | null>` resolving to the sentence or `null`
+on failure or timeout, which is what `createDebriefCard(doc, card, pending)`
+consumes; `fillCounterfactual` from section 15 is not needed and is not
+written. When `deps.replay` is null the promise resolves `null` immediately.
+Also expose the `CodexCounterfactual` through `toCodexCounterfactual` on the
+`DebriefView` so the host can call `codex.setCounterfactual`.
+
+### V15. Cards, HUD and codex are consumers of this package's outputs
+
+`LegRunner` emits typed notifications through `deps.onLegEvent`:
+`{ kind: 'leg_unavailable', legId, index, reason }`, `{ kind: 'tombstone',
+epitaph, memberName }`, `{ kind: 'panic', message, tick }`, `{ kind:
+'debrief', view }`, `{ kind: 'crossing_open', def, context }`, `{ kind:
+'depot_open', depot }`, `{ kind: 'reclamation_open', layout }`. Their shapes
+match `createLegUnavailableCard`, `createTombstoneCard`, `createPanicCard`
+and `createDebriefCard` option types so the boot package renders them without
+translation. `Codex.signal` takes `{ kind: 'crossing' | 'leg_complete' ... }`
+and the runner calls a `deps.codexSignal` hook with the same shape at the
+right moments; `Hud.derezz.begin()` and `tombstone()` are called through
+`deps.onDerezz` at the derezz pre-roll and the tombstone rise.
+
+### V16. Difficulty tiers carry more than the resource factor
+
+Narrative 13's table also sets, per tier, an affliction frequency multiplier
+(0.60, 1.00, 1.35, 1.70), an affliction drain multiplier (0.75, 1.00, 1.10,
+1.25), a `fatalAfter` multiplier (1.50, 1.00, 0.90, 0.80), a policy change
+cost (free, free, 15 cycles, 25 cycles), a terminal command cost (free, free,
+1 bandwidth on writes, 2 bandwidth on all) and the score multiplier. Create
+`src/game/tiers.ts` with all seven columns as one `TIER_TABLE` and apply the
+affliction three in `AfflictionClock` and `EventDeck.apply`, and the two
+command costs in the director's handling of drained `CommandOutcome`s
+(refusing the mutation and marking the record `costly` when the ledger cannot
+pay). The section 7.1 and 12.3 tables are asserted at `operator`, where
+every multiplier is 1.0.
+
+### V17. Recruit under a closed `ConvoyMemberId`
+
+`ConvoyMemberId` is the closed union `lumen | sable | orrery | kestrel |
+vesper` in the frozen kernel types, so `LUMEN-2` cannot be a new id. The
+recruit reuses the dead Program's id, sets `name` to `<NAME>-2`, `status` to
+`nominal`, `integrity` to 100, `pid` to null until the next leg binds it, and
+`abilityCharges` to the role's per-leg charges minus one; the original
+`Epitaph` stays in `tombstones` and `member` on it still reads the shared id.
+The 60 percent passive is recorded in a runner-side `recruits` table exposed
+on the `LegRunner` for the abilities package to read. Report this as the
+reading forced by the frozen union.
+
+### V18. `LegSandbox` is architecture 10.5 verbatim, with one addition
+
+Ship the class from 10.5 exactly, including `LegFailure`, `NULL_STAGE` and
+`neutralOutcome`. The one addition: `onlyIf` and terminal handlers are not
+in that listing, so add `predicate(def, run): boolean` (false on throw,
+recorded) and use it from `EventDeck.eligible` through an injected
+`predicate` function so `EventDeck` stays free of the sandbox type.
+
+### V19. Verge and reclamation read `MemoryMetrics.externalFragmentation`
+
+The field exists on `KernelSnapshot.metrics.memory` and on the view. The
+round is headless and `submit(trace)` is the only input; `ReclamationTrace`
+is `readonly { readonly atSeconds: number; readonly action: 'collect' |
+'coalesce'; readonly blockId: number }[]`, and its type is exported for WP-20.
+
+### V20. Journal checkpoint and boundary saves use the pure save functions
+
+`buildSaveFile` and `checksumOf` are synchronous and pure; `persistSave` and
+`SaveService` need IndexedDB. The runner takes `deps.persist: (input:
+SaveFileInput, kind: 'boundary' | 'provisional') => void` and calls it at
+every leg boundary with `kernel: null` and `rngStates: saveRunStreams(streams)`;
+the journal checkpoint keeps the `SaveFile` returned by `buildSaveFile` in
+memory and rolls back with `resumeRun(file, { buildKernel, populate })`. The
+boot package binds `deps.persist` to a `SaveService`; tests inject a spy.
+
+### V21. Two enforcement tests this package writes
+
+`tests/game/run-mutation.test.ts`: wraps the run store's `get()` in a
+deep-freezing proxy for the duration of a full synthetic leg, so any write
+outside `mutate` throws, and asserts zero throws. `tests/game/boundaries.
+test.ts`: in the pattern of `tests/ui/boundaries.test.ts` over `src/game`
+excluding `src/game/workers/`, asserting no `Math.random`, `Date.now`,
+`performance.now`, `new Date`, `localStorage`, `document` or `window`, and
+no value import from `@world`, `@render`, `@ui`, `@audio`, `@terminal` or
+`@app` except the two WP-18 worker imports. `src/app/RunHost.ts` may import
+`@world/FrameEventQueue` as a value.
+
+### V22. Numbers to report beside the documents
+
+Every table the package lists in "Report back" item 3, plus `TIER_TABLE`
+(V16), `TERMINATION_FOR_AFFLICTION` (V7) and the arrival transform's effect
+on the synthetic leg's arrival ticks at the four paces (V5).
+
+### V23. Pre-flight before writing
+
+Read this section, then send a pre-flight listing: the exact diffs for the
+four granted edits (V3, V5, V12); the `TERMINATION_FOR_AFFLICTION` mapping
+(V7); the `RunHost` and `LegRunnerDeps` declarations as you will write them;
+the `EpitaphCopySource` interface (V11); the `ReplayHooks` the director will
+expose (V13); the `onLegEvent` union (V15); the commit plan by module; and
+any finding needing a ruling, numbered. Wait for the reply before the first
+commit. Every commit passes all four gates on its own and ends with both
+attribution lines.
