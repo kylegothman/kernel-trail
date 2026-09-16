@@ -22,7 +22,7 @@ import { ALL_DEFINITIONS, BASE_COMMAND_NAMES, SHIPPED_HANDLERS } from '@terminal
 import { DEFERRED_COMMANDS } from '@terminal/registry';
 import { createWorkloadKernel } from '../kernel/scheduler/workloadRunner';
 import { REFERENCE_CONFIG } from '../kernel/fixtures/referenceConfig';
-import { curriculumDefinitions, ERRORS, expectError, expectOk, makeFixture, makeKernel, makeZombie, ROOT, runningProcess, runUntil } from './harness';
+import { curriculumDefinitions, ERRORS, expectError, expectErrorsNameTopics, expectOk, makeFixture, makeKernel, makeZombie, ROOT, runningProcess, runUntil } from './harness';
 
 const DEFINED = curriculumDefinitions();
 
@@ -955,13 +955,10 @@ describe('decisions', () => {
   });
 });
 
-describe('errors', () => {
-  it('every error produced by this file so far carries a topic and a message that names it', () => {
-    expect(ERRORS.length).toBeGreaterThan(0);
-    for (const { line, result } of ERRORS) {
-      expect(result.topic, line).not.toBe('');
-      expect(result.message, line).toContain(result.topic);
-    }
+describe('errors name topics (acceptance 11)', () => {
+  it('every error this suite produced names a man topic that resolves', () => {
+    expect(ERRORS.length).toBeGreaterThan(40);
+    expectErrorsNameTopics();
   });
 });
 

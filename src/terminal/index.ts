@@ -1,5 +1,5 @@
 /** KERNEL TRAIL: the terminal, WP-15. */
-export { Shell, callerPid, findProcess } from './Shell';
+export { Shell, createBaseShell, callerPid, findProcess } from './Shell';
 export type { ShellContext, ShellOptions } from './Shell';
 export { CommandRegistry, DEFERRED_COMMANDS, fail, ok, nearest, editDistance } from './registry';
 export type { ArgCompletion, CommandResult, CommandRun, CompletionKind, ShippedHandler, TerminalCommand } from './registry';
@@ -14,3 +14,8 @@ export type { EventRings, GanttSegment, ModeSwitch } from './eventRings';
 export type { TerminalHost } from './host';
 export type { CommandSink, SinkResult, TerminalCommandRequest } from './commandSink';
 export { ALL_DEFINITIONS, BASE_COMMAND_NAMES, BASE_DEFINITIONS, SHIPPED_HANDLERS, definitionOf } from './commands/index';
+export { manPage, resolveTopic, allTopics, pageFor, seeAlsoTopics } from './man/ManPages';
+export type { ResolvedTopic, TopicKind } from './man/ManPages';
+export { ERRNO_CALLS, ERRNO_NAMES, errnoPage, isErrno, substitutedPage } from './man/errnoPages';
+export { syscallPage, errnosOf, CALL_WRAPPERS, CALL_PREFIX } from './man/syscallPages';
+export { CONCEPT_PAGES, CODEX_TOPIC, codexRedirect, isCodexReference, noPage } from './man/conceptPages';

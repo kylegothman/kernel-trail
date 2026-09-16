@@ -1,5 +1,5 @@
 /**
- * KERNEL TRAIL: the Leg 0 commands, `syscall` and `mode` (`man` joins them with the man module).
+ * KERNEL TRAIL: the Leg 0 commands, `man`, `syscall` and `mode`.
  *
  * `syscall` is the one command that issues an arbitrary call on the player's
  * behalf, so its formatting helpers are shared with `trace`, which prints the
@@ -11,6 +11,7 @@ import { table } from '../output';
 import { parseInteger } from '../parser';
 import { bindOrFail, fail, nearest, ok, pidArg, type ShippedHandler } from '../registry';
 import { callerPid, type ShellContext } from '../Shell';
+import { manPage } from '../man/ManPages';
 
 export const MAN_DEF: TerminalCommandDef = {
   name: 'man',
@@ -168,7 +169,17 @@ const modeHandler: ShippedHandler = {
   },
 };
 
+const manHandler: ShippedHandler = {
+  completions: [{ flag: null, kind: 'topic' }],
+  run(argv, ctx: ShellContext) {
+    const bound = bindOrFail('man', argv, {});
+    if (!bound.ok) return bound;
+    return manPage(bound.args.positional.join(' '), ctx.registry, ctx.host);
+  },
+};
+
 export const BASE_HANDLERS: ReadonlyMap<string, ShippedHandler> = new Map([
+  ['man', manHandler],
   ['syscall', syscallHandler],
   ['mode', modeHandler],
 ]);

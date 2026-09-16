@@ -16,12 +16,18 @@ import { History } from './history';
 import type { TerminalHost } from './host';
 import { PARSER_TOPIC, parse } from './parser';
 import { CommandRegistry, fail, nearest, ok, type CommandResult, type CommandRun, type ShippedHandler } from './registry';
-import { SHIPPED_HANDLERS } from './commands/index';
+import { BASE_DEFINITIONS, SHIPPED_HANDLERS } from './commands/index';
 
-/** What a command receives: the host, the shell's event rings, and the line being run (for the sink's origin). */
+/**
+ * What a command receives: the host, the shell's event rings, the registry
+ * (read by `man` and by completion) and the line being run, for the sink's
+ * origin. No mutable kernel reference: the host's kernel is the frozen read
+ * interface and every write goes through the host's sink.
+ */
 export interface ShellContext {
   readonly host: TerminalHost;
   readonly rings: EventRings;
+  readonly registry: CommandRegistry;
   readonly line: string;
 }
 
@@ -81,7 +87,7 @@ export class Shell {
       return fail(candidate, `unknown command '${name}'; the nearest is '${candidate}'.`);
     }
     if (flags.includes('help')) return ok([command.def.usage, command.def.summary, ...(command.help ?? [])]);
-    const ctx: ShellContext = { host: this.host, rings: this.rings, line };
+    const ctx: ShellContext = { host: this.host, rings: this.rings, registry: this.registry, line };
     try {
       return command.run(argv, ctx);
     } catch (error) {
@@ -90,8 +96,15 @@ export class Shell {
   }
 
   complete(input: string): Completion {
-    return complete(input, this.registry, { host: this.host, rings: this.rings, line: input });
+    return complete(input, this.registry, { host: this.host, rings: this.rings, registry: this.registry, line: input });
   }
 
   dispose(): void { if (this.ownsRings) this.rings.dispose(); }
+}
+
+/** The base shell of design brief section 7: exactly the fourteen always-available commands, every one with a handler. */
+export function createBaseShell(host: TerminalHost, options: ShellOptions = {}): Shell {
+  const shell = new Shell(host, options);
+  shell.registerAll(BASE_DEFINITIONS);
+  return shell;
 }

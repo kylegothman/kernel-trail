@@ -13,6 +13,8 @@ import type { KernelConfig, Pid } from '@kernel/types';
 import { LEG_ORDER, type RunState, type TerminalCommandDef } from '@game/types';
 import { createTerminalHost, type CommandSink, type TerminalCommandRequest, type TerminalHost } from '@game/terminalHost';
 import { Shell, type ShellOptions } from '@terminal/Shell';
+import { ALL_DEFINITIONS } from '@terminal/commands/index';
+import { resolveTopic } from '@terminal/man/ManPages';
 import type { CommandResult } from '@terminal/registry';
 import { REFERENCE_CONFIG } from '../kernel/fixtures/referenceConfig';
 
@@ -141,4 +143,20 @@ export function curriculumDefinitions(): ReadonlyMap<string, TerminalCommandDef>
   }
   if (defs.size === 0) throw new Error('no terminal command definitions found in the curriculum map');
   return defs;
+}
+
+/**
+ * Acceptance 11 for one suite: vitest isolates each test file's modules, so
+ * every suite calls this on its own ERRORS at the end. A full shell (all 49
+ * definitions) is the resolver, because a base shell cannot know a leg's page.
+ */
+export function expectErrorsNameTopics(): void {
+  const f = makeFixture();
+  f.shell.registerAll(ALL_DEFINITIONS);
+  expect(ERRORS.length).toBeGreaterThan(0);
+  for (const { line, result } of ERRORS) {
+    expect(result.topic, line).not.toBe('');
+    expect(result.message, line).toContain(result.topic);
+    expect(resolveTopic(result.topic, f.shell.registry, f.host), `${line} -> ${result.topic}`).not.toBeNull();
+  }
 }

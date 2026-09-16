@@ -10,6 +10,7 @@
 import type { CommandRegistry, CompletionKind, TerminalCommand } from './registry';
 import { classify } from './parser';
 import type { ShellContext } from './Shell';
+import { allTopics } from './man/ManPages';
 
 export interface Completion {
   readonly candidates: readonly string[];
@@ -46,7 +47,7 @@ export function valuesFor(kind: CompletionKind, ctx: ShellContext, registry: Com
     case 'syscall': return host.specs.names;
     case 'deadlock-strategy': return ['ignore', 'detect', 'avoid', 'prevent'];
     case 'signal': return SIGNALS;
-    case 'topic': return [...registry.names(), ...host.specs.names, ...host.specs.substitutions.map(row => row.unix)];
+    case 'topic': return allTopics(registry, host);
     case 'syscall-arg': {
       const name = argv[0];
       const spec = name === undefined ? undefined : host.specs.names.includes(name as (typeof host.specs.names)[number]) ? host.specs.calls[name as (typeof host.specs.names)[number]] : undefined;

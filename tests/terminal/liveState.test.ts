@@ -11,7 +11,7 @@ import type { Actor } from '@kernel/sync/SyncSubsystem';
 import { asPageId, asPid, asResourceId, asTick } from '@kernel/types';
 import type { Instruction } from '@kernel/process/Program';
 import { REFERENCE_CONFIG } from '../kernel/fixtures/referenceConfig';
-import { curriculumDefinitions, expectOk, makeFixture, makeKernel, runUntil } from './harness';
+import { curriculumDefinitions, expectError, expectErrorsNameTopics, expectOk, makeFixture, makeKernel, runUntil } from './harness';
 
 const DEFINED = curriculumDefinitions();
 function shellWith(names: readonly string[], kernel = makeKernel()) {
@@ -144,5 +144,14 @@ describe('live state', () => {
     expect(later[1]).not.toEqual(snapshot[1]);
     expect(later[1]?.find(line => line.startsWith('page faults'))).not.toBe(snapshot[1]?.find(line => line.startsWith('page faults')));
     expect(later[2]).not.toEqual(snapshot[2]);
+  });
+});
+
+describe('errors name topics (acceptance 11)', () => {
+  it('every error this suite produced names a man topic that resolves', () => {
+    const f = shellWith(['ps', 'free']);
+    expectError(f.shell, 'ps 4096');
+    expectError(f.shell, 'free --nope');
+    expectErrorsNameTopics();
   });
 });
