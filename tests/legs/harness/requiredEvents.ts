@@ -23,11 +23,16 @@ export const CHAOS_SEED = 4;
  * reckless pace, which ends the leg before the second rotation. Requiring the
  * event under those conditions tests the rotation rather than the leg.
  *
+ * `boot_sector` is here for the second reason: it declares zero travel
+ * segments, so it ends on its own `leg_done` record rather than on travel
+ * progress, and the chaotic rotation has nothing to rotate before the leg is
+ * over. Its required events are issued by its known-good script or not at all.
+ *
  * The known-good script is the stricter reading in any case: the leg has to
  * fire its signature events on the path it ships as correct play, every time,
  * rather than on a path a different seed might happen to produce.
  */
-export const REQUIRED_EVENTS_FROM_KNOWN_GOOD: ReadonlySet<LegId> = new Set<LegId>(['quantum_pass']);
+export const REQUIRED_EVENTS_FROM_KNOWN_GOOD: ReadonlySet<LegId> = new Set<LegId>(['quantum_pass', 'boot_sector']);
 
 /** The run a leg's required-events row is asserted against. */
 export async function runForRequiredEvents(leg: Leg): Promise<HarnessResult> {
