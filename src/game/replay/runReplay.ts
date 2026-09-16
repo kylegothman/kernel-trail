@@ -29,6 +29,7 @@ import {
   restoreRunStreams,
   saveRunStreams,
   type HeadlessLeg,
+  type ObservedLeg,
   type ReplayHooks,
   type ReplayKernel,
   type ReplayOptions,
@@ -209,6 +210,43 @@ export function noteExits(store: Store<RunState>, bindings: ReadonlyMap<ConvoyMe
   });
 }
 
+/**
+ * What one leg produced, in the shape the planner and the phrasing read:
+ * casualties from `process.exited` and the bindings, head movement summed
+ * from `disk.seek`, the rest from the snapshot's metrics. The live runner
+ * calls this at leg end with its own snapshot, log and bindings, so the
+ * planner sees the same numbers a replay of that leg would report.
+ */
+export function observeLeg(snapshot: KernelSnapshot, events: readonly KernelEvent[], bindings: ReadonlyMap<ConvoyMemberId, Pid>): ObservedLeg {
+  const casualties: { member: string; reason: string; tick: number }[] = [];
+  let seekDistance = 0;
+  for (const event of events) {
+    if (event.type === 'disk.seek') seekDistance += event.distance;
+    else if (event.type === 'process.exited' && event.reason !== 'normal_exit') {
+      const member = memberOf(bindings, event.pid);
+      if (member !== null) casualties.push({ member, reason: event.reason, tick: event.tick });
+    }
+  }
+  const metrics = snapshot.metrics;
+  return {
+    casualties,
+    scheduling: {
+      averageWaitingTime: metrics.scheduling.averageWaitingTime,
+      averageTurnaroundTime: metrics.scheduling.averageTurnaroundTime,
+      averageResponseTime: metrics.scheduling.averageResponseTime,
+      contextSwitches: metrics.scheduling.contextSwitches,
+      cpuUtilisation: metrics.scheduling.cpuUtilisation,
+      worstWait: metrics.scheduling.worstWait,
+    },
+    memory: {
+      pageFaults: metrics.memory.pageFaults,
+      evictions: metrics.memory.evictions,
+      faultRate: metrics.memory.faultRate,
+    },
+    storage: { seekDistance },
+  };
+}
+
 const LEDGER_KEYS = ['cycles', 'quota', 'blocks', 'bandwidth'] as const;
 
 /** Leg exit: casualties, the resource delta, objectives and codex unlocks, then the index and status. Exported so WP-19's exit makes the same writes. */
@@ -385,27 +423,17 @@ export function* replaySteps(request: ReplayRequest, options: ReplayOptions = {}
   }
   if (last === null) return failure('error', 'Replay request names no legs.');
   const run = store.get();
-  const metrics = last.snapshot.metrics;
   const bindings = last.bindings;
+  // Scheduling and memory are the last leg's; casualties and head movement accumulate across the legs replayed.
+  const observed = observeLeg(last.snapshot, last.events, bindings);
   const result: ReplayResult = {
     ok: true,
     ticks: totalTicks,
     eventLogHash: hashEventLog(log),
     survivors: run.convoy.filter((m) => m.status !== 'derezzed').map((m) => m.id),
     casualties,
-    scheduling: {
-      averageWaitingTime: metrics.scheduling.averageWaitingTime,
-      averageTurnaroundTime: metrics.scheduling.averageTurnaroundTime,
-      averageResponseTime: metrics.scheduling.averageResponseTime,
-      contextSwitches: metrics.scheduling.contextSwitches,
-      cpuUtilisation: metrics.scheduling.cpuUtilisation,
-      worstWait: metrics.scheduling.worstWait,
-    },
-    memory: {
-      pageFaults: metrics.memory.pageFaults,
-      evictions: metrics.memory.evictions,
-      faultRate: metrics.memory.faultRate,
-    },
+    scheduling: observed.scheduling,
+    memory: observed.memory,
     storage: { seekDistance },
     score: scoreFromRun(run, { workloadCompletions: completions, privilegeExcess: 0 }),
     highlights: selectHighlights(last.events, (pid) => memberOf(bindings, pid)),

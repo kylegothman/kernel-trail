@@ -17,7 +17,7 @@ import { canonicalise, fnv1a64, withoutMapsAndSets } from '../../src/game/save';
 import { HEADLESS_LEGS, createHeadlessSetupContext, type ConvoyBindings } from '../../src/game/replay/headlessLegs';
 import { hashEventLog } from '../../src/game/replay/hash';
 import { HIGHLIGHT_CAP, selectHighlights, severityOf } from '../../src/game/replay/highlights';
-import { applyLegOutcome, initialRunState, noteExits, runReplay, workloadDrained } from '../../src/game/replay/runReplay';
+import { applyLegOutcome, initialRunState, noteExits, observeLeg, runReplay, workloadDrained } from '../../src/game/replay/runReplay';
 import { DEFAULT_POLICY_BINDING, createRunStreams, type PolicyBinding, type ReplayOverrides, type ReplayRequest, type ReplayResult } from '../../src/game/replay/types';
 import { canonical, hash as hash32 } from '../kernel/canonical';
 import { createSyntheticLeg, registerSynthetic, type SyntheticLegOptions } from './fixtures/syntheticLeg';
@@ -144,6 +144,15 @@ describe('runReplay', () => {
       expect(result.diagnostics.legs).toEqual([{ legId: 'boot_sector', ticks: live.ticks, eventLogHash: live.hash }]);
       expect(result.survivors.length + result.casualties.length).toBe(5);
     }
+  });
+
+  it('observeLeg: the live side observes the same numbers the replay reports, so the planner reads one shape', () => {
+    withSynthetic();
+    const live = liveRun(29, SCRIPT);
+    const result = okResult(runReplay(requestFor(29, live.run)));
+    const observed = observeLeg(live.snapshot, live.log, live.bindings);
+    expect(observed).toEqual({ casualties: result.casualties, scheduling: result.scheduling, memory: result.memory, storage: result.storage });
+    expect(observed.scheduling.contextSwitches).toBeGreaterThan(0);
   });
 
   it('idempotent: replaying the same request twice gives byte-identical results', () => {
