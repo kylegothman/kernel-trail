@@ -250,6 +250,7 @@ export class LegRunner {
     if (this.leg !== null) this.activeDirector?.registerCrossings(this.crossingDefs.get(this.leg.id) ?? []);
   }
   openCrossing(def: CrossingDef): CrossingContext { return this.requireDirector().openCrossing(def); }
+  surveyCrossing(def: CrossingDef): CrossingContext { return this.requireDirector().surveyCrossing(def); }
   resolveCrossing(def: CrossingDef, option: CrossingOption): CrossingResult { return this.requireDirector().resolveCrossing(def, option); }
   openDepot(): Depot { return this.requireDirector().openDepot(); }
   openReclamation(): VergeLayout { return this.requireDirector().openReclamation(); }
