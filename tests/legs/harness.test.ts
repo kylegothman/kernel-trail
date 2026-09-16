@@ -695,3 +695,166 @@ describe('the fixture contract', () => {
     expect(full.fields).toEqual([]);
   });
 });
+
+/* ------------------------------------------------------------------ */
+/* The journey, over synthetic legs (section 8, W10, F8)                */
+/* ------------------------------------------------------------------ */
+
+import { HEADLESS_LEGS } from '@game/replay/headlessLegs';
+import type { DecisionRecord } from '@game/types';
+import { HANDOFFS, journeyHashOf, replayJourney, runJourney, type JourneyOptions } from './harness/journey';
+
+const weaveScript: DecisionScript = { legId: 'the_weave', label: 'weave', steps: [{ at: 4, command: { kind: 'set_pace', to: 'aggressive' } }] };
+const journeyLegs = (): Leg[] => [createSyntheticLeg(), createHarnessLeg(), createSyntheticLeg({ id: 'the_weave', index: 2 })];
+const journeyScripts = new Map<LegId, DecisionScript>([[HARNESS_LEG_ID, GOOD], ['the_weave', weaveScript]]);
+const journeyBase = (): JourneyOptions => ({ seed: FIXTURE_SEED, discClass: 'shell', difficulty: 'operator', scripts: journeyScripts, legs: journeyLegs() });
+
+/** A synthetic leg whose populate writes hand-off records onto the entry draft, the one write a leg has at entry. */
+function handoffLeg(id: LegId, index: number, records: readonly Omit<DecisionRecord, 'legId'>[], resolve?: (run: { decisions: DecisionRecord[] }) => void): Leg {
+  const base = createSyntheticLeg({ id, index, processes: 2, service: [20, 40] });
+  return {
+    ...base,
+    populate(ctx) {
+      base.populate(ctx);
+      for (const record of records) ctx.run.decisions.push({ ...record, legId: id });
+      resolve?.(ctx.run);
+    },
+  };
+}
+
+describe('the journey over synthetic legs', () => {
+  it('two journeys from the same seed and scripts hash the same, and a different seed hashes differently', async () => {
+    const first = await runJourney(journeyBase());
+    const second = await runJourney(journeyBase());
+    const other = await runJourney({ ...journeyBase(), seed: 7 });
+    try {
+      expect(first.legs.map((result) => result.legId)).toEqual(['boot_sector', 'fork_fields', 'the_weave']);
+      for (const result of first.legs) assertClean(result);
+      expect(second.journeyHash).toBe(first.journeyHash);
+      expect(other.journeyHash).not.toBe(first.journeyHash);
+      expect(first.journeyHash).toBe(journeyHashOf(first.legs.map((result) => result.logHash), first.finalRun));
+      expect(first.journeyHash).toMatch(/^[0-9a-f]{16}$/);
+      expect(first.skipped).toEqual(LEG_ORDER.slice(3));
+      expect(first.finalRun.legIndex).toBe(3);
+      expect(first.finalRun.status).toBe('in_progress');
+      expect(first.survivors).toBe(5);
+      expect(first.ledgerByLeg).toHaveLength(3);
+      expect(first.wallMs).toBeLessThan(60_000);
+      expect(first.legs[1]?.decisions.some((record) => record.kind === 'crossing')).toBe(true);
+    } finally {
+      first.release(); second.release(); other.release();
+    }
+  });
+
+  it('a journey with restoreAtBoundaries produces the same hash as one run straight through', async () => {
+    const straight = await runJourney(journeyBase());
+    const restored = await runJourney({ ...journeyBase(), restoreAtBoundaries: true });
+    try {
+      expect(restored.boundaryRestores).toBe(2);
+      expect(restored.legs.map((result) => result.logHash)).toEqual(straight.legs.map((result) => result.logHash));
+      expect(restored.finalRun).toEqual(straight.finalRun);
+      expect(restored.journeyHash).toBe(straight.journeyHash);
+      for (const result of restored.legs) assertClean(result);
+    } finally {
+      straight.release(); restored.release();
+    }
+  });
+
+  it('replays through runReplay from the seed and the decision log alone to the same per-leg hashes and final run', async () => {
+    const journey = await runJourney(journeyBase());
+    try {
+      const check = replayJourney(journey, journeyBase());
+      expect(check.problems).toEqual([]);
+      expect(check.ok).toBe(true);
+      expect(check.skippedDecisions).toBe(0);
+      expect(check.handoffRecords).toBe(0);
+      expect(check.replayHash).toBe(journey.journeyHash);
+    } finally {
+      journey.release();
+    }
+  });
+
+  it('the ledger never goes negative at a boundary, the credit fires where the entering ledger predicts, and objectives come from declared ids', async () => {
+    const drained: Leg = { ...createHarnessLeg(), evaluate: (ctx) => ({ ...createHarnessLeg().evaluate(ctx), resourceDelta: { cycles: -1_000_000 } }) };
+    const journey = await runJourney({ ...journeyBase(), legs: [createSyntheticLeg(), drained, createSyntheticLeg({ id: 'the_weave', index: 2 })] });
+    try {
+      for (const ledger of journey.ledgerByLeg) for (const value of Object.values(ledger)) expect(value).toBeGreaterThanOrEqual(0);
+      // The outcome floors the ledger at zero and the dividend lands after it, so what remains is the dividend alone.
+      expect(journey.ledgerByLeg[1]?.cycles).toBeLessThan(65 * 1.575);
+      expect(journey.creditPredicted).toEqual(['the_weave']);
+      expect(journey.creditLegs).toContain('the_weave');
+      expect(journey.legs[2]?.onCredit).toBe(true);
+      expect(journey.legs[2]?.run.policy.pace).toBe('conservative');
+      const declared = new Set(journeyLegs().flatMap((leg) => leg.objectives.map((objective) => objective.id)));
+      for (const id of journey.objectivesMet) expect(declared.has(id), id).toBe(true);
+    } finally {
+      journey.release();
+    }
+  });
+
+  it('observes the hand-offs against their producers, marks the absent ones skipped or defaulted, and replays their records as skipped decisions', async () => {
+    const pending = (kind: string, choice: string): Omit<DecisionRecord, 'legId'> => ({ tick: asTick(0), kind, choice, outcome: 'pending', relatedObjective: null });
+    const legs: Leg[] = [];
+    for (const [index, id] of LEG_ORDER.slice(0, 13).entries()) {
+      if (id === 'the_cistern') legs.push(handoffLeg(id, index, [{ ...pending('ring_closed', '41'), outcome: 'good' }]));
+      else if (id === 'allocation_yards') legs.push(handoffLeg(id, index, [pending('executable_bit', 'left_set')]));
+      else if (id === 'the_bus') legs.push(handoffLeg(id, index, [{ ...pending('device_attach', 'block'), outcome: 'good' }]));
+      else if (id === 'the_archive') legs.push(handoffLeg(id, index, [{ ...pending('crash_outcome', 'recovered'), outcome: 'good' }, { ...pending('manifest_integrity', 'intact'), outcome: 'good' }]));
+      else if (id === 'arbiter_wall') legs.push(handoffLeg(id, index, [{ ...pending('escalation_outcome', 'all_blocked'), outcome: 'good' }, { ...pending('privilege_excess', '0'), outcome: 'good' }], (run) => {
+        // Hand-off 2's write-back: the consumer resolves the producer's pending record.
+        for (const record of run.decisions) if (record.kind === 'executable_bit') record.outcome = 'costly';
+      }));
+      else legs.push(createSyntheticLeg({ id, index, processes: 2, service: [20, 40] }));
+    }
+    const base: JourneyOptions = { seed: 5, discClass: 'shell', difficulty: 'operator', scripts: new Map(), legs };
+    const journey = await runJourney(base);
+    try {
+      for (const result of journey.legs) assertClean(result);
+      const byNumber = new Map(journey.handoffs.map((observation) => [observation.handoff, observation]));
+      expect(byNumber.get(1)?.status).toBe('observed');
+      expect(byNumber.get(1)?.producerWrote).toEqual(['ring_closed']);
+      expect(byNumber.get(2)?.status).toBe('observed');
+      expect(byNumber.get(2)?.writeBack).toBe(true);
+      expect(byNumber.get(3)?.status).toBe('observed');
+      expect(byNumber.get(4)?.status).toBe('observed');
+      expect(byNumber.get(4)?.producerWrote).toEqual(['crash_outcome', 'manifest_integrity']);
+      expect(byNumber.get(5)?.status).toBe('skipped');
+      expect(byNumber.get(5)?.reason).toContain('the_portal did not run');
+      expect(journey.finalRun.decisions.filter((record) => record.kind === 'executable_bit').map((record) => record.outcome)).toEqual(['costly']);
+      const check = replayJourney(journey, base);
+      expect(check.problems).toEqual([]);
+      expect(check.handoffRecords).toBe(7);
+      expect(check.skippedDecisions).toBe(7);
+      const restored = await runJourney({ ...base, restoreAtBoundaries: true });
+      try {
+        expect(restored.journeyHash).toBe(journey.journeyHash);
+        expect(restored.finalRun.decisions.filter((record) => HANDOFFS.some((spec) => spec.kinds.includes(record.kind)))).toHaveLength(7);
+      } finally {
+        restored.release();
+      }
+    } finally {
+      journey.release();
+    }
+    const silent = await runJourney({ ...base, legs: legs.map((leg) => (leg.id === 'the_cistern' ? createSyntheticLeg({ id: 'the_cistern', index: 5, processes: 2, service: [20, 40] }) : leg)) });
+    try {
+      expect(silent.handoffs.find((observation) => observation.handoff === 1)?.status).toBe('defaulted');
+      expect(silent.handoffs.find((observation) => observation.handoff === 1)?.reason).toContain('fell back to its default');
+    } finally {
+      silent.release();
+    }
+  });
+
+  it('release puts the headless registry back as it was before the journey', async () => {
+    const before = { boot: HEADLESS_LEGS.boot_sector, fork: HEADLESS_LEGS.fork_fields, weave: HEADLESS_LEGS.the_weave, portal: HEADLESS_LEGS.the_portal };
+    const journey = await runJourney(journeyBase());
+    expect(HEADLESS_LEGS.fork_fields).not.toBe(before.fork);
+    expect(HEADLESS_LEGS.the_weave).not.toBe(before.weave);
+    expect(() => HEADLESS_LEGS.the_weave()).not.toThrow();
+    journey.release();
+    expect(HEADLESS_LEGS.boot_sector).toBe(before.boot);
+    expect(HEADLESS_LEGS.fork_fields).toBe(before.fork);
+    expect(HEADLESS_LEGS.the_weave).toBe(before.weave);
+    expect(HEADLESS_LEGS.the_portal).toBe(before.portal);
+    expect(() => HEADLESS_LEGS.the_portal()).toThrow(/not implemented/);
+  });
+});

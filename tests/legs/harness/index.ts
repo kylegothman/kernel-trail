@@ -10,3 +10,4 @@ export * from './syntheticLeg';
 export * from './goldenLog';
 export * from './fixtureContract';
 export * from './stubFixtures';
+export * from './journey';

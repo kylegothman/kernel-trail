@@ -111,7 +111,6 @@ export function assertHeadless(): void {
 /** Per-run state shared across a mid-leg restore and across the legs of a journey. */
 export interface Collectors {
   readonly log: KernelEvent[];
-  readonly seen: Set<number>;
   readonly panics: string[];
   readonly legFailures: LegFailure[];
   readonly runnerFailures: string[];
@@ -121,7 +120,7 @@ export interface Collectors {
 }
 
 export function createCollectors(): Collectors {
-  return { log: [], seen: new Set(), panics: [], legFailures: [], runnerFailures: [], notes: [], crossings: [], stageCalls: 0 };
+  return { log: [], panics: [], legFailures: [], runnerFailures: [], notes: [], crossings: [], stageCalls: 0 };
 }
 
 export class HarnessSession {
@@ -196,7 +195,10 @@ export class HarnessSession {
   private attachTo(kernel: ReplayKernel | null): void {
     this.detach();
     if (kernel === null) return;
-    const { seen, log } = this.collectors;
+    // One set per kernel, as createRunHost keeps it: every leg's kernel restarts its seq at 0, and a
+    // restored kernel continues from its snapshot's seq, so the set never has to outlive the kernel.
+    const seen = new Set<number>();
+    const { log } = this.collectors;
     this.unsubscribe = kernel.events.onAny((event) => {
       if (seen.has(event.seq)) return;
       seen.add(event.seq);

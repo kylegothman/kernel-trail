@@ -1,10 +1,10 @@
 import { asTick, type ConvoyMemberId, type createKernel, type KernelEvent, type KernelConfig, type Tick } from '@kernel/index';
-import { CommandBus, commandFromRecord, originFromRecord, type CommandOutcome } from './CommandBus';
+import { CommandBus, commandFromRecord, originFromRecord, type CommandKind, type CommandOutcome } from './CommandBus';
 import type { CodexCounterfactual, CodexUnlock } from './codexTypes';
 import type { EpitaphCopySource } from './convoy/derezz';
 import { PER_LEG_ABILITY_CHARGES } from './convoy/status';
 import { LegSandbox, type LegFailure } from './LegSandbox';
-import { RunDirector, type DirectorSnapshot, type InteractionHandler } from './RunDirector';
+import { DIRECTOR_OWNED_KINDS, RunDirector, type DirectorSnapshot, type InteractionHandler } from './RunDirector';
 import { buildDebrief, type DebriefView } from './debrief';
 import type { CrossingDef, CrossingResult } from './crossing/Crossing';
 import type { CrossingContext, CrossingOption } from './crossing/options';
@@ -79,6 +79,12 @@ interface Checkpoint {
   readonly recruits: readonly RecruitPassive[];
   readonly replayRecord: ReplayRecord;
 }
+
+/** Every kind the bus records; exhaustive over `Command`, so a new command kind is a compile error here (WP-20 W9). */
+const BUS_KINDS: Readonly<Record<CommandKind, true>> = {
+  set_scheduler: true, set_replacement: true, set_disk_policy: true, set_allocation: true, set_deadlock_strategy: true,
+  set_pace: true, set_rations: true, set_degree: true, use_ability: true, syscall: true, interaction: true, terminal: true,
+};
 
 /** Copy plain run data through reads, including guarded store views. */
 function cloneRunState(run: Readonly<RunState>): RunState {
@@ -450,8 +456,14 @@ export class LegRunner {
             if (record.tick < kernel.tick) throw new Error(`Resume action order missed tick ${record.tick}.`);
             const command = commandFromRecord(record);
             if (command === null) {
-              if (!director.dispatch(record)) throw new Error(`Resume cannot dispatch ${record.kind}.`);
-              if (record.kind === 'checkpoint_rollback') { scratch.checkpoint = null; scratch.pendingCheckpoint = null; }
+              if (director.dispatch(record)) {
+                if (record.kind === 'checkpoint_rollback') { scratch.checkpoint = null; scratch.pendingCheckpoint = null; }
+              } else if (DIRECTOR_OWNED_KINDS.has(record.kind) || Object.hasOwn(BUS_KINDS, record.kind)) {
+                throw new Error(`Resume cannot dispatch ${record.kind}.`);
+              } else {
+                // Neither the bus nor the director owns the kind: leg data such as a hand-off record rides through verbatim (WP-20 W9).
+                replayStore.mutate((run) => { run.decisions.push({ ...record }); });
+              }
             } else outcomes.push(bus.apply(command, originFromRecord(record), kernel.tick));
             next++;
           }
