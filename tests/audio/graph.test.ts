@@ -168,7 +168,12 @@ describe('graph', () => {
       const code = stripComments(readFileSync(file, 'utf8'), false);
       expect(code, file).not.toMatch(forbidden);
       expect(code, file).not.toMatch(/from\s*['"]three/);
-      expect(code, file).not.toMatch(/(?:from\s*|import\s*\()['"](?:@(?:world|render|ui|terminal|legs|app)\b|(?:\.\.\/)+(?:world|render|ui|terminal|legs|app|kernel|game)\/)/);
+      // WP-17 pre-flight ruling 4 (2026-09-15): the audio layer holds exactly
+      // one value import from the world layer, the shared per-frame queue.
+      for (const m of code.matchAll(/(?:from\s*|import\s*\()['"](@world[^'"]*)['"]/g)) {
+        expect(m[1], `${file}: world import`).toBe('@world/FrameEventQueue');
+      }
+      expect(code, file).not.toMatch(/(?:from\s*|import\s*\()['"](?:@(?:render|ui|terminal|legs|app)\b|(?:\.\.\/)+(?:world|render|ui|terminal|legs|app|kernel|game)\/)/);
       for (const m of code.matchAll(/^\s*import\s+([^;]+?)\s+from\s*['"](@kernel[^'"]*|@game[^'"]*|[^'"]*\/(?:kernel|game)\/[^'"]*)['"]/gm)) {
         const clause = m[1] ?? '';
         const spec = m[2] ?? '';

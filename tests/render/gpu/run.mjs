@@ -1,6 +1,6 @@
 import { chromium } from 'playwright';
 import { createServer, build } from 'vite';
-import { resolve } from 'node:path';
+import { resolve, join } from 'node:path';
 import os from 'node:os';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
@@ -13,7 +13,7 @@ const machine = { hostname: os.hostname(), cpu: os.cpus()[0]?.model, platform: o
 console.log('GPU test machine:', JSON.stringify(machine));
 await build({ plugins: [allocationProbe], build: {
   outDir: '/private/tmp/kt-wp12-gpu-build', emptyOutDir: true,
-  rolldownOptions: { input: [resolve('tests/render/gpu/probe.html'),resolve('tests/render/gpu/focus.html'),resolve('tests/render/gpu/derezz.html'),resolve('tests/render/gpu/audio.html')] },
+  rolldownOptions: { input: [resolve('tests/render/gpu/probe.html'),resolve('tests/render/gpu/focus.html'),resolve('tests/render/gpu/derezz.html'),resolve('tests/render/gpu/audio.html'),resolve('tests/render/gpu/hud.html')] },
 } });
 if (process.argv.includes('--build-only')) process.exit(0);
 
@@ -203,6 +203,29 @@ try {
     } finally {
       await audioPage.close();
     }
+  }
+  // WP-17 HUD probe. One page at 1440 by 900, the worst-case fixture mounted
+  // over an empty document, every HUD rect measured, the union over the viewport.
+  {
+    const path = 'wp17-hud';
+    const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+    const diagnostics = capturePageDiagnostics(page);
+    try {
+      console.log(`Starting ${path}`);
+      await navigateAndWaitForProbe(page, `http://127.0.0.1:${address.port}/tests/render/gpu/hud.html`, diagnostics);
+      const result = await page.evaluate(() => globalThis.__kernelTrailProbe.api.run());
+      console.log(`${path}: coverage ${(result.coverage * 100).toFixed(2)}% of 1440x900`, JSON.stringify(result));
+      results.push({ path, result });
+      assert.ok(result.coverage < 0.11, `${path}: coverage ${(result.coverage * 100).toFixed(2)}% exceeds 11%`);
+      await page.screenshot({ path: join(os.tmpdir(), `kt-${path}.png`) });
+      assert.equal(diagnostics.pageErrors.length, 0, 'WP-17 HUD page errors');
+      assert.deepEqual(diagnostics.messages.filter(message => message.startsWith('[console.error]')), []);
+      await page.evaluate(() => globalThis.__kernelTrailProbe.api.dispose());
+    } catch (error) {
+      console.error(`GPU test failed on ${path}:`, error.stack || String(error));
+      console.error(formatPageDiagnostics(diagnostics));
+      failures.push(`${path}: ${error.stack || String(error)}`);
+    } finally { await page.close(); }
   }
   if (environmentDiagnostics.pageErrors.length) {
     failures.push('WebGPU environment page reported an error');

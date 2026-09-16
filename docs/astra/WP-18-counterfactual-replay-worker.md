@@ -574,3 +574,254 @@ State:
    canonicaliser are one implementation rather than three.
 8. Every `// TODO(astra):` left in the tree, with file and line, including the
    fourteen `headlessLegs` stubs.
+
+---
+
+## Scope correction against the shipped tree
+
+Written 2026-09-16, after WP-17 merged (main at `877a2ff`) and before WP-18
+starts. Where this section disagrees with the text above, this section wins.
+Each numbered item is a decision; report against them by number. WP-15 is in
+flight on `wp-15` and owns `src/terminal/` plus `src/game/terminalHost.ts`; do
+not touch either.
+
+### U1. Files you may modify, restated
+
+The two the package lists, plus one:
+
+- `src/ui/cards/DebriefCard.ts` (see U7)
+- `src/game/save.ts` (the `replays` store read and write, see U11)
+- `src/game/CommandBus.ts`, one addition only (see U2)
+
+Nothing else outside the create list. `src/game/replay/types.ts` holds
+`ReplayRequest`, `ReplayOverrides`, `ReplayResult`, `ReplayHighlight`,
+`ReplayResponse` and the envelope types exactly as printed above, with the one
+addition in U5. The file is not frozen by this package; it will be frozen by a
+contract amendment when WP-19 lands, the same way `codexTypes.ts` will be.
+
+### U2. Decisions are recorded one way; add the inverse
+
+`CommandBus.apply(cmd, origin, at)` records then mutates, in that order, and
+that is the code path replay must share. But `DecisionRecord` carries
+`kind: string` and `choice: string`, and `describeChoice` (`CommandBus.ts:90`)
+is one way: nothing turns a record back into a `Command`. Add to
+`CommandBus.ts` one exported pure function
+`commandFromRecord(record: DecisionRecord): Command | null`, the exact inverse
+of `describeChoice` for the kinds replay applies, with a round-trip test over
+every variant in `tests/game/commandBus.test.ts` (that file is WP-17's and is
+protected; the new case is quote-and-wait, ruled approved now, so quote the
+insertion in the commit message and proceed).
+
+Replay applies these kinds: `set_scheduler`, `set_replacement`,
+`set_disk_policy`, `set_allocation`, `set_pace`, `set_rations`, `set_degree`
+and `syscall`. It skips `terminal`, `interaction` and `use_ability`, because
+the first two are audit lines whose effect was recorded as a separate command
+and the third is leg logic that WP-19 owns; `commandFromRecord` returns `null`
+for them and the replay loop counts skips in the result's diagnostics. Mark the
+`use_ability` skip `// TODO(astra): WP-19 replays abilities through the
+RunDirector`.
+
+The replay loop applies each decision by constructing a `CommandBus` over a
+throwaway `createRunStore(initialRun)` and calling `bus.apply(cmd, { source:
+'replay', legId }, tick)`. That satisfies "the same code path" literally, and
+the `decision path shared` case spies on `CommandBus.prototype.apply`.
+
+### U3. Pace, rations and degree do not reach the kernel through the bus
+
+`CommandBus` cases `set_pace`, `set_rations` and `set_degree` mutate
+`RunState.policy` only (`CommandBus.ts:183-197`). The kernel effect of those
+three is WP-19's `LegRunner` mapping, which does not exist yet, and
+`KernelConfig` has no degree field; `KernelImpl.setDegreeOfMultiprogramming`
+is the only kernel-side hook. Define in `src/game/replay/types.ts`:
+
+```ts
+export interface PolicyBinding {
+  /** Called after every policy change and once after populate. */
+  apply(kernel: ReplayKernel, policy: Readonly<TravelPolicy>): void;
+}
+```
+
+with `ReplayKernel = ReturnType<typeof createKernel>`. `runReplay` takes a
+binding; the default binding calls `kernel.setDegreeOfMultiprogramming(policy.
+degreeOfMultiprogramming)` and does nothing for pace and rations, marked
+`// TODO(astra): WP-19 supplies the pace and rations binding and replay must
+use the same one`. The `overrides` cases for `pace` and `rations` assert the
+override reaches the binding; the `degreeOfMultiprogramming` case asserts the
+kernel's degree changed. Architecture 8.7's thrashing row is therefore a
+`degreeOfMultiprogramming` override on the policy, applied through the binding,
+not a kernel config change.
+
+### U4. Random events belong to WP-19; give them a hook
+
+`RandomEventDef.onlyIf` is a function and cannot cross a worker boundary, and
+the draw logic that fires events from `Leg.eventTable` is `RunDirector`, which
+WP-19 writes. The replay loop exposes one per-tick hook,
+`ReplayHooks.beforeStep(tick, kernel, rng)`, where WP-19 plugs the director's
+headless half; the worker resolves it from `headlessLegs.ts` by leg id, never
+from the request. This package's synthetic leg has an empty `eventTable` and
+the tests prove purity for decisions and policy only. State in the report that
+random-event purity is WP-19's obligation through this hook.
+
+### U5. Metrics: what the kernel gives you and what it does not
+
+`KernelSnapshot.metrics` carries exactly `scheduling` and `memory`, and both
+have every field `ReplayResult` needs (`averageWaitingTime`,
+`averageTurnaroundTime`, `averageResponseTime`, `contextSwitches`,
+`cpuUtilisation`, `worstWait`; `pageFaults`, `evictions`, `faultRate`). There
+is no seek metric in the snapshot; head movement is on the `disk.seek` event
+(`distance` field) and on `KernelImpl.storageSubsystem.diskQueue.
+totalHeadMovement`. Add to `ReplayResult` one field,
+`readonly storage: { readonly seekDistance: number }`, summed from
+`disk.seek` events in the replay log so it is derivable from the event log
+alone. The planner's "high seek distance" row reads it.
+
+`casualties[].reason` and `.tick` come from `process.exited` events
+(`reason: TerminationReason`), and `.member` comes from the `bind(member, pid)`
+calls the leg makes in `populate`; the headless `LegSetupContext` records
+those bindings. `LegOutcome.casualties` is bare member ids and is not enough.
+
+### U6. One hash implementation
+
+`src` cannot import `tests/kernel/canonical.ts`, and its `hash` is 32-bit.
+`hashEventLog` imports `canonicalise` and `fnv1a64` from `@game/save` and says
+so in a comment. `canonicalise` throws on `Map` and `Set`, and some event
+payloads may carry them (check `deadlock.detected`'s `DeadlockReport` and
+`memory.thrashing`); flatten with the same rule `checksumSafeSnapshot` uses
+before hashing, in one helper shared by the two. Acceptance 12 is restated:
+`hashEventLog` and `checksumOf` share one canonicaliser and one FNV-1a 64, and
+the `hash shared` case asserts `canonicalise` and the test canonicaliser agree
+byte for byte on a Map-free event fixture; the two hash widths differ by
+design and the case says so.
+
+### U7. The debrief card renders once and has no computing state
+
+`createDebriefCard(doc, card)` (`src/ui/cards/DebriefCard.ts:10`) renders a
+frozen `DebriefCard` once; the counterfactual paragraph appears only when
+`card.counterfactual` is a string. Extend the signature to
+`createDebriefCard(doc, card, pending?: Promise<string | null>)`: when
+`pending` is supplied, render the slot in a computing state; on resolution
+with a string, fill it and add the `kt-counterfactual` class the existing code
+uses; on `null` or rejection, remove the slot. Do not touch the frozen
+`DebriefCard` type. The `debrief non-blocking` and `computing state` cases run
+under `// @vitest-environment happy-dom` like WP-17's card tests, and the
+existing `tests/ui/cards.test.ts` must still pass unchanged.
+
+The codex side already exists: `Codex.setCounterfactual(id, cf)`
+(`src/ui/codex/Codex.ts:152`) takes `CodexCounterfactual`, whose `projected` is
+a flat `Record<string, number>`. Ship `toCodexCounterfactual(result,
+alternative, decisionIndex, replaySeed, narrative)` in `phrasing.ts` that
+flattens `scheduling.*`, `memory.*` and `storage.*` into dotted keys.
+
+### U8. Workers cannot run under vitest; make the handle testable and the worker real in the browser
+
+Node's test environment has no `Worker` global and happy-dom does not execute
+worker scripts. Two consequences:
+
+1. `ReplayWorkerHandle`, `PersistWorkerHandle` and `BakeWorkerHandle` take an
+   injectable `WorkerFactory = () => WorkerLike` where `WorkerLike` is
+   `{ postMessage; onmessage; onerror; terminate }`. The default factory is
+   the verbatim `new Worker(new URL('./replay.worker.ts', import.meta.url),
+   { type: 'module' })` form, and the `new URL form` case is a source scan for
+   that string. Tests inject an in-process fake that runs `runReplay` on
+   `postMessage` and can be told to throw, hang or delay, which is how the
+   `single instance`, `crash respawn`, `timeout` and `cancel` cases run.
+2. The real worker path is exercised in the browser runner:
+   `tests/render/gpu/replay.html` and `replay.gpu.ts` spawn the built replay,
+   persist and bake workers, run one synthetic-leg replay, one checksum, and
+   one bake, and assert the bake's source buffer is detached after transfer
+   (acceptance 26) and the persist checksum equals the main-thread value
+   (acceptance 27). Register it in `tests/render/gpu/run.mjs` the way the HUD
+   block is registered: `replay.html` in the rolldown input list and one block
+   after the HUD block. Kyle runs it and pastes the output; that run is the
+   evidence for 26 and 27. The Node cases for 26 and 27 assert the transfer
+   list is built and the pure checksum agrees.
+
+### U9. What the bake worker actually bakes
+
+No procedural texture generator exists in `src/render` as a pure module (the
+post chain builds its noise on the GPU). Do not write one. The bake worker
+carries two jobs that already have pure, worker-safe implementations:
+`audio_buffers`, calling `generateBuffers(seed, sampleRate?)` from
+`@audio/buffers` and returning the set with `transferList(set)` (WP-16 shipped
+both for exactly this purpose; `isAudioBufferSet` validates the reply on the
+main thread), and `codex_index`, calling `buildIndex(entries)` from
+`@ui/codex/search`. Texture baking is a follow-up for the render track and
+gets a `// TODO(astra): render track supplies pure bakers` marker in the job
+union, not a stub that throws.
+
+### U10. Worker boundary case, transitive
+
+No "worker entry points" case exists anywhere, whatever architecture 9.4
+claims. Write it in `tests/game/workerProtocol.test.ts`: for each
+`src/game/workers/*.worker.ts`, walk the import graph transitively over
+relative and alias imports within `src` (using `stripComments` from
+`tests/kernel/sourceScan.ts`) and assert no module in the closure imports
+`three`, `@world`, `@render`, `@ui` (except `@ui/codex/search` for the bake
+worker), `@app`, `@platform` or `@terminal`, and that `@audio` appears only as
+`@audio/buffers`. `document`, `window` and `localStorage` must not appear in
+the closure either; `indexedDB` may appear in `save.ts` because it is
+referenced at call time only, and the case asserts `Database` is never
+constructed in a worker.
+
+### U11. `ReplayRecord` is declared and never written
+
+`save.ts` declares `ReplayRecord` and creates the `replays` store, and nothing
+reads or writes it. Add `writeReplayRecord(db, record)` and
+`readReplayRecord(db, runId)` to `save.ts`, and in `replay/verify.ts` the
+builder side: `startReplayRecord(run, buildId)`, `recordLegEntry(record,
+rngStates)` and `recordLegHash(record, hash)`, all pure. WP-19's `LegRunner`
+calls them at leg start and leg end; this package tests them with the
+synthetic leg. `verifySave`'s deep check reads the record through the new
+reader. `LoadService.ts:46-50` returns `unreadable` for a migrated file that
+needs re-signing; add `resignSaveFile(file, salt?)` to `verify.ts` and leave
+the wiring into `loadOutcome` as a follow-up named in the report.
+
+### U12. Seed and configuration
+
+The seed is `KernelConfig.seed`, not a `createKernel` option. A replay builds
+`Leg.kernelConfig(run)` from a `RunState` reconstructed from the request
+(`seed`, `discClass`, `difficulty`, empty decisions, default policy) and
+overrides `seed` with the request's. The `deadlockStrategy` row substitutes
+`{ ...config, deadlockStrategy: 'avoid' }` in the headless factory as the
+package describes; `KernelImpl.setDeadlockStrategy` also exists if a mid-leg
+switch is ever wanted, but the config substitution is the mechanism to
+document. `allProgramsScripted()` is on `KernelImpl` (`Kernel.ts:566`), not on
+the `Kernel` interface; the planner receives the replay kernel type.
+
+### U13. The synthetic leg and `LEG_LOADERS`
+
+`src/legs/registry.ts` maps ids to `import('@legs/<id>')` thunks with an
+800 ms `setTimeout` retry; the worker must not use it. `headlessLegs.ts` is a
+separate `Record<LegId, () => HeadlessLeg>` with the fourteen throwing stubs
+and a `registerHeadlessLeg(id, factory)` for legs and tests. The synthetic leg
+lives in `tests/game/fixtures/syntheticLeg.ts` and implements the full `Leg`
+interface with `createStage` returning a stage whose `update` is a no-op, so
+the `headless equals staged` case can run both paths. Report its shape.
+
+### U14. Throughput and timeout
+
+Measure microseconds per tick on the synthetic leg in Node and report it; the
+container the reviewer verifies in is about 3.4 times slower than the M3, so
+the `throughput` case asserts the 8,000-tick leg under 400 ms only when
+`process.env.CI` is unset, and otherwise under 1,400 ms, with both numbers
+printed. The 1,500 ms handle timeout stays as specified.
+
+### U15. Style rules for phrasing
+
+The forbidden-term list is `forbiddenTerms` in `contracts.lock.json`; the
+`no forbidden words` case reads that file rather than a copy. The em dash
+rule is enforced by the contract check across the tree and the case asserts it
+on the rendered sentences as well. The imperative scan uses the same twelve
+patterns WP-15's `no remedies` case uses; take them from
+`tests/terminal/man.test.ts` once wp-15 lands, or define them locally and note
+the duplication if wp-15 has not merged when you reach that commit.
+
+### U16. Pre-flight before writing
+
+Read this section, then send a pre-flight listing: the `commandFromRecord`
+signature and the round-trip case (U2); the `PolicyBinding` and `ReplayHooks`
+declarations (U3, U4); the amended `ReplayResult` (U5); the `WorkerLike` and
+factory declarations (U8); the `run.mjs` diff (U8); the bake job union (U9);
+the synthetic leg's shape (U13); and any finding needing a ruling, numbered.
+Wait for the reply before the first commit. Every commit passes all four gates
+on its own and ends with both attribution lines.

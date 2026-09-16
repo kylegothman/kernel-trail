@@ -14,8 +14,6 @@ export { LAYER_IDS, LAYERS } from './score/layers';
 export type { LayerId, LayerTargets } from './score/layers';
 export { LoadModel, nextFaultAccumulator } from './score/loadModel';
 export type { LoadThresholds } from './score/loadModel';
-export { FrameEventQueue, COALESCE } from './events/FrameEventQueue';
-export type { FrameAggregates } from './events/FrameEventQueue';
 export { CENTRED_POSITION_SOURCE } from './events/PositionSource';
 export type { PositionSource } from './events/PositionSource';
 export { EVENT_TREATMENT } from './events/eventSounds';

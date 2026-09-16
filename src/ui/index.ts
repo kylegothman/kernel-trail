@@ -1,0 +1,41 @@
+/**
+ * The UI layer barrel. Cross-layer imports come through here.
+ */
+export { DomBatch } from './DomBatch';
+export { SILENT_SOUNDS } from './sounds';
+export type { UiSounds } from './sounds';
+export { Hud, createHud, HUD_CELL_CLASS } from './hud/Hud';
+export type { HudOptions, HudVisibility } from './hud/Hud';
+export * from './hud/layout';
+export { contrastRatio, compositeOver, relativeLuminance } from './hud/contrast';
+export { HUD_CSS, buildHudCss, HUD_TEXT_TOKENS, ALERT_STYLE } from './hud/hud.css';
+export { HUD_STRUCTURE_NAMES, HUD_KERNEL_NAME } from './hud/structures';
+export type { HudStructureName, AlertStructure } from './hud/structures';
+export { deriveAlert, composeAlert, AlertModel } from './hud/regions/AlertStack';
+export type { HudAlert, AlertSeverity, AlertStackProps } from './hud/regions/AlertStack';
+export type { LegRailProps } from './hud/regions/LegRail';
+export type { PolicyChipsProps } from './hud/regions/PolicyChips';
+export type { MetersProps } from './hud/regions/Meters';
+export type { ConvoyPipsProps, ConvoyPipProps } from './hud/regions/ConvoyPips';
+export { AFFLICTION_GLYPH } from './hud/regions/ConvoyPips';
+export type { ResourceLedgerProps } from './hud/regions/ResourceLedgerView';
+export type { FocusHintProps } from './hud/regions/FocusHint';
+export { Codex, createCodex } from './codex/Codex';
+export type { CodexOptions, CodexOpenResult, CodexListItem, OnScreen, UnlockListener } from './codex/Codex';
+export { CodexRegistry, createCodexRegistry } from './codex/entries';
+export { matchesUnlock, structureFor, structureForEventType } from './codex/triggers';
+export type { CodexSignal } from './codex/triggers';
+export { buildWorkedExample, renderEventLine, summarise, WORKED_EXAMPLE_MAX_LINES } from './codex/workedExample';
+export type { WorkedExampleInput } from './codex/workedExample';
+export { buildIndex, search, tokenise } from './codex/search';
+export type { CodexSearchIndex } from './codex/search';
+export { CARD_CSS, buildCardCss } from './cards/cards.css';
+export { citation } from './cards/card';
+export type { Card } from './cards/card';
+export { createDebriefCard } from './cards/DebriefCard';
+export { createTombstoneCard } from './cards/TombstoneCard';
+export type { TombstoneCardOptions } from './cards/TombstoneCard';
+export { createPanicCard } from './cards/PanicCard';
+export type { PanicCardOptions } from './cards/PanicCard';
+export { createLegUnavailableCard } from './cards/LegUnavailableCard';
+export type { LegUnavailableOptions } from './cards/LegUnavailableCard';
