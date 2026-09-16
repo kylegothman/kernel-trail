@@ -31,6 +31,8 @@ export const LEG_DEFERRED_COMMANDS = ['hyper', 'guest', 'migrate', 'belady'] as 
 
 export interface LegContent {
   readonly legId: LegId;
+  /** Positive designed throughput target; omitted until the balance pass authors it. */
+  readonly throughputTarget?: number;
   /** Declared through the runner at entry; formulas are WP-19's. */
   readonly crossings: readonly CrossingDef[];
   /** Keyed by InteractionDef.id; the target names the Program an integrity cost lands on. */
@@ -113,6 +115,9 @@ const list = (items: readonly string[]): string => `[${items.join(', ')}]`;
 export function validateContent(leg: Leg, content: LegContent): readonly string[] {
   const problems: string[] = [];
   if (content.legId !== leg.id) problems.push(`legId: the content is for ${content.legId}, the leg is ${leg.id}`);
+  if (content.throughputTarget !== undefined && (!Number.isFinite(content.throughputTarget) || content.throughputTarget <= 0)) {
+    problems.push('throughputTarget: expected a positive finite number');
+  }
 
   const declared = recordDeclarations(leg);
   if (declared.error !== null) problems.push(`populate threw against the recording context: ${declared.error}`);
