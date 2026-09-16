@@ -979,3 +979,227 @@ document containing a table of numeric test vectors, sends each through compress
 and then expand, and asserts both come back byte identical. If either round trip
 is lossy, the layer stays in shadow mode and is not used. Add this canary to the
 acceptance criteria above.
+
+---
+
+## Scope correction against the shipped tree
+
+Written 2026-09-16, after WP-19 merged (main at `8accbcc`) and before WP-20
+starts. Where this section disagrees with the text above, including the
+amendment, this section wins. Each numbered item is a decision; report against
+them by number. Nothing else is in flight.
+
+### W1. The runner has no pump, no panic list and no event getter; the harness owns all three
+
+`LegRunner` exposes `enter`, `preTick(at)`, `postTick(at, events)`,
+`observeCommands(outcomes)`, `exit()`, the modal verbs (`registerCrossings`,
+`openCrossing`, `resolveCrossing`, `openDepot`, `openReclamation`,
+`submitReclamation`, `continueTravel`, `registerInteraction`),
+`saveProvisional()`, `rollbackCheckpoint()`, `resume(file, legs, opts)`, and
+the getters `kernel`, `director`, `currentLeg`, `phase`, `ticksElapsed`,
+`finished`, `recruits`, `replayRecord`, `replayEntry`, plus
+`onKernelChanged(listener)`. There is no `step()`. The harness pump is the
+one `tests/game/legRunner.test.ts` uses, verbatim in shape:
+
+```ts
+const kernel = runner.kernel!;
+fireDueSteps(kernel.tick);                        // script steps for this tick, through bus.dispatch
+runner.observeCommands(bus.drain(kernel.tick));
+runner.preTick(kernel.tick);
+if (runner.director!.tickLimitReached) break;
+const events = kernel.step();
+runner.postTick(kernel.tick, events);
+evaluateTriggers(events);                         // `when` steps arm here, fire before the next drain
+```
+
+`kernel.panic` does not stop the runner; it arrives as
+`{ kind: 'panic' }` on `deps.onLegEvent`. The harness collects those into
+`panics` and stops the pump on the first one. Sandbox failures arrive on
+`deps.onFailure` and runner failures (the `maxTicks` cap, resume errors) on
+`deps.onRunnerFailure`; keep the two lists separate in `HarnessResult`
+(`legFailures` and `runnerFailures`), never one callback for both.
+
+The event log is not on the runner. Tap it the way `createRunHost` does:
+`runner.onKernelChanged(k => k?.events.onAny(e => log.push(e)))`, deduplicated
+by `seq`. Do not read `director.allEvents` after `exit()`; it is cleared on
+the next `enter`.
+
+### W2. Hashing uses the game's one implementation, not the kernel test helper
+
+`tests/kernel/canonical.ts` exports `canonical`, a 32-bit `hash` and
+`strip`; it has no `fnv1a64`. `logHash` is `hashEventLog(events)` from
+`@game/replay/hash` (64-bit FNV-1a over `canonicalise(withoutMapsAndSets(
+events))`), so a harness hash equals a replay hash for the same log by
+construction. `journeyHash` is `fnv1a64(legHashes.join('') + canonicalise(
+finalRun))` with both functions from `@game/save`. The kernel helper is not
+used anywhere in this package.
+
+### W3. Golden storage follows the amendment; the five scripts are restated
+
+Per leg, per path, two committed files under `tests/golden/legs/`:
+`<leg_id>.<path>.fingerprint.txt` (one line: seed, ticks, event count, hash)
+and `<leg_id>.<path>.summary.txt` (per event type in sorted order: count,
+first tick, last tick). No full event log is committed. The five
+`package.json` scripts are:
+
+```json
+"test:legs":      "vitest run tests/legs",
+"test:goldens":   "vitest run tests/legs/goldens.test.ts",
+"test:journey":   "vitest run tests/legs/journey.test.ts",
+"golden:record":  "tsx tools/golden/record.ts",
+"golden:explain": "tsx tools/golden/explain.ts"
+```
+
+`golden:explain <legId> <path>` replaces `golden:diff`: it reruns the fixture,
+compares tiers 1 and 2, and on a mismatch materialises both logs, finds the
+first diverging event by `seq`, prints that event plus 50 events of context on
+each side and the tick and seq, and exits non-zero. `golden:record` writes
+tiers 1 and 2, refuses to overwrite without `--force`, and prints old and new
+hashes when forced. `golden:update` is not a separate script; it is
+`golden:record --force`. `UPDATE_GOLDEN` has no effect, asserted.
+`tools/golden/renderEventLog.ts` remains the tier 3 renderer.
+
+### W4. `tsx` is not installed; it is granted
+
+Neither `tsx` nor any TypeScript runner is in `package.json`, and the `@game`
+aliases rule out `node --experimental-strip-types`. Add `tsx` as an exact
+pinned dev dependency (quote the version in the pre-flight); it is the one
+dependency this package may add. `vitest.config.ts` needs no change:
+`include` already matches `tests/**/*.test.ts` and coverage already includes
+`src/game/**`. Do not edit it.
+
+### W5. Field order for the rendered log has no runtime source
+
+The kernel event union is type-only; nothing at runtime lists event types or
+their fields, and `canonicalise` sorts keys. `renderEventLog` prints `tick`,
+`seq`, `type`, then the remaining fields in sorted key order, values through
+`canonicalise` for nested objects. That is stable, locale-free and
+deterministic; it is not "the frozen union's declared field order", and the
+report says so. No table is added to the frozen types.
+
+### W6. Loading goes through the registry's map, not through `loadLeg`
+
+`src/legs/registry.ts` exports `LEG_LOADERS` and `loadLeg`; `loadLeg` sleeps
+800 ms of real time before its retry, which is 11 s per suite over fourteen
+missing legs. `loadLegForTest` calls `LEG_LOADERS[id]()` directly, once, and
+treats a rejected import as unshipped. That satisfies "goes through
+`src/legs/registry.ts`" without the retry. The forbidden-import check
+(acceptance 6) is a source scan of `src/legs/<id>/index.ts` before the import,
+using `stripComments` from `tests/kernel/sourceScan.ts`, because `three`
+imports fine under Node and would not fail at load on its own. No leg module
+exists today, so every real-leg case in this package skips; the synthetic legs
+in W8 are what the harness's own suite runs.
+
+### W7. Actions are the runner's verbs; records are what the goldens hash
+
+Script steps map as follows. `command` steps go through
+`bus.dispatch(command, { source: 'replay', legId })` before the drain.
+`crossing` steps call `runner.openCrossing(def)` then
+`runner.resolveCrossing(def, option)` with the def from the script's own
+`crossings` list (legs declare crossings through `runner.registerCrossings`;
+the harness registers the script's list at entry). `depot` steps call
+`runner.openDepot().buy(item, target)` then `runner.continueTravel()`.
+`reclamation` steps call `runner.openReclamation()`,
+`runner.submitReclamation(trace)`, `runner.continueTravel()`. Every one of
+those writes its own `DecisionRecord` (`crossing_open`, `crossing`,
+`depot_open`, `depot`, `reclamation_open`, `reclamation`, `travel_resume`),
+and `RunDirector.dispatch(record)` re-executes them on resume and in replay,
+so a scripted run is replayable without the script. The `replay origin` case
+asserts every command record carries `source: 'replay'` through
+`originFromRecord`, and that no action record needs the script to replay.
+
+### W8. Synthetic legs: the shipped fixture is the base, and it needs a composite
+
+`tests/game/fixtures/syntheticLeg.ts` ships `createSyntheticLeg(options)`
+with one mutex (`vault`), one resource, an empty event table (which
+`validateTable` rejects: the sum must be 100), no interactions and a no-op
+stage. Build `tests/legs/harness/syntheticLeg.ts` on top of it: an event
+table of four entries summing to 100, three `InteractionDef`s whose anchors
+the synthetic stage resolves, a crossing def on `vault`, an id in
+`DEPOT_LEGS` (`fork_fields`) so the depot opens, two objectives the known-good
+script meets, and known-good and known-bad scripts. A second variant that
+imports `three` at module scope lives under `tests/legs/harness/forbidden/`
+for the load check. Tests may import from `tests/game/fixtures/`.
+
+### W9. Hand-off records are leg data and must survive resume
+
+The five hand-offs are `DecisionRecord`s with kinds `ring_closed`,
+`executable_bit`, `device_attach`, `crash_outcome`, `manifest_integrity`,
+`escalation_outcome` and `privilege_excess`, written by legs, and
+`RunDirector.dispatch` returns false for them, which makes
+`LegRunner.resume` throw `Resume cannot dispatch <kind>` at line 453. That
+breaks the journey's `restoreAtBoundaries` case the moment a leg writes one.
+Granted edit to `src/game/LegRunner.ts`, quoted in the pre-flight: in
+`resume`, a record that `commandFromRecord` returns null for and `dispatch`
+returns false for is pushed back onto `run.decisions` verbatim instead of
+throwing, since it is data rather than an action. Add a case to
+`tests/game/legRunner.test.ts` (protected; quote-and-wait, ruled approved now)
+with a synthetic leg that writes a `ring_closed` record and resumes through
+it. `HandoffObservation` in the journey reads those records by kind.
+
+### W10. Journey mechanics against the shipped runner
+
+`runJourney` uses one `RunStore` and one `LegRunner` for all legs, calling
+`enter(leg, opts)` per leg in `LEG_ORDER`; `prepareLegEntry` runs inside
+`enter`. Boundary saves are captured through `deps.persist` (the harness's
+spy keeps the last `SaveFileInput` and builds a `SaveFile` with
+`buildSaveFile`); `restoreAtBoundaries` calls `runner.resume(file, legs,
+opts)` at each boundary on a fresh runner over a fresh store and continues.
+Assertion 4 (replay through WP-18) calls `runReplay({ seed, discClass,
+difficulty, legs: prefix, decisions: finalRun.decisions, overrides: {
+suppressRecordedPolicyChanges: false }, maxTicks })` directly, with the
+synthetic legs registered through `registerHeadlessLeg` by the harness at
+entry, and compares per-leg hashes and the final run. The worker path is not
+used; it cannot see harness-registered legs (WP-19 ruling R5).
+
+### W11. Budgets and the container
+
+The reviewer verifies in a two-core container about 3.4 times slower than
+the M3. `maxTickMs` under 2 ms and `wallMs` under 1000 ms hold locally;
+under `process.env.CI` the bounds are 7 ms and 3500 ms, both printed. The
+journey's 60 s becomes 200 s under `CI`, with its own `it` timeout of
+`300_000` in the sweep test's pattern (dynamic name, `performance.now`
+bracket, header comment with the measured ladder).
+
+### W12. The stand-in policies
+
+`passive` dispatches nothing. `competent` reads `AFFLICTION_TABLE` remedies
+and issues the matching command when a bound Program acquires an affliction
+(`set_scheduler` and the like through the bus; `terminal`, `spend` and
+`ability` remedies are not issuable headlessly and are logged as skipped),
+lowers the degree by one on `memory.thrashing` and never above the kernel
+ceiling, and at a crossing picks the cheapest of the options whose `successP`
+is at least 0.9 by `cyclesCost + quotaCost / 2`, or the highest `successP` if
+none qualifies. `chaotic` rotates the four policy dials every 40 ticks from a
+`createRng(seed, 'chaotic')` stream. The `competent is generic` scan asserts
+the module imports nothing from `tests/legs/<leg_id>/`.
+
+### W13. The anchor test and `createStage` under Node
+
+Real legs' `createStage` will build over `StageBuilder`, which needs a
+`three` scene and WP-13's structure factories, several of which still throw.
+The case runs as specified for shipped legs and for the synthetic leg (whose
+stage resolves anchors without `three`); a real leg whose stage cannot be
+built under Node is a failure of that leg's integration, reported with the
+thrown message, not a harness skip. Say in the report that no real leg
+exists to exercise it yet.
+
+### W14. Out of scope, restated
+
+`tests/toolchain/headroom.canary.test.ts` is not written here: the
+compression layer it guards does not exist in the repository (only
+`tools/headroom/policy.json` does), and a canary for an absent layer tests
+nothing. Note the pending reference in `policy.json` under follow-ups.
+`docs/06-AGENT-TOOLCHAIN.md` is not modified. `NULL_STAGE` is not exported
+and is not needed; the harness never calls `createStage` in the run loop.
+
+### W15. Pre-flight before writing
+
+Read this section, then send a pre-flight listing: the `tsx` version (W4);
+the W9 diff and its test case; the `HarnessResult` and `HarnessOptions`
+declarations as you will write them; the `LegFixture` shape; the
+fingerprint and summary file formats with one example each; the composite
+synthetic leg's shape (W8); the `competent` policy's decision rules (W12);
+and any finding needing a ruling, numbered. Wait for the reply before the
+first commit. Every commit passes all four gates on its own and ends with
+both attribution lines.
