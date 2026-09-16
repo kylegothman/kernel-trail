@@ -261,21 +261,42 @@ function withConfigPatch(leg: HeadlessLeg, patch: ReplayRequest['configPatch']):
   return leg.hooks === undefined ? patched : { ...patched, hooks: leg.hooks };
 }
 
-const failure = (reason: 'aborted' | 'error', message: string): ReplayResponse => ({ ok: false, reason, message });
+export const failure = (reason: 'aborted' | 'error', message: string): ReplayResponse => ({ ok: false, reason, message });
 
 function cloneRun(run: RunState): RunState {
   return structuredClone(run);
 }
 
+/**
+ * The synchronous form: drains `replaySteps`, posting progress at every
+ * yield and honouring `isCancelled` there, so a cancel lands within 500
+ * ticks. A thrown leg or kernel error becomes an error response.
+ */
 export function runReplay(request: ReplayRequest, options: ReplayOptions = {}): ReplayResponse {
   try {
-    return replay(request, options);
+    const steps = replaySteps(request, options);
+    for (;;) {
+      const next = steps.next();
+      if (next.done) return next.value;
+      options.onProgress?.(next.value);
+      if (options.isCancelled?.() === true) {
+        steps.return(failure('aborted', 'cancelled'));
+        return failure('aborted', `Replay cancelled at tick ${next.value}.`);
+      }
+    }
   } catch (error) {
     return failure('error', error instanceof Error ? error.message : String(error));
   }
 }
 
-function replay(request: ReplayRequest, options: ReplayOptions): ReplayResponse {
+/**
+ * The loop as a generator that yields the tick count every 500 ticks. The
+ * worker pumps it one chunk per macrotask, which is what lets a cancel
+ * message land while a replay is in flight: a worker handles one message at
+ * a time, so a synchronous loop could never see one. `runReplay` drains it
+ * in place for callers on either thread.
+ */
+export function* replaySteps(request: ReplayRequest, options: ReplayOptions = {}): Generator<number, ReplayResponse, void> {
   const resolve = options.legs ?? resolveHeadlessLeg;
   const binding = options.binding ?? DEFAULT_POLICY_BINDING;
   const kernelOptions = options.kernelOptions ?? REPLAY_KERNEL_OPTIONS;
@@ -353,10 +374,7 @@ function replay(request: ReplayRequest, options: ReplayOptions): ReplayResponse 
       hooks.afterStep?.(kernel.tick, kernel, events, store);
       totalTicks += 1;
       legTicks += 1;
-      if (totalTicks % PROGRESS_INTERVAL === 0) {
-        options.onProgress?.(totalTicks);
-        if (options.isCancelled?.() === true) return failure('aborted', `Replay cancelled at tick ${totalTicks}.`);
-      }
+      if (totalTicks % PROGRESS_INTERVAL === 0) yield totalTicks;
     }
     const snapshot = kernel.snapshot();
     const outcome = leg.evaluate({ run: store.get(), kernelSnapshot: snapshot, events: legLog, ticksElapsed: legTicks });

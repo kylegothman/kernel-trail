@@ -391,25 +391,33 @@ describe('runReplay', () => {
   });
 
   it('throughput: microseconds per tick on an 8,000-tick busy leg, both workload classes measured', () => {
-    // The kernel's memory and vm path is the cost (about 60 to 80 us per tick on
-    // an M3 with every subsystem on, 13 with process and scheduler only), and the
-    // loop adds nothing measurable. Both are printed; the budget is asserted on
-    // the scheduling leg, and the full-subsystem number is a kernel-track finding.
+    // The kernel's memory and vm path is the cost (about 79 us per tick alone on an
+    // M3 with every subsystem on, 13 with process, scheduler, sync and deadlock),
+    // and the loop adds nothing measurable. Both are printed; the budget is
+    // asserted on the scheduling leg, best of five rounds, because the full
+    // parallel suite loads the machine four to five times over (62 us per tick
+    // measured for the same leg under load), the same tolerance the AC22 cost
+    // gate takes. The full-subsystem number is a kernel-track finding.
     const budget = process.env['CI'] === undefined ? 400 : 1400;
-    const measure = (label: string, config: SyntheticLegOptions['config']): number => {
+    const label = process.env['CI'] === undefined ? 'local' : 'CI';
+    const measure = (name: string, config: SyntheticLegOptions['config'], rounds: number): number => {
       withSynthetic({ processes: 10, service: [700, 900], hooks: { isComplete: (at) => at >= 8000 }, ...(config === undefined ? {} : { config }) });
       const request = requestFor(23, initialRunState(23, 'shell', 'operator'), {}, { maxTicks: 10_000 });
-      okResult(runReplay(request));
-      const t0 = performance.now();
-      const result = okResult(runReplay(request));
-      const ms = performance.now() - t0;
-      expect(result.ticks).toBe(8000);
-      console.log(`replay throughput (${label}): ${result.ticks} ticks in ${ms.toFixed(1)} ms, ${((ms * 1000) / result.ticks).toFixed(1)} us per tick, budget ${budget} ms (${process.env['CI'] === undefined ? 'local' : 'CI'})`);
+      let best = Number.POSITIVE_INFINITY;
+      for (let round = 0; round < rounds; round++) {
+        const t0 = performance.now();
+        const result = okResult(runReplay(request));
+        const ms = performance.now() - t0;
+        expect(result.ticks).toBe(8000);
+        console.log(`replay throughput (${name}, round ${round + 1}): 8000 ticks in ${ms.toFixed(1)} ms, ${((ms * 1000) / 8000).toFixed(1)} us per tick`);
+        best = Math.min(best, ms);
+      }
+      console.log(`replay throughput (${name}): best ${best.toFixed(1)} ms, ${((best * 1000) / 8000).toFixed(1)} us per tick, budget ${budget} ms (${label})`);
       undos.pop()?.();
-      return ms;
+      return best;
     };
-    measure('every subsystem, 15 processes', undefined);
-    const scheduling = measure('process, scheduler, sync and deadlock, 15 processes', { enabledSubsystems: ['process', 'scheduler', 'sync', 'deadlock'] });
+    measure('every subsystem, 15 processes', undefined, 1);
+    const scheduling = measure('process, scheduler, sync and deadlock, 15 processes', { enabledSubsystems: ['process', 'scheduler', 'sync', 'deadlock'] }, 5);
     expect(scheduling).toBeLessThan(budget);
   });
 
