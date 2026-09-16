@@ -57,6 +57,7 @@ function liveRun(seed: number, script: readonly ScriptedDecision[], opts: LiveOp
   const stage = leg.createStage({ quality: opts.quality ?? 'high', run: store.get() });
   const bus = new CommandBus({ store, kernel, handlers: { useAbility: () => undefined, interaction: () => undefined, terminal: () => undefined } });
   const log: KernelEvent[] = [];
+  const unsubscribe = kernel.events.onAny((event) => log.push(event));
   const perFrame = opts.ticksPerFrame ?? 1;
   let ticks = 0;
   let frames = 0;
@@ -70,12 +71,12 @@ function liveRun(seed: number, script: readonly ScriptedDecision[], opts: LiveOp
       const outcomes = bus.drain(at);
       if (outcomes.some((outcome) => POLICY_KINDS.has(outcome.command.kind))) DEFAULT_POLICY_BINDING.apply(kernel, store.get().policy);
       const events = [...kernel.step()];
-      log.push(...events);
       noteExits(store, bindings, events);
       ticks += 1;
     }
     stage.update(perFrame / 20, 0.5);
   }
+  unsubscribe();
   const snapshot = kernel.snapshot();
   applyLegOutcome(store, leg.evaluate({ run: store.get(), kernelSnapshot: snapshot, events: log, ticksElapsed: ticks }), leg.index);
   stage.dispose();
@@ -265,8 +266,8 @@ describe('runReplay', () => {
           original.call(this, target);
         });
       });
-      // Populate at the run's default, then the start-of-leg application and the tick 50 batch at the override; the recorded 4 never reaches the kernel.
-      expect(targets).toEqual([6, 3, 3]);
+      // R4 resolves the override before populate; unchanged later batches are no-ops.
+      expect(targets).toEqual([3]);
       expect(policies.at(-1)?.degreeOfMultiprogramming).toBe(3);
     });
 

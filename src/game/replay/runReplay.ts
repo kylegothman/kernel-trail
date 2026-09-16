@@ -14,11 +14,13 @@
 
 import { createKernel } from '@kernel/Kernel';
 import type { ConvoyMemberId, KernelConfig, KernelEvent, KernelSnapshot, Pid, SchedulerId } from '@kernel/types';
-import { LEG_ORDER, type ConvoyMember, type DifficultyTier, type DiscClass, type LegId, type LegOutcome, type RunState } from '@game/types';
-import { CommandBus, commandFromRecord, type Command, type CommandHandlers } from '@game/CommandBus';
+import { LEG_ORDER, type ConvoyMember, type DecisionRecord, type DifficultyTier, type DiscClass, type Epitaph, type LegId, type LegOutcome, type RunState } from '@game/types';
+import { CommandBus, commandFromRecord, originFromRecord, type Command, type CommandHandlers, type CommandOrigin } from '@game/CommandBus';
 import { createRunStore } from '@game/runStore';
 import type { Store } from '@game/store';
-import { classMultiplierFor, scoreFromRun } from '@game/scoring';
+import { classMultiplierFor, scoreFromRun, SCORE_WEIGHTS } from '@game/scoring';
+import { startingLedger } from '../travel/ledger';
+import { paceSpawnTransform } from '../travel/workload';
 import { createHeadlessSetupContext, resolveHeadlessLeg, type ConvoyBindings } from './headlessLegs';
 import { hashEventLog } from './hash';
 import { selectHighlights } from './highlights';
@@ -53,12 +55,7 @@ const ROSTER: readonly { readonly id: ConvoyMemberId; readonly name: string; rea
   { id: 'vesper', name: 'VESPER', role: 'cartographer' },
 ];
 
-/**
- * Pre-flight ruling 7. The five-member roster at 100 integrity, the default
- * policy and a zero ledger: enough to rebuild `Leg.kernelConfig(run)` from a
- * request, which is all a replay needs. The ledger never reaches the kernel.
- */
-// TODO(astra): WP-19 routes the live run through initialRunState so the starting ledger, roster and default degree are one function
+/** Shared live/replay roster, policy and starting allocation. WP-19 ruling R4. */
 export function initialRunState(seed: number, discClass: DiscClass, difficulty: DifficultyTier): RunState {
   return {
     runId: `run-${(seed >>> 0).toString(16)}`,
@@ -68,7 +65,7 @@ export function initialRunState(seed: number, discClass: DiscClass, difficulty: 
     legIndex: 0,
     legProgress: 0,
     convoy: ROSTER.map((m) => ({ id: m.id, name: m.name, role: m.role, pid: null, integrity: 100, status: 'nominal', epitaph: null, abilityCharges: 0, afflictions: [] })),
-    resources: { cycles: 0, quota: 0, blocks: 0, bandwidth: 0 },
+    resources: startingLedger(discClass, difficulty),
     policy: { pace: 'steady', rations: 'standard', degreeOfMultiprogramming: DEFAULT_DEGREE },
     tombstones: [],
     codexUnlocked: [],
@@ -153,33 +150,48 @@ function replaceWithOverride(o: ReplayOverrides, cmd: Command): Command {
   }
 }
 
-/** Commands by the leg-local kernel tick they land on: overrides at tick 0, then the log in record order. */
-export function scheduleDecisions(request: ReplayRequest, legId: LegId, config: KernelConfig): { readonly schedule: ReadonlyMap<number, readonly Command[]>; readonly skipped: number } {
+export type ScheduledDecision =
+  | { readonly kind: 'command'; readonly command: Command; readonly origin: CommandOrigin }
+  | { readonly kind: 'action'; readonly record: DecisionRecord };
+
+/** Preserve record order between bus commands and director-owned actions. */
+export function scheduleDecisions(request: ReplayRequest, legId: LegId, config: KernelConfig): {
+  readonly schedule: ReadonlyMap<number, readonly Command[]>;
+  readonly skipped: number;
+  readonly actions: ReadonlyMap<number, readonly ScheduledDecision[]>;
+} {
   const o = request.overrides;
   const overridden = overriddenKinds(o);
   const schedule = new Map<number, Command[]>();
+  const actions = new Map<number, ScheduledDecision[]>();
   let skipped = 0;
-  const add = (tick: number, cmd: Command): void => {
-    const list = schedule.get(tick);
-    if (list === undefined) schedule.set(tick, [cmd]);
-    else list.push(cmd);
+  const add = (tick: number, action: ScheduledDecision): void => {
+    const ordered = actions.get(tick);
+    if (ordered === undefined) actions.set(tick, [action]);
+    else ordered.push(action);
+    if (action.kind === 'command') {
+      const list = schedule.get(tick);
+      if (list === undefined) schedule.set(tick, [action.command]);
+      else list.push(action.command);
+    }
   };
-  for (const cmd of startCommands(o, config)) add(0, cmd);
+  for (const command of startCommands(o, config)) add(0, { kind: 'command', command, origin: { source: 'replay', legId } });
   for (const record of request.decisions) {
     if (record.legId !== legId) continue;
     const cmd = commandFromRecord(record);
     if (cmd === null) {
       skipped += 1;
+      add(record.tick, { kind: 'action', record });
       continue;
     }
     if (overridden.has(cmd.kind)) {
       if (o.suppressRecordedPolicyChanges) continue;
-      add(record.tick, replaceWithOverride(o, cmd));
+      add(record.tick, { kind: 'command', command: replaceWithOverride(o, cmd), origin: originFromRecord(record) });
       continue;
     }
-    add(record.tick, cmd);
+    add(record.tick, { kind: 'command', command: cmd, origin: originFromRecord(record) });
   }
-  return { schedule, skipped };
+  return { schedule, skipped, actions };
 }
 
 /* ------------------------------------------------------------------ */
@@ -212,12 +224,13 @@ export function noteExits(store: Store<RunState>, bindings: ReadonlyMap<ConvoyMe
 
 /**
  * What one leg produced, in the shape the planner and the phrasing read:
- * casualties from `process.exited` and the bindings, head movement summed
+ * casualties from `process.exited`, supplemented by game tombstones when
+ * the bound process was not live at derezz; head movement summed
  * from `disk.seek`, the rest from the snapshot's metrics. The live runner
  * calls this at leg end with its own snapshot, log and bindings, so the
  * planner sees the same numbers a replay of that leg would report.
  */
-export function observeLeg(snapshot: KernelSnapshot, events: readonly KernelEvent[], bindings: ReadonlyMap<ConvoyMemberId, Pid>): ObservedLeg {
+export function observeLeg(snapshot: KernelSnapshot, events: readonly KernelEvent[], bindings: ReadonlyMap<ConvoyMemberId, Pid>, tombstones: readonly Epitaph[] = []): ObservedLeg {
   const casualties: { member: string; reason: string; tick: number }[] = [];
   let seekDistance = 0;
   for (const event of events) {
@@ -227,6 +240,17 @@ export function observeLeg(snapshot: KernelSnapshot, events: readonly KernelEven
       if (member !== null) casualties.push({ member, reason: event.reason, tick: event.tick });
     }
   }
+  // Match each member's deaths by occurrence. Command exits can precede
+  // their postTick epitaph by one tick; the game's reason and tick win.
+  const unmatchedEventDeaths = [...casualties];
+  casualties.length = 0;
+  for (const stone of tombstones) {
+    const index = unmatchedEventDeaths.findIndex(death => death.member === stone.member);
+    if (index >= 0) unmatchedEventDeaths.splice(index, 1);
+    casualties.push({ member: stone.member, reason: stone.reason, tick: stone.tick });
+  }
+  casualties.push(...unmatchedEventDeaths);
+  casualties.sort((a, b) => a.tick - b.tick);
   const metrics = snapshot.metrics;
   return {
     casualties,
@@ -341,24 +365,31 @@ export function* replaySteps(request: ReplayRequest, options: ReplayOptions = {}
   if (!Number.isSafeInteger(request.maxTicks) || request.maxTicks < 0) return failure('error', 'maxTicks must be a non-negative integer.');
   if (request.legs.length === 0) return failure('error', 'Replay request names no legs.');
 
-  const store = createRunStore(options.entry === undefined ? initialRunState(request.seed, request.discClass, request.difficulty) : cloneRun(options.entry.run));
+  const entry = options.entry ?? request.entry;
+  const store = createRunStore(entry === undefined ? initialRunState(request.seed, request.discClass, request.difficulty) : cloneRun(entry.run));
   const streams = createRunStreams(request.seed);
-  if (options.entry !== undefined) restoreRunStreams(streams, options.entry.rng);
+  if (entry !== undefined) restoreRunStreams(streams, 'rngStates' in entry ? entry.rngStates : entry.rng);
 
   const log: KernelEvent[] = [];
   const legs: { legId: LegId; ticks: number; eventLogHash: string }[] = [];
   const casualties: { member: string; reason: string; tick: number }[] = [];
   let totalTicks = 0;
   let skippedDecisions = 0;
-  let completions = 0;
+  let completions = store.get().score.throughput / SCORE_WEIGHTS.perCompletion;
   let seekDistance = 0;
   let last: { readonly snapshot: KernelSnapshot; readonly events: readonly KernelEvent[]; readonly bindings: ConvoyBindings } | null = null;
 
   for (const [index, legId] of request.legs.entries()) {
     const leg = withConfigPatch(resolve(legId), request.configPatch);
+    const hooks: ReplayHooks = leg.hooks ?? {};
+    hooks.enter?.(streams, store);
     store.mutate((s) => {
       s.legIndex = leg.index;
       s.legProgress = 0;
+      // Resolve the initial policy before populate so arrivals see the override.
+      if (request.overrides.pace !== undefined) s.policy.pace = request.overrides.pace;
+      if (request.overrides.rations !== undefined) s.policy.rations = request.overrides.rations;
+      if (request.overrides.degreeOfMultiprogramming !== undefined) s.policy.degreeOfMultiprogramming = request.overrides.degreeOfMultiprogramming;
       for (const m of s.convoy) m.pid = null;
     });
     options.onLegEntry?.(index, legId, store.get(), saveRunStreams(streams));
@@ -366,57 +397,84 @@ export function* replaySteps(request: ReplayRequest, options: ReplayOptions = {}
     const config: KernelConfig = { ...leg.kernelConfig(store.get()), seed: request.seed };
     const kernel = createKernel(config, kernelOptions);
     const bindings: ConvoyBindings = new Map();
-    leg.populate(createHeadlessSetupContext(kernel, store.get(), streams.leg.fork(legId), bindings));
+    const policy = store.get().policy;
+    leg.populate(createHeadlessSetupContext(kernel, store.get(), streams.leg.fork(legId), bindings, paceSpawnTransform(policy.pace)));
     store.mutate((s) => {
       for (const m of s.convoy) m.pid = bindings.get(m.id) ?? null;
     });
-    binding.apply(kernel, store.get().policy);
-    const bus = new CommandBus({ store, kernel, handlers: REPLAY_HANDLERS });
-    const { schedule, skipped } = scheduleDecisions(request, legId, config);
-    skippedDecisions += skipped;
-    const hooks: ReplayHooks = leg.hooks ?? {};
+    const applyBinding = (): void => {
+      binding.apply(kernel, store.get().policy);
+      // An explicit counterfactual quantum wins over the pace mapping (R4).
+      if (request.overrides.quantum !== undefined) {
+        kernel.setScheduler(kernel.invariantState().schedulerId, { quantum: request.overrides.quantum });
+      }
+    };
+    applyBinding();
+    const bus = new CommandBus({ store, kernel, handlers: REPLAY_HANDLERS, ...(hooks.admit === undefined ? {} : { admit: hooks.admit }) });
+    const { actions } = scheduleDecisions(request, legId, config);
     const isComplete = hooks.isComplete ?? workloadDrained;
     const legLog: KernelEvent[] = [];
+    const tombstoneStart = store.get().tombstones.length;
+    const seen = new Set<number>();
+    // Subscribe before command application: step() clears its frame, and
+    // afterStep may emit lifecycle events after step() returns. Ruling R6.
+    const unsubscribe = kernel.events.onAny((event) => {
+      if (seen.has(event.seq)) return;
+      seen.add(event.seq);
+      legLog.push(event);
+      if (event.type === 'disk.seek') seekDistance += event.distance;
+      else if (event.type === 'process.exited' && event.reason === 'normal_exit' && memberOf(bindings, event.pid) === null) completions += 1;
+    });
     let legTicks = 0;
-    for (;;) {
-      const tick = kernel.tick;
-      if (isComplete(tick, kernel, store.get())) break;
-      if (totalTicks >= request.maxTicks) return failure('aborted', `Replay exceeded maxTicks (${request.maxTicks}) in leg ${legId} at tick ${tick}.`);
-      const due = schedule.get(tick);
-      if (due !== undefined) {
-        // The binding runs once after the tick's batch, which is what a host
-        // that drains the bus and then maps the policy does; per-command
-        // application would call the kernel a different number of times.
-        let policyChanged = false;
-        for (const cmd of due) {
-          bus.apply(cmd, { source: 'replay', legId }, tick);
-          if (POLICY_KINDS.has(cmd.kind)) policyChanged = true;
-        }
-        if (policyChanged) binding.apply(kernel, store.get().policy);
-      }
-      hooks.beforeStep?.(tick, kernel, streams, store);
-      // `lastFrame` is one array reused every step, so the frame is copied out.
-      const events = [...kernel.step()];
-      for (const event of events) {
-        legLog.push(event);
-        if (event.type === 'disk.seek') seekDistance += event.distance;
-        else if (event.type === 'process.exited') {
-          if (event.reason === 'normal_exit') completions += 1;
-          else {
-            const member = memberOf(bindings, event.pid);
-            if (member !== null) casualties.push({ member, reason: event.reason, tick: event.tick });
+    try {
+      for (;;) {
+        const tick = kernel.tick;
+        const alreadyComplete = isComplete(tick, kernel, store.get());
+        if (!alreadyComplete && totalTicks >= request.maxTicks) return failure('aborted', `Replay exceeded maxTicks (${request.maxTicks}) in leg ${legId} at tick ${tick}.`);
+        const eventStart = legLog.length;
+        const due = actions.get(tick);
+        if (due !== undefined) {
+          // One binding after the accepted batch, shared with the live host.
+          let policyChanged = false;
+          for (const action of due) {
+            if (action.kind === 'action') {
+              if (hooks.dispatch?.(action.record, kernel, streams, store) !== true) skippedDecisions += 1;
+              continue;
+            }
+            const outcome = bus.apply(action.command, action.origin, kernel.tick);
+            if (outcome.refused === null && POLICY_KINDS.has(action.command.kind)) policyChanged = true;
           }
+          if (policyChanged) applyBinding();
         }
+        // Director actions can simulate crossing ticks themselves. Keep the
+        // budget and elapsed count in kernel ticks, including those actions.
+        const actionTicks = kernel.tick - tick;
+        totalTicks += actionTicks;
+        legTicks += actionTicks;
+        if (totalTicks > request.maxTicks) return failure('aborted', `Replay exceeded maxTicks (${request.maxTicks}) in leg ${legId} at tick ${kernel.tick}.`);
+        if (isComplete(kernel.tick, kernel, store.get())) {
+          noteExits(store, bindings, legLog.slice(eventStart));
+          break;
+        }
+        if (totalTicks >= request.maxTicks) return failure('aborted', `Replay exceeded maxTicks (${request.maxTicks}) in leg ${legId} at tick ${kernel.tick}.`);
+        hooks.beforeStep?.(kernel.tick, kernel, streams, store);
+        kernel.step();
+        const events = legLog.slice(eventStart);
+        hooks.afterStep?.(kernel.tick, kernel, events, store);
+        // Let the director build epitaphs before the fallback marks exits.
+        // Include lifecycle events emitted by afterStep itself (R6).
+        noteExits(store, bindings, legLog.slice(eventStart));
+        totalTicks += 1;
+        legTicks += 1;
+        if (totalTicks % PROGRESS_INTERVAL === 0) yield totalTicks;
       }
-      noteExits(store, bindings, events);
-      hooks.afterStep?.(kernel.tick, kernel, events, store);
-      totalTicks += 1;
-      legTicks += 1;
-      if (totalTicks % PROGRESS_INTERVAL === 0) yield totalTicks;
+    } finally {
+      unsubscribe();
     }
     const snapshot = kernel.snapshot();
     const outcome = leg.evaluate({ run: store.get(), kernelSnapshot: snapshot, events: legLog, ticksElapsed: legTicks });
     applyLegOutcome(store, outcome, leg.index);
+    casualties.push(...observeLeg(snapshot, legLog, bindings, store.get().tombstones.slice(tombstoneStart).filter(stone => stone.legId === legId)).casualties);
     legs.push({ legId, ticks: legTicks, eventLogHash: hashEventLog(legLog) });
     for (const event of legLog) log.push(event);
     last = { snapshot, events: legLog, bindings };

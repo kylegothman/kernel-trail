@@ -25,6 +25,7 @@ import type {
   Tick,
 } from '@kernel/types';
 import { asPid } from '@kernel/types';
+import type { DeadlockStrategy } from '@kernel/index';
 import type { DecisionRecord, LegId, Pace, Rations, RunState } from '@game/types';
 import type { Store } from './store';
 
@@ -33,6 +34,7 @@ export type Command =
   | { readonly kind: 'set_replacement'; readonly to: PageReplacementId }
   | { readonly kind: 'set_disk_policy'; readonly to: DiskSchedulingId }
   | { readonly kind: 'set_allocation'; readonly to: AllocationStrategy }
+  | { readonly kind: 'set_deadlock_strategy'; readonly to: DeadlockStrategy }
   | { readonly kind: 'set_pace'; readonly to: Pace }
   | { readonly kind: 'set_rations'; readonly to: Rations }
   | { readonly kind: 'set_degree'; readonly to: number }
@@ -44,7 +46,7 @@ export type Command =
 export type CommandKind = Command['kind'];
 
 export interface CommandOrigin {
-  /** Where the command came from. Replay only accepts 'replay'. */
+  /** Original terminal writes retain their provenance during replay. */
   readonly source: 'hud' | 'world' | 'terminal' | 'replay';
   readonly legId: LegId;
 }
@@ -55,6 +57,7 @@ export interface KernelMutators {
   setReplacementPolicy(id: PageReplacementId): void;
   setDiskPolicy(id: DiskSchedulingId): void;
   setAllocationStrategy(s: AllocationStrategy): void;
+  setDeadlockStrategy(strategy: DeadlockStrategy): void;
   syscall(request: SyscallRequest): SyscallResult;
 }
 
@@ -75,6 +78,8 @@ export interface CommandBusOptions {
   readonly handlers: CommandHandlers;
   /** Bounded so a stuck key cannot queue ten thousand commands. */
   readonly capacity?: number;
+  /** Runs after recording and before any command mutation. WP-19 ruling R1. */
+  readonly admit?: (cmd: Command, origin: CommandOrigin, at: Tick) => { ok: true } | { ok: false; reason: string };
 }
 
 export interface CommandOutcome {
@@ -84,6 +89,7 @@ export interface CommandOutcome {
   /** Index of the record appended to `RunState.decisions`. */
   readonly decisionIndex: number;
   readonly syscall: SyscallResult | null;
+  readonly refused: string | null;
 }
 
 export const COMMAND_QUEUE_CAPACITY = 64;
@@ -96,6 +102,7 @@ export function describeChoice(cmd: Command): string {
     case 'set_replacement':
     case 'set_disk_policy':
     case 'set_allocation':
+    case 'set_deadlock_strategy':
     case 'set_pace':
     case 'set_rations':
       return cmd.to;
@@ -123,6 +130,7 @@ export class CommandBus {
   private readonly kernel: KernelMutators;
   private readonly handlers: CommandHandlers;
   private readonly capacity: number;
+  private readonly admit: CommandBusOptions['admit'];
   /** Commands refused because the queue was full. */
   dropped = 0;
 
@@ -131,6 +139,7 @@ export class CommandBus {
     this.kernel = options.kernel;
     this.handlers = options.handlers;
     this.capacity = options.capacity ?? COMMAND_QUEUE_CAPACITY;
+    this.admit = options.admit;
   }
 
   get pending(): number {
@@ -159,7 +168,7 @@ export class CommandBus {
       tick: at,
       legId: origin.legId,
       kind: cmd.kind,
-      choice: describeChoice(cmd),
+      choice: origin.source === 'terminal' ? TERMINAL_CHOICE_PREFIX + describeChoice(cmd) : describeChoice(cmd),
       outcome: 'pending',
       relatedObjective: null,
     };
@@ -167,8 +176,16 @@ export class CommandBus {
     this.store.mutate((s) => {
       decisionIndex = s.decisions.push(record) - 1;
     });
+    const admission = this.admit?.(cmd, origin, at);
+    if (admission?.ok === false) {
+      this.store.mutate((s) => {
+        const decision = s.decisions[decisionIndex];
+        if (decision !== undefined) decision.outcome = 'costly';
+      });
+      return { command: cmd, origin, at, decisionIndex, syscall: null, refused: admission.reason };
+    }
     const syscall = this.mutate(cmd, at);
-    return { command: cmd, origin, at, decisionIndex, syscall };
+    return { command: cmd, origin, at, decisionIndex, syscall, refused: null };
   }
 
   private mutate(cmd: Command, at: Tick): SyscallResult | null {
@@ -184,6 +201,9 @@ export class CommandBus {
         return null;
       case 'set_allocation':
         this.kernel.setAllocationStrategy(cmd.to);
+        return null;
+      case 'set_deadlock_strategy':
+        this.kernel.setDeadlockStrategy(cmd.to);
         return null;
       case 'set_pace':
         this.store.mutate((s) => {
@@ -242,6 +262,9 @@ const DISK_IDS: Readonly<Record<DiskSchedulingId, true>> = {
 const ALLOCATION_IDS: Readonly<Record<AllocationStrategy, true>> = {
   first_fit: true, best_fit: true, worst_fit: true, buddy: true,
 };
+const DEADLOCK_STRATEGIES: Readonly<Record<DeadlockStrategy, true>> = {
+  ignore: true, detect: true, avoid: true, prevent: true,
+};
 const PACES: Readonly<Record<Pace, true>> = { conservative: true, steady: true, aggressive: true, reckless: true };
 const RATIONS: Readonly<Record<Rations, true>> = { generous: true, standard: true, lean: true, starved: true };
 const SYSCALL_NAMES: Readonly<Record<SyscallName, true>> = {
@@ -283,8 +306,17 @@ function syscallFromChoice(choice: string): Command | null {
  * effect was recorded as a separate command, for `use_ability`, and for a
  * choice string that does not parse or names an unknown id.
  */
+const TERMINAL_CHOICE_PREFIX = '[terminal] ';
+
+/** Plain choice strings from older saves remain valid and replay normally. */
+export function originFromRecord(record: DecisionRecord): CommandOrigin {
+  return { source: record.choice.startsWith(TERMINAL_CHOICE_PREFIX) ? 'terminal' : 'replay', legId: record.legId };
+}
+
 export function commandFromRecord(record: DecisionRecord): Command | null {
-  const choice = record.choice;
+  const choice = record.choice.startsWith(TERMINAL_CHOICE_PREFIX)
+    ? record.choice.slice(TERMINAL_CHOICE_PREFIX.length)
+    : record.choice;
   switch (record.kind) {
     case 'set_scheduler': {
       const m = /^([a-z_]+)(?: q=(\d+))?$/.exec(choice);
@@ -299,6 +331,8 @@ export function commandFromRecord(record: DecisionRecord): Command | null {
       return isMember(DISK_IDS, choice) ? { kind: 'set_disk_policy', to: choice } : null;
     case 'set_allocation':
       return isMember(ALLOCATION_IDS, choice) ? { kind: 'set_allocation', to: choice } : null;
+    case 'set_deadlock_strategy':
+      return isMember(DEADLOCK_STRATEGIES, choice) ? { kind: 'set_deadlock_strategy', to: choice } : null;
     case 'set_pace':
       return isMember(PACES, choice) ? { kind: 'set_pace', to: choice } : null;
     case 'set_rations':

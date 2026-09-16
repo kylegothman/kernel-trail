@@ -34,6 +34,7 @@ import type {
   TravelPolicy,
 } from '@game/types';
 import type { Store } from '@game/store';
+import type { CommandBusOptions } from '@game/CommandBus';
 
 /* ------------------------------------------------------------------ */
 /* Architecture 8.6                                                    */
@@ -50,6 +51,8 @@ export interface ReplayRequest {
   readonly overrides: ReplayOverrides;
   /** Safety valve. A replay that exceeds this is aborted and reported. */
   readonly maxTicks: number;
+  /** Plain leg-entry state for mid-journey counterfactuals. WP-19 ruling R4. */
+  readonly entry?: ReplayEntry;
   /**
    * Pre-flight ruling 2. `deadlockStrategy` is not a player verb and has no
    * `ReplayOverrides` field, so the planner's deadlock row cannot be expressed
@@ -147,21 +150,11 @@ export type ReplayOutbound = ReplayProgress | ReplayDone;
 export type ReplayKernel = ReturnType<typeof createKernel>;
 
 export interface PolicyBinding {
-  /** Called after every policy change and once after populate. */
+  /** Called once after each accepted policy batch and once after populate. */
   apply(kernel: ReplayKernel, policy: Readonly<TravelPolicy>): void;
 }
 
-/**
- * Degree reaches the kernel through its one hook. Pace and rations mutate
- * `RunState.policy` only, because their kernel effect is the leg runner's
- * mapping, which does not exist yet.
- */
-export const DEFAULT_POLICY_BINDING: PolicyBinding = {
-  apply(kernel, policy) {
-    kernel.setDegreeOfMultiprogramming(policy.degreeOfMultiprogramming);
-    // TODO(astra): WP-19 supplies the pace and rations binding and replay must use the same one
-  },
-};
+export { livePolicyBinding as DEFAULT_POLICY_BINDING } from '../travel/policyBinding';
 
 /**
  * Pre-flight ruling 4. The invariant harness costs about three times the
@@ -216,6 +209,12 @@ export function restoreRunStreams(streams: RunStreams, states: readonly RngState
 }
 
 export interface ReplayHooks {
+  /** WP-19 economic entry, before configuration, population and tick-zero commands. */
+  enter?(streams: RunStreams, store: Store<RunState>): void;
+  /** The live director's guard, before the command mutates. WP-19 ruling R1. */
+  readonly admit?: CommandBusOptions['admit'];
+  /** Dispatch non-command decisions in record order. False counts as a skip. */
+  dispatch?(record: DecisionRecord, kernel: ReplayKernel, streams: RunStreams, store: Store<RunState>): boolean;
   /** Before every kernel step: WP-19's director headless half (event draws, travel charge, arrivals). */
   beforeStep?(tick: Tick, kernel: ReplayKernel, streams: RunStreams, store: Store<RunState>): void;
   /** After every step with that tick's events: WP-19's postTick half (integrity, decision outcomes). */
@@ -243,6 +242,12 @@ export type HeadlessLegFactory = () => HeadlessLeg;
 /** A mid-journey start: a boundary save's `run` and its `rngStates`, which are `saveRunStreams` at leg entry. */
 export interface ReplayEntry {
   readonly run: RunState;
+  readonly rngStates: readonly RngState[];
+}
+
+/** Existing in-process callers may keep the WP-18 spelling. Requests use ReplayEntry. */
+export interface LegacyReplayEntry {
+  readonly run: RunState;
   readonly rng: readonly RngState[];
 }
 
@@ -255,7 +260,7 @@ export interface ReplayOptions {
   readonly onProgress?: (ticks: number) => void;
   /** Polled every 500 ticks; true aborts the replay at that boundary. */
   readonly isCancelled?: () => boolean;
-  readonly entry?: ReplayEntry;
+  readonly entry?: ReplayEntry | LegacyReplayEntry;
   /** The run and streams at each leg start, in the shape `ReplayRecord.legEntryRng` records. */
   readonly onLegEntry?: (index: number, legId: LegId, run: Readonly<RunState>, rng: readonly RngState[]) => void;
 }
