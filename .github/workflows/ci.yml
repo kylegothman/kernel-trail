@@ -7,7 +7,7 @@ name: ci
 
 on:
   push:
-    branches: ['**']
+    branches: ["**"]
   pull_request:
   workflow_dispatch:
 
@@ -46,9 +46,14 @@ jobs:
         run: |
           # The whole point of a browser game is that it opens fast. A silent
           # bundle regression is the easiest way to lose that, so name a ceiling.
-          size=$(du -sk dist | cut -f1)
-          echo "dist is ${size}KB"
-          if [ "$size" -gt 6144 ]; then
-            echo "dist exceeds the 6MB ceiling. Check what was added, or raise the ceiling deliberately."
+          # The ceiling is on what a player downloads. Source maps are emitted
+          # for debugging and fetched only when devtools are open, so they are
+          # measured and reported but not budgeted: counting them made the gate
+          # fail at 15MB while the game itself shipped 3MB.
+          shipped=$(find dist -type f ! -name '*.map' -exec du -sk {} + | awk '{s+=$1} END {print s+0}')
+          maps=$(find dist -name '*.map' -exec du -sk {} + | awk '{s+=$1} END {print s+0}')
+          echo "dist ships ${shipped}KB to a player, plus ${maps}KB of source maps"
+          if [ "$shipped" -gt 6144 ]; then
+            echo "the shipped bundle exceeds the 6MB ceiling. Check what was added, or raise the ceiling deliberately."
             exit 1
           fi
