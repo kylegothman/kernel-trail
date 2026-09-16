@@ -91,6 +91,15 @@ export const CHECKSUM_SALT: string =
  *
  * Canonicalisation matters more than the hash function. Two saves representing
  * the same state must produce the same string.
+ *
+ * This is the same discipline as `tests/kernel/canonical.ts`, and the two agree
+ * byte for byte on any value containing no Map and no Set (asserted by the
+ * `consistent with kernel canonical` case). Two differences are deliberate:
+ * the kernel helper encodes a Map or Set as a sorted array of pairs or items
+ * because it compares live kernel state, while this one refuses them so a Map
+ * cannot reach a save file unconverted; and the kernel's `hash` is a 32-bit
+ * FNV-1a used only to compare fixtures, while `fnv1a64` below is the save
+ * checksum. WP-17 scope correction S6.
  */
 export function canonicalise(value: unknown): string {
   const out: string[] = [];
@@ -153,22 +162,62 @@ function write(v: unknown, out: string[]): void {
   throw new Error(`Unserialisable value of type ${t} in save data.`);
 }
 
-/** 64-bit FNV-1a as a pair of 32-bit halves, because JS has no fast u64. */
+/**
+ * 64-bit FNV-1a over the UTF-8 bytes of the input, as a pair of unsigned
+ * 32-bit halves because JS has no fast u64. Offset basis 0xcbf29ce484222325,
+ * prime 2^40 + 0x1b3. The multiply is exact in doubles: each half times
+ * 0x1b3 stays under 2^41, and the low half's carry and the `lo << 40` term
+ * both land in the high half modulo 2^32. Matches the reference FNV-1a 64
+ * vectors on ASCII (`tests/game/checksum.test.ts` cross-checks a BigInt
+ * implementation). A lone surrogate is encoded as three bytes so every
+ * string still hashes deterministically.
+ *
+ * The scaffold's version, copied from architecture 8.4, was not FNV-1a: it
+ * swapped the halves of the offset basis, dropped the carry between the
+ * halves and folded the high byte of a code unit into the high word.
+ * Corrected by WP-17; no save existed yet to invalidate.
+ */
 export function fnv1a64(input: string): string {
-  let h1 = 0x84222325 | 0; // high half of the offset basis
-  let h2 = 0xcbf29ce4 | 0; // low half
+  let hi = 0xcbf29ce4;
+  let lo = 0x84222325;
+  const mix = (byte: number): void => {
+    lo = (lo ^ byte) >>> 0;
+    const loProduct = lo * 0x1b3;
+    const carry = Math.floor(loProduct / 0x100000000);
+    const shifted = (lo * 0x100) >>> 0;
+    hi = (hi * 0x1b3 + carry + shifted) >>> 0;
+    lo = loProduct >>> 0;
+  };
+  const three = (c: number): void => {
+    mix(0xe0 | (c >> 12));
+    mix(0x80 | ((c >> 6) & 0x3f));
+    mix(0x80 | (c & 0x3f));
+  };
   for (let i = 0; i < input.length; i++) {
     const c = input.charCodeAt(i);
-    h2 ^= c & 0xff;
-    h1 ^= (c >>> 8) & 0xff;
-    // Multiply by the 64-bit FNV prime 0x100000001b3, split into halves.
-    const l1 = h1 * 0x1b3 + h2 * 0x100;
-    const l2 = h2 * 0x1b3;
-    h1 = l1 | 0;
-    h2 = l2 | 0;
+    if (c < 0x80) {
+      mix(c);
+    } else if (c < 0x800) {
+      mix(0xc0 | (c >> 6));
+      mix(0x80 | (c & 0x3f));
+    } else if (c >= 0xd800 && c <= 0xdbff && i + 1 < input.length) {
+      const d = input.charCodeAt(i + 1);
+      if (d >= 0xdc00 && d <= 0xdfff) {
+        const cp = 0x10000 + ((c - 0xd800) << 10) + (d - 0xdc00);
+        i += 1;
+        mix(0xf0 | (cp >> 18));
+        mix(0x80 | ((cp >> 12) & 0x3f));
+        mix(0x80 | ((cp >> 6) & 0x3f));
+        mix(0x80 | (cp & 0x3f));
+      } else {
+        three(c);
+      }
+    } else {
+      three(c);
+    }
   }
-  const hex = (n: number): string => (n >>> 0).toString(16).padStart(8, '0');
-  return hex(h1) + hex(h2);
+  const hex = (n: number): string => n.toString(16).padStart(8, '0');
+  return hex(hi) + hex(lo);
 }
 
 /**
@@ -177,9 +226,9 @@ export function fnv1a64(input: string): string {
  * an identical checksum, which is what makes the deduplication of architecture
  * section 8.5 possible.
  */
-export function checksumOf(file: Omit<SaveFile, 'checksum'>): string {
+export function checksumOf(file: Omit<SaveFile, 'checksum'>, salt: string = CHECKSUM_SALT): string {
   return fnv1a64(
-    CHECKSUM_SALT +
+    salt +
       canonicalise({
         version: file.version,
         run: file.run,
@@ -243,12 +292,21 @@ function deepCopy<T>(value: T): T {
 }
 
 /**
- * `KernelSnapshot.metrics.memory.workingSets` is a Map, which `canonicalise`
- * refuses. Convert before checksumming or storing as an exported JSON file.
+ * `KernelSnapshot.metrics.memory.workingSets` and every
+ * `ProtectionDomain.rights` are Maps, which `canonicalise` refuses. Convert
+ * before checksumming or storing as an exported JSON file. Both are flattened
+ * to key-sorted arrays of pairs, so the result is independent of insertion
+ * order. (The domain rights were missed by the scaffold; WP-17 added them.)
  */
 export function checksumSafeSnapshot(snapshot: KernelSnapshot): unknown {
+  const byKey = (a: readonly [string, unknown], b: readonly [string, unknown]): number =>
+    a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0;
   return {
     ...snapshot,
+    domains: snapshot.domains.map((d) => ({
+      ...d,
+      rights: [...d.rights.entries()].map(([k, v]): readonly [string, unknown] => [k, [...v]]).sort(byKey),
+    })),
     metrics: {
       scheduling: snapshot.metrics.scheduling,
       memory: {
@@ -268,9 +326,16 @@ export function checksumSafeSnapshot(snapshot: KernelSnapshot): unknown {
 export class Database {
   private db: IDBDatabase | null = null;
 
+  /**
+   * The version defaults to the schema's. Tests pass a higher one to drive
+   * the `onblocked` path, which only an upgrade can reach; production code
+   * never passes it.
+   */
+  constructor(private readonly version: number = DB_VERSION) {}
+
   async open(): Promise<void> {
     this.db = await new Promise<IDBDatabase>((resolve, reject) => {
-      const req = indexedDB.open(DB_NAME, DB_VERSION);
+      const req = indexedDB.open(DB_NAME, this.version);
       req.onupgradeneeded = (): void => {
         const db = req.result;
         // Version 1 creates everything. Later versions branch on
@@ -302,10 +367,18 @@ export class Database {
           diag.createIndex('byCreatedAt', 'createdAtIso');
         }
       };
-      req.onsuccess = (): void => resolve(req.result);
+      let abandoned = false;
+      req.onsuccess = (): void => {
+        // A blocked open already rejected; when the other tab finally lets
+        // the upgrade through, the connection it hands back must not leak.
+        if (abandoned) req.result.close();
+        else resolve(req.result);
+      };
       req.onerror = (): void => reject(req.error ?? new Error('indexedDB.open failed'));
-      req.onblocked = (): void =>
+      req.onblocked = (): void => {
+        abandoned = true;
         reject(new Error('IndexedDB upgrade blocked by another tab.'));
+      };
     });
 
     // A second tab upgrading the schema must not corrupt this one's view.
