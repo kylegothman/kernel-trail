@@ -777,7 +777,9 @@ import type { DecisionRecord } from '@game/types';
 import { HANDOFFS, journeyHashOf, replayJourney, runJourney, type JourneyOptions } from './harness/journey';
 
 const weaveScript: DecisionScript = { legId: 'the_weave', label: 'weave', steps: [{ at: 4, command: { kind: 'set_pace', to: 'aggressive' } }] };
-const journeyLegs = (): Leg[] => [createSyntheticLeg(), createHarnessLeg(), createSyntheticLeg({ id: 'the_weave', index: 2 })];
+/** The synthetic Boot Sector ends at entry: a zero-segment leg runs to its `leg_done` record or the tick allowance (WP-L00 ruling 1), and this one writes the record at populate. */
+const LEG_DONE_AT_ENTRY: Omit<DecisionRecord, 'legId'> = { tick: asTick(0), kind: 'leg_done', choice: 'synthetic', outcome: 'pending', relatedObjective: null };
+const journeyLegs = (): Leg[] => [handoffLeg('boot_sector', 0, [LEG_DONE_AT_ENTRY]), createHarnessLeg(), createSyntheticLeg({ id: 'the_weave', index: 2 })];
 const journeyScripts = new Map<LegId, DecisionScript>([[HARNESS_LEG_ID, GOOD], ['the_weave', weaveScript]]);
 const journeyBase = (): JourneyOptions => ({ seed: FIXTURE_SEED, discClass: 'shell', difficulty: 'operator', scripts: journeyScripts, legs: journeyLegs() });
 

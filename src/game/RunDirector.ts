@@ -65,9 +65,16 @@ export interface DirectorSnapshot {
   readonly previousQuantum: number;
 }
 export type InteractionHandler = (run: RunState, at: Tick) => void;
+/** WP-L00 ruling 1: a leg with no travel segments ends on a `leg_done` record its own handler pushes, or at this kernel tick as a normal completion. */
+export const LEG_DONE_KIND = 'leg_done';
+export const ZERO_SEGMENT_TICK_ALLOWANCE = 200;
+/** True when this leg's decision log holds a `leg_done` record. */
+export function legDone(run: Readonly<RunState>, legId: Leg['id']): boolean {
+  return run.decisions.some(record => record.legId === legId && record.kind === LEG_DONE_KIND);
+}
 /** The record kinds `dispatch` replays; a non-command record of any other kind is leg data and rides through resume verbatim (WP-20 W9). */
 export const DIRECTOR_OWNED_KINDS: ReadonlySet<string> = new Set([
-  'travel_resume', 'depot_open', 'crossing_open', 'crossing', 'depot', 'reclamation_open', 'reclamation', 'interaction', 'checkpoint_rollback', 'use_ability', 'terminal',
+  'travel_resume', 'depot_open', 'crossing_open', 'crossing', 'depot', 'reclamation_open', 'reclamation', 'interaction', 'checkpoint_rollback', 'use_ability', 'terminal', LEG_DONE_KIND,
 ]);
 const POLICY = new Set<Command['kind']>(['set_scheduler', 'set_replacement', 'set_disk_policy', 'set_allocation', 'set_deadlock_strategy', 'set_pace', 'set_rations', 'set_degree']);
 const MEMBERS: readonly ConvoyMemberId[] = ['kestrel', 'lumen', 'orrery', 'sable', 'vesper'];
@@ -112,7 +119,11 @@ export class RunDirector {
   get bindings(): ConvoyBindings { return this.deps.bindings; }
   get failed(): boolean { return aliveMembers(this.deps.store.get().convoy).length === 0; }
   get tickLimitReached(): boolean { return this.capped; }
-  get complete(): boolean { return this.capped || this.failed || legProgress(this.travel) >= 1; }
+  get complete(): boolean {
+    if (this.capped || this.failed) return true;
+    if (this.travel.segmentsTotal === 0) return legDone(this.deps.store.get(), this.deps.leg.id) || this.deps.kernel.tick >= ZERO_SEGMENT_TICK_ALLOWANCE;
+    return legProgress(this.travel) >= 1;
+  }
   dispose(): void { this.unsubscribe(); }
 
   /** Called before the bus mutates, including synchronous terminal writes. */
@@ -376,13 +387,19 @@ export class RunDirector {
         if (isObject(data) && validTrace(data.trace)) { this.submitReclamation(data.trace); owned = true; }
       } else if (record.kind === 'interaction') {
         const split = record.choice.indexOf(' @ '); owned = this.interactions.has(record.choice.slice(0, split));
-        if (owned) this.interaction(record.choice.slice(0, split), record.choice.slice(split + 3), record.tick);
+        // The record lands before the handler runs, as the bus orders it live, so a handler that reads its own record sees it (WP-L00 ruling 1).
+        if (owned) { this.deps.store.mutate(run => { run.decisions.push({ ...record }); }); this.interaction(record.choice.slice(0, split), record.choice.slice(split + 3), record.tick); }
       } else if (record.kind === 'checkpoint_rollback') owned = true;
       else if (record.kind === 'use_ability') owned = true;
       else if (record.kind === 'terminal') owned = true;
+      else if (record.kind === LEG_DONE_KIND) {
+        // Pushed verbatim only when absent: a handler replayed just before may already have written it.
+        if (!legDone(this.deps.store.get(), this.deps.leg.id)) this.deps.store.mutate(run => { run.decisions.push({ ...record }); });
+        owned = true;
+      }
     } catch { owned = false; }
     finally { this.replayingAction = false; }
-    if (owned) this.deps.store.mutate(run => { run.decisions.push({ ...record }); });
+    if (owned && record.kind !== 'interaction' && record.kind !== LEG_DONE_KIND) this.deps.store.mutate(run => { run.decisions.push({ ...record }); });
     return owned;
   }
 
@@ -447,7 +464,7 @@ export class RunDirector {
         latest = run; if (initialPolicy === null) { initialPolicy = { ...run.policy }; initialQuantum = kernel.invariantState().schedulerParams.quantum; initialCredit = emergencyCreditNeeded(run.resources, this.deps.leg.id); }
         // Flush accepted tick-zero and final-boundary costs even if no step follows.
         if (entryContext !== null) return ensure(kernel, entryContext.streams, entryContext.store).complete;
-        return replay?.complete ?? (this.travel.segmentsTotal === 0 || aliveMembers(run.convoy).length === 0);
+        return replay?.complete ?? (this.travel.segmentsTotal === 0 ? legDone(run, this.deps.leg.id) || _at >= ZERO_SEGMENT_TICK_ALLOWANCE : aliveMembers(run.convoy).length === 0);
       },
       admit: (cmd, origin) => {
         if (latest === null) return { ok: false, reason: 'Replay has no active leg.' };
