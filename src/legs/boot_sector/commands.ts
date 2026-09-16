@@ -1,0 +1,90 @@
+/**
+ * The three Leg 0 commands, copied byte for byte from the curriculum map's
+ * "Terminal commands introduced" block. WP-15 already ships all three, so the
+ * host's `registerAll` treats these as identical re-registrations and
+ * registers nothing new; a definition that drifted would throw naming the
+ * first differing line, which is the point of shipping them here.
+ */
+import type { TerminalCommandDef } from '@game/types';
+
+export const terminalCommands: readonly TerminalCommandDef[] = [
+  {
+    name: 'man',
+    usage: 'man <topic>',
+    summary: 'Read the manual page for a command, a concept or an error code.',
+    manual: [
+      'man prints the manual page for a topic. A topic is a command name (man ps), a',
+      'concept (man syscall), or an error code (man EPERM).',
+      '',
+      'Manual pages in this system are written to be read before you need them, which is',
+      'not how anyone reads them. Reading one after a failure is the normal case and is',
+      'expected. Every error message printed by this shell names the topic that explains',
+      'it, so the error itself tells you what to type next.',
+      '',
+      'A manual page never tells you which choice to make. It tells you what the choice',
+      'costs. The codex, which fills in as you encounter things, is where remedies live.',
+      '',
+      'See also: syscall, mode, codex.',
+    ].join('\n'),
+    chapter: { chapter: 2, title: 'Operating-System Structures', sections: ['2.2'] },
+  },
+  {
+    name: 'syscall',
+    usage: 'syscall <name> [args...]',
+    summary: 'Issue a system call directly and print the result and its cost.',
+    manual: [
+      'syscall submits a request to the kernel on your behalf and prints what came back.',
+      '',
+      'A system call is not a function call. A function call jumps to another address in',
+      'your own address space and costs a few ticks. A system call raises a trap: the',
+      'processor stops executing your code, switches from user mode to kernel mode, runs',
+      'kernel code that validates every argument you passed because it trusts none of',
+      'them, switches back, and resumes you. That round trip is the mode-switch cost, and',
+      'this shell charges you 4 cycles for it whether you asked for one block or one',
+      'hundred. Batch your requests.',
+      '',
+      'The kernel validates arguments because a system call is the only door between code',
+      'that may do anything and code that may not. If the kernel trusted your arguments,',
+      'the door would not be a door.',
+      '',
+      'Results come back as ok with a value, or as an errno. Common errnos here:',
+      '  EPERM   you asked for something your current mode does not permit',
+      '  ENOMEM  the resource exists but there is not enough of it',
+      '  EINVAL  the arguments were malformed; the trap still cost you 4 cycles',
+      '',
+      'Examples:',
+      '  syscall brk 12          request 12 more quota',
+      '  syscall open manifest   open the convoy manifest, returns a descriptor',
+      '',
+      'See also: mode, man EPERM.',
+    ].join('\n'),
+    chapter: { chapter: 2, title: 'Operating-System Structures', sections: ['2.3', '2.3.1', '2.3.2'] },
+  },
+  {
+    name: 'mode',
+    usage: 'mode [--history]',
+    summary: 'Report the current processor mode and, with --history, every switch this leg.',
+    manual: [
+      'mode prints whether the processor is currently executing in user mode or kernel',
+      'mode, and which Program it is executing on behalf of.',
+      '',
+      'There is one processor and one mode bit. When the bit says kernel, the running code',
+      'may touch any memory and issue any instruction. When it says user, a large set of',
+      'instructions fault instead of executing. The bit is hardware. No program can set it',
+      'by asking politely; it flips on a trap, on an interrupt, and on nothing else.',
+      '',
+      'This is worth being precise about because two different ideas are often confused.',
+      'Kernel mode is a processor state that lasts microseconds. An administrator account',
+      'is a policy label that lasts for a login session. They are unrelated. The same',
+      'Program in this convoy enters kernel mode dozens of times per leg and is never an',
+      'administrator.',
+      '',
+      'mode --history prints every switch this leg with the cause: trap, interrupt, or',
+      'return. If the count surprises you, that is the lesson. The kernel is not running',
+      'alongside your Programs. It is running only in these intervals.',
+      '',
+      'See also: syscall, ring (available later).',
+    ].join('\n'),
+    chapter: { chapter: 1, title: 'Introduction', sections: ['1.4.1', '1.4.2'] },
+  },
+];

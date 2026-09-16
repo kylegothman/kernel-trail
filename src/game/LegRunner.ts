@@ -4,7 +4,7 @@ import type { CodexCounterfactual, CodexUnlock } from './codexTypes';
 import type { EpitaphCopySource } from './convoy/derezz';
 import { PER_LEG_ABILITY_CHARGES } from './convoy/status';
 import { LegSandbox, type LegFailure } from './LegSandbox';
-import { DIRECTOR_OWNED_KINDS, RunDirector, type DirectorSnapshot, type InteractionHandler } from './RunDirector';
+import { DIRECTOR_OWNED_KINDS, LEG_DONE_KIND, legDone, RunDirector, type DirectorSnapshot, type InteractionHandler } from './RunDirector';
 import { buildDebrief, type DebriefView } from './debrief';
 import type { CrossingDef, CrossingResult } from './crossing/Crossing';
 import type { CrossingContext, CrossingOption } from './crossing/options';
@@ -297,6 +297,10 @@ export class LegRunner {
     const leg = this.leg; const kernel = this.activeKernel; const sandbox = this.sandbox; const director = this.activeDirector;
     if (leg === null || kernel === null || sandbox === null || director === null) throw new Error('No leg to exit.');
     if (director.failed && this.rollbackCheckpoint()) return skippedOutcome(leg);
+    // A zero-segment leg's end is in its log, so a replay or a resume ends it at the same tick (WP-L00 ruling 1).
+    if (director.travel.segmentsTotal === 0 && !legDone(this.deps.runStore.get(), leg.id)) {
+      this.deps.runStore.mutate((run) => { run.decisions.push({ tick: kernel.tick, legId: leg.id, kind: LEG_DONE_KIND, choice: 'exit', outcome: 'pending', relatedObjective: null }); });
+    }
     const before = cloneRunState(this.deps.runStore.get());
     const snapshot = kernel.snapshot();
     const raw = sandbox.evaluate({ run: before, kernelSnapshot: snapshot, events: director.allEvents, ticksElapsed: kernel.tick });
