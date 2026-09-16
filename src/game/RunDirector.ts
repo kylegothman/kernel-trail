@@ -55,6 +55,7 @@ export interface DirectorSnapshot {
   readonly processed: readonly number[];
   readonly completions: number;
   readonly pendingDeaths: readonly { readonly member: ConvoyMemberId; readonly reason: TerminationReason }[];
+  readonly inverted: readonly ConvoyMemberId[];
   readonly reclamationRuns: number;
   readonly reclamation: ReclamationSnapshot | null;
   readonly depot: DepotSnapshot | null;
@@ -64,7 +65,15 @@ export interface DirectorSnapshot {
   readonly previousPolicy: TravelPolicy;
   readonly previousQuantum: number;
 }
-export type InteractionHandler = (run: RunState, at: Tick) => void;
+/**
+ * WP-L04 ruling 2: the kernel is the third argument. A leg's interaction is a
+ * player verb that changes how the simulation runs, and every such verb needs
+ * a kernel write it cannot reach through `RunState` alone. Additive, so a
+ * handler that ignores it is unchanged, and the replay director re-registers
+ * the same handlers against its own kernel, which is what keeps it
+ * deterministic.
+ */
+export type InteractionHandler = (run: RunState, at: Tick, kernel: ReplayKernel) => void;
 /** WP-L00 ruling 1: a leg with no travel segments ends on a `leg_done` record its own handler pushes, or at this kernel tick as a normal completion. */
 export const LEG_DONE_KIND = 'leg_done';
 export const ZERO_SEGMENT_TICK_ALLOWANCE = 200;
@@ -87,6 +96,8 @@ export class RunDirector {
   private readonly captured = new Set<number>();
   private readonly processed = new Set<number>();
   private readonly deaths = new Map<ConvoyMemberId, TerminationReason>();
+  /** Members already told about the inversion they are in, so one episode inflicts once (WP-L04 ruling 4). */
+  private readonly inverted = new Set<ConvoyMemberId>();
   private readonly crossings = new Map<string, CrossingDef>();
   private readonly interactions = new Map<string, { handler: InteractionHandler; target: ConvoyMemberId | null }>();
   private readonly pendingCommands: Command[] = [];
@@ -101,6 +112,7 @@ export class RunDirector {
   private depot: Depot | null = null;
   private reclamation: Reclamation | null = null;
   private readonly unsubscribe: () => void;
+  private readonly syncEnabled: boolean;
 
   constructor(private readonly deps: RunDirectorDeps) {
     this.travel = createTravelState(deps.leg.id, deps.onCredit ?? false);
@@ -108,6 +120,7 @@ export class RunDirector {
     this.recruited = deps.store.get().convoy.some(member => member.name.endsWith('-2'));
     this.completions = deps.store.get().score.throughput / SCORE_WEIGHTS.perCompletion;
     this.previousQuantum = deps.kernel.invariantState().schedulerParams.quantum;
+    this.syncEnabled = deps.kernel.config.enabledSubsystems.includes('sync');
     this.unsubscribe = deps.kernel.events.onAny(event => {
       if (this.captured.has(event.seq)) return;
       this.captured.add(event.seq); this.events.push(event);
@@ -226,6 +239,24 @@ export class RunDirector {
       this.processed.add(event.seq);
       if (!this.captured.has(event.seq)) { this.captured.add(event.seq); this.events.push(event); }
       this.processEvent(event);
+    }
+    // WP-L04 ruling 4: the kernel detects priority inversion in phase 4 and
+    // reports it on the sync subsystem rather than as an event, so nothing
+    // reached the convoy. The affliction lands on the blocked Program, which is
+    // the high-priority one, and it lands once for the episode rather than
+    // once a tick. The early return keeps a tick that has no inversion, which
+    // is nearly all of them, free of any allocation at all.
+    const inversions = this.syncEnabled ? this.deps.kernel.syncSubsystem.priorities.inversions() : [];
+    if (inversions.length > 0 || this.inverted.size > 0) {
+      const current = new Set<ConvoyMemberId>();
+      for (const inversion of inversions) {
+        let blocked: ConvoyMemberId | undefined;
+        for (const [member, pid] of this.deps.bindings) if (pid === inversion.blocked) { blocked = member; break; }
+        if (blocked === undefined) continue;
+        current.add(blocked);
+        if (!this.inverted.has(blocked)) { this.inverted.add(blocked); this.inflict(blocked, 'priority_inversion', at); }
+      }
+      for (const member of this.inverted) if (!current.has(member)) this.inverted.delete(member);
     }
     for (const member of [...this.deps.store.get().convoy].sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0)) {
       if (member.epitaph !== null) continue;
@@ -357,7 +388,7 @@ export class RunDirector {
       const { integrity = 0, ...cost } = def.cost;
       applyDelta(transaction.resources, { cycles: -(cost.cycles ?? 0), quota: -(cost.quota ?? 0), blocks: -(cost.blocks ?? 0), bandwidth: -(cost.bandwidth ?? 0) });
       const member = transaction.convoy.find(m => m.id === registered.target); if (member !== undefined) applyIntegrity(member, -integrity);
-      applied = this.deps.sandbox.predicate({ ...def, enabledWhen: draft => { registered.handler(draft, at); return true; } }, transaction);
+      applied = this.deps.sandbox.predicate({ ...def, enabledWhen: draft => { registered.handler(draft, at, this.deps.kernel); return true; } }, transaction);
       if (applied) Object.assign(run, transaction);
       else {
         const decision = run.decisions.at(-1);
@@ -424,7 +455,7 @@ export class RunDirector {
 
   snapshot(): DirectorSnapshot {
     return structuredClone({ travel: this.travel, phase: this.currentPhase, events: this.events, processed: [...this.processed], completions: this.completions,
-      pendingDeaths: [...this.deaths].map(([member, reason]) => ({ member, reason })), reclamationRuns: this.reclamationRuns,
+      pendingDeaths: [...this.deaths].map(([member, reason]) => ({ member, reason })), inverted: [...this.inverted], reclamationRuns: this.reclamationRuns,
       reclamation: this.reclamation?.snapshot() ?? null, depot: this.depot?.snapshot() ?? null, recruited: this.recruited, capped: this.capped, clockRebased: this.clockRebased,
       previousPolicy: this.previousPolicy, previousQuantum: this.previousQuantum });
   }
@@ -433,6 +464,7 @@ export class RunDirector {
     this.captured.clear(); for (const event of state.events) this.captured.add(event.seq);
     this.processed.clear(); for (const seq of state.processed) this.processed.add(seq);
     this.completions = state.completions; this.deaths.clear(); for (const death of state.pendingDeaths) this.deaths.set(death.member, death.reason);
+    this.inverted.clear(); for (const member of state.inverted ?? []) this.inverted.add(member);
     this.reclamationRuns = state.reclamationRuns; this.recruited = state.recruited; this.capped = state.capped; this.clockRebased = state.clockRebased;
     this.previousPolicy = { ...state.previousPolicy }; this.previousQuantum = state.previousQuantum;
     if (state.reclamation !== null) this.reclamationModel().restore(state.reclamation);

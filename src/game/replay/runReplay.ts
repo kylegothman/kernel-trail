@@ -21,7 +21,7 @@ import type { Store } from '@game/store';
 import { classMultiplierFor, scoreFromRun, SCORE_WEIGHTS } from '@game/scoring';
 import { startingLedger } from '../travel/ledger';
 import { paceSpawnTransform } from '../travel/workload';
-import { createHeadlessSetupContext, resolveHeadlessLeg, type ConvoyBindings } from './headlessLegs';
+import { populateHeadless, resolveHeadlessLeg, type ConvoyBindings } from './headlessLegs';
 import { hashEventLog } from './hash';
 import { selectHighlights } from './highlights';
 import {
@@ -398,7 +398,7 @@ export function* replaySteps(request: ReplayRequest, options: ReplayOptions = {}
     const kernel = createKernel(config, kernelOptions);
     const bindings: ConvoyBindings = new Map();
     const policy = store.get().policy;
-    leg.populate(createHeadlessSetupContext(kernel, store.get(), streams.leg.fork(legId), bindings, paceSpawnTransform(policy.pace)));
+    populateHeadless(legId, (ctx) => { leg.populate(ctx); return true; }, kernel, store.get(), streams.leg.fork(legId), bindings, paceSpawnTransform(policy.pace));
     store.mutate((s) => {
       for (const m of s.convoy) m.pid = bindings.get(m.id) ?? null;
     });

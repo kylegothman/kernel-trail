@@ -12,11 +12,13 @@
  * so a crossing whose lock the leg never declares is caught before any run.
  */
 import type { ConvoyMemberId, Pid } from '@kernel/types';
+import type { Instruction } from '@kernel/process/Program';
 import type { CodexEntry } from '@game/codexTypes';
 import type { CrossingDef } from '@game/crossing/Crossing';
 import type { EpitaphTemplate } from '@game/convoy/derezz';
 import type { InteractionHandler } from '@game/RunDirector';
 import { initialRunState } from '@game/replay/runReplay';
+import type { ReplayKernel } from '@game/replay/types';
 import type { Leg, LegId, LegSetupContext, RunState } from '@game/types';
 import type { CommandRun } from '@terminal/registry';
 import type { LegLayout } from './layout';
@@ -28,6 +30,31 @@ import type { LegLayout } from './layout';
  * lists equal so they cannot drift.
  */
 export const LEG_DEFERRED_COMMANDS = ['hyper', 'guest', 'migrate', 'belady'] as const;
+
+/**
+ * WP-L04 ruling 1: the synchronisation workload a leg needs and `ProcessSpec`
+ * cannot carry.
+ *
+ * `populate` reaches the kernel only through `LegSetupContext`, which has no
+ * channel for a program, so every process a leg spawns runs a generated
+ * compute-and-access program. A leg that teaches synchronisation therefore has
+ * no way to make one of its own processes take a lock, and nothing it declares
+ * is ever contended. `programs` is keyed by `ProcessSpec.name`: a spawn whose
+ * name is present runs that instruction list instead of a generated program,
+ * and `install` runs once after `populate`, with the pids keyed by the same
+ * names, for the shared regions, cells and scenarios those programs read.
+ *
+ * Both frozen files stay untouched. The seam is here, beside the rest of the
+ * companion, and `createHeadlessSetupContext` is the one place that applies it,
+ * so the live runner, the checkpoint rollback, `resume` and the replay worker
+ * all populate identically.
+ */
+export interface LegWorkload {
+  /** Keyed by `ProcessSpec.name`. A name the leg never spawns is a `validateContent` problem. */
+  readonly programs: Readonly<Record<string, readonly Instruction[]>>;
+  /** Once after populate, with what populate spawned. The pids are the live kernel's. */
+  install?(kernel: ReplayKernel, spawned: ReadonlyMap<string, Pid>): void;
+}
 
 export interface LegContent {
   readonly legId: LegId;
@@ -45,6 +72,8 @@ export interface LegContent {
   readonly terminalHandlers: Readonly<Record<string, CommandRun>>;
   /** Renderer-free; the boot package builds the scene from it. */
   readonly layout: LegLayout;
+  /** Programs for the processes `populate` spawns, and the kernel state they read. */
+  readonly workload?: LegWorkload;
 }
 
 export interface LegModule {
@@ -57,6 +86,8 @@ interface Declarations {
   readonly sync: ReadonlySet<string>;
   readonly resources: ReadonlySet<string>;
   readonly bound: ReadonlySet<ConvoyMemberId>;
+  /** `ProcessSpec.name` per spawn, in spawn order, so a workload program can be matched to one. */
+  readonly spawned: ReadonlySet<string>;
   readonly error: string | null;
 }
 
@@ -77,11 +108,12 @@ export function recordDeclarations(leg: Leg, run: RunState = probeRunState(leg))
   const sync = new Set<string>();
   const resources = new Set<string>();
   const bound = new Set<ConvoyMemberId>();
+  const spawned = new Set<string>();
   let nextPid = 2;
   const ctx: LegSetupContext = {
     run,
     rng: probeRng(),
-    spawn: () => (nextPid++) as Pid,
+    spawn: (spec) => { spawned.add(spec.name); return (nextPid++) as Pid; },
     bind: (member) => { bound.add(member); },
     declareResource: (id) => { resources.add(id); },
     declareSync: (id) => { sync.add(id); },
@@ -89,9 +121,9 @@ export function recordDeclarations(leg: Leg, run: RunState = probeRunState(leg))
   try {
     leg.populate(ctx);
   } catch (error) {
-    return { sync, resources, bound, error: describe(error) };
+    return { sync, resources, bound, spawned, error: describe(error) };
   }
-  return { sync, resources, bound, error: null };
+  return { sync, resources, bound, spawned, error: null };
 }
 
 /** The run a leg's `populate` is probed against: the shared roster at the leg's index, the operator shell defaults. */
@@ -110,7 +142,9 @@ const list = (items: readonly string[]): string => `[${items.join(', ')}]`;
  * refuses it as unavailable), or a declared one with an integrity cost and no
  * target; a codex entry whose `unlock` names an objective the leg does not
  * declare; a terminal handler for a name outside `LEG_DEFERRED_COMMANDS`; and
- * a layout whose anchor set is not the interaction anchors plus its extras.
+ * a layout whose anchor set is not the interaction anchors plus its extras;
+ * and a workload program keyed by a name `populate` never spawns, which would
+ * never run (WP-L04 ruling 1).
  */
 export function validateContent(leg: Leg, content: LegContent): readonly string[] {
   const problems: string[] = [];
@@ -124,6 +158,14 @@ export function validateContent(leg: Leg, content: LegContent): readonly string[
   for (const def of content.crossings) {
     if (def.legId !== leg.id) problems.push(`crossing ${def.id}: legId ${def.legId} is not ${leg.id}`);
     if (!declared.sync.has(def.lockId)) problems.push(`crossing ${def.id}: lockId ${def.lockId} is never declared by populate; declareSync ids ${list([...declared.sync].sort())}`);
+  }
+
+  const workload = content.workload;
+  if (workload !== undefined) {
+    for (const name of Object.keys(workload.programs).sort()) {
+      if (!declared.spawned.has(name)) problems.push(`workload program ${name}: populate spawns no process with that name; spawn names ${list([...declared.spawned].sort())}`);
+      else if (workload.programs[name]?.length === 0) problems.push(`workload program ${name}: an empty instruction list would leave the process with no program`);
+    }
   }
 
   const interactionIds = new Set(leg.interactions.map((def) => def.id));

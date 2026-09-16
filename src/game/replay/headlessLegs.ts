@@ -11,6 +11,8 @@
  */
 
 import type { Leg, LegId, LegSetupContext, RunState, ProcessSpec } from '@game/types';
+import type { LegWorkload } from '@legs/content';
+import { instructionProgram } from '@kernel/process/Program';
 import { asResourceId, type ConvoyMemberId, type Pid, type Rng } from '@kernel/types';
 import type { HeadlessLeg, HeadlessLegFactory, ReplayHooks, ReplayKernel } from './types';
 
@@ -93,13 +95,17 @@ export function createHeadlessSetupContext(
   rng: Rng,
   bindings: ConvoyBindings,
   transform?: (spec: ProcessSpec) => ProcessSpec,
+  workload?: LegWorkload | null,
+  spawned?: Map<string, Pid>,
 ): LegSetupContext {
   return {
     run,
     rng: { next: () => rng.next(), int: (a, b) => rng.int(a, b) },
     spawn: (spec) => {
       const transformed = transform === undefined ? spec : transform(spec);
-      return kernel.spawn(
+      // WP-L04 ruling 1: a named workload program replaces the generated one.
+      const instructions = workload?.programs[transformed.name];
+      const pid = kernel.spawn(
         {
           name: transformed.name,
           priority: transformed.priority,
@@ -109,8 +115,13 @@ export function createHeadlessSetupContext(
           pages: transformed.pages,
           ...(transformed.referenceString === undefined ? {} : { referenceString: transformed.referenceString }),
         },
-        transformed.serialFraction === undefined ? {} : { serialFraction: transformed.serialFraction },
+        {
+          ...(transformed.serialFraction === undefined ? {} : { serialFraction: transformed.serialFraction }),
+          ...(instructions === undefined ? {} : { program: instructionProgram(instructions) }),
+        },
       );
+      spawned?.set(transformed.name, pid);
+      return pid;
     },
     bind: (member, pid) => {
       bindings.set(member, pid);
@@ -138,4 +149,59 @@ export function createHeadlessSetupContext(
       }
     },
   };
+}
+
+/* ------------------------------------------------------------------ */
+/* WP-L04 ruling 1: the workload registry and the populate path        */
+/* ------------------------------------------------------------------ */
+
+/**
+ * A leg's workload has to be in hand before `populate` runs, and a leg's
+ * `LegContent` does not reach the runner until `enter`'s configure callback,
+ * which runs after it. So a leg module that ships a workload registers it here
+ * at import, exactly as `registerHeadlessLeg` is registered, and
+ * `populateHeadless` looks it up by id. `LegContent.workload` stays the single
+ * source: the leg registers that object and nothing else.
+ */
+const LEG_WORKLOADS = new Map<LegId, LegWorkload>();
+
+/** Install a leg's workload. Returns the undo, so a test can remove it. */
+export function registerLegWorkload(id: LegId, workload: LegWorkload | undefined): () => void {
+  const previous = LEG_WORKLOADS.get(id);
+  if (workload === undefined) LEG_WORKLOADS.delete(id);
+  else LEG_WORKLOADS.set(id, workload);
+  return () => {
+    if (previous === undefined) LEG_WORKLOADS.delete(id);
+    else LEG_WORKLOADS.set(id, previous);
+  };
+}
+
+export function legWorkload(id: LegId): LegWorkload | null {
+  return LEG_WORKLOADS.get(id) ?? null;
+}
+
+/**
+ * The one populate path. `populate` is the caller's own invocation, sandboxed
+ * or raw, and its boolean is returned unchanged; the leg's registered workload
+ * supplies programs at spawn and `install` runs once after a populate that
+ * succeeded, never after one that threw.
+ */
+export function populateHeadless(
+  legId: LegId,
+  populate: (ctx: LegSetupContext) => boolean,
+  kernel: ReplayKernel,
+  run: RunState,
+  rng: Rng,
+  bindings: ConvoyBindings,
+  transform?: (spec: ProcessSpec) => ProcessSpec,
+): boolean {
+  const workload = legWorkload(legId);
+  const spawned = new Map<string, Pid>();
+  const ok = populate(createHeadlessSetupContext(kernel, run, rng, bindings, transform, workload, spawned));
+  // A workload belongs to its own leg's processes. A harness suite may register
+  // a synthetic leg under a real id, and that leg spawns none of them, so there
+  // is nothing here to install and installing it would throw on the first name.
+  const mine = workload !== null && Object.keys(workload.programs).some((name) => spawned.has(name));
+  if (ok && workload !== null && mine) workload.install?.(kernel, spawned);
+  return ok;
 }
