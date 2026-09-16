@@ -36,6 +36,9 @@ export interface ShellOptions {
   readonly handlers?: ReadonlyMap<string, ShippedHandler>;
 }
 
+/** The audit hook's listener: the command named, the words after it, and what the shell returned. */
+export type CommandListener = (name: string, argv: readonly string[], result: CommandResult) => void;
+
 /**
  * The caller identity rule for syscalls the terminal issues (pre-flight F3).
  * The kernel has no shell process, so a command issues each call as the process
@@ -64,6 +67,7 @@ export class Shell {
   readonly history = new History();
   readonly rings: EventRings;
   private readonly ownsRings: boolean;
+  private readonly listeners = new Set<CommandListener>();
 
   constructor(readonly host: TerminalHost, options: ShellOptions = {}) {
     this.registry = new CommandRegistry(options.handlers ?? SHIPPED_HANDLERS);
@@ -75,12 +79,30 @@ export class Shell {
   registerAll(defs: readonly TerminalCommandDef[]): void { for (const def of defs) this.registry.register(def); }
   registerHandler(name: string, run: CommandRun): void { this.registry.registerHandler(name, run); }
 
+  /**
+   * The audit hook (WP-21 section 4, the one WP-19's R3 named as missing):
+   * called once after every submission that names a command, successful or
+   * failed, including an unknown name. A parse error and an empty line name
+   * no command and do not fire. The codex and the boot package's
+   * `kernel_space` read-cost rule listen here.
+   */
+  onCommand(listener: CommandListener): () => void {
+    this.listeners.add(listener);
+    return () => { this.listeners.delete(listener); };
+  }
+
   execute(line: string): CommandResult {
     this.history.push(line);
     const parsed = parse(line);
     if (!parsed.ok) return { ok: false, message: parsed.message, topic: PARSER_TOPIC };
     if (parsed.line === null) return ok([]);
     const { command: name, argv, flags } = parsed.line;
+    const result = this.dispatch(line, name, argv, flags);
+    for (const listener of this.listeners) listener(name, argv, result);
+    return result;
+  }
+
+  private dispatch(line: string, name: string, argv: readonly string[], flags: readonly string[]): CommandResult {
     const command = this.registry.get(name);
     if (command === undefined) {
       const candidate = nearest(name, this.registry.names()) ?? PARSER_TOPIC;

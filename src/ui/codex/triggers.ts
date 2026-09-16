@@ -4,9 +4,10 @@
  *
  * Four signal kinds derive from what the codex can see on its own: kernel
  * events (the `event` and `termination` unlocks), the convoy's afflictions
- * and the objectives met (watched on the run store). Two are facts only the
- * leg runner knows and reports through `Codex.signal`: a crossing option
- * taken and a leg completed.
+ * and the objectives met (watched on the run store). Four are facts the host
+ * reports through `Codex.signal`: a crossing option taken and a leg completed
+ * from the leg runner, a command submitted from the shell's `onCommand` hook,
+ * and a metric read from the telemetry store once per tick (WP-21 section 5).
  *
  * `structureFor` names the world structure a pathology plays out on, so the
  * codex can ask whether it is on screen before offering the entry.
@@ -21,9 +22,21 @@ export type CodexSignal =
   | { readonly kind: 'affliction'; readonly id: AfflictionId }
   | { readonly kind: 'objective'; readonly id: string }
   | { readonly kind: 'crossing'; readonly option: 'spin' | 'block' | 'monitor' | 'wait' }
-  | { readonly kind: 'leg_complete'; readonly leg: LegId };
+  | { readonly kind: 'leg_complete'; readonly leg: LegId }
+  | { readonly kind: 'command'; readonly name: string; readonly argv: readonly string[] }
+  | { readonly kind: 'metric'; readonly id: string; readonly value: number };
 
-export function matchesUnlock(unlock: CodexUnlock, signal: CodexSignal): boolean {
+/** A command signal that counts toward a `command` unlock: the name matches and the flag, when named, is in argv. */
+export function isCommandOccurrence(unlock: Extract<CodexUnlock, { kind: 'command' }>, signal: CodexSignal): boolean {
+  return signal.kind === 'command' && signal.name === unlock.name && (unlock.flag === undefined || signal.argv.includes(unlock.flag));
+}
+
+/**
+ * `occurrence` is which matching command submission this signal is for the
+ * entry, counted from 1 per entry by the codex; a `command` unlock with `nth`
+ * fires on exactly that one. `metric` compares strictly.
+ */
+export function matchesUnlock(unlock: CodexUnlock, signal: CodexSignal, occurrence = 1): boolean {
   switch (unlock.kind) {
     case 'event':
       return signal.kind === 'event' && signal.event.type === unlock.type;
@@ -37,6 +50,10 @@ export function matchesUnlock(unlock: CodexUnlock, signal: CodexSignal): boolean
       return signal.kind === 'crossing' && signal.option === unlock.option;
     case 'leg_complete':
       return signal.kind === 'leg_complete' && signal.leg === unlock.leg;
+    case 'command':
+      return isCommandOccurrence(unlock, signal) && (unlock.nth === undefined || occurrence === unlock.nth);
+    case 'metric':
+      return signal.kind === 'metric' && signal.id === unlock.id && signal.value > unlock.above;
     default:
       return assertNever(unlock);
   }
@@ -114,6 +131,8 @@ export function structureFor(unlock: CodexUnlock): HudStructureName | null {
     case 'objective':
     case 'crossing':
     case 'leg_complete':
+    case 'command':
+    case 'metric':
       return null;
     default:
       return assertNever(unlock);

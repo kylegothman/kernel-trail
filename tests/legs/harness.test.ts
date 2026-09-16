@@ -16,16 +16,18 @@ import { createSyntheticLeg } from '../game/fixtures/syntheticLeg';
 import {
   assertClean, assertHeadless, remainderHashAfter, runLeg, type HarnessResult,
 } from './harness/LegHarness';
-import { assertLegShape, loadLegForTest, loadShippedSet, REPO_ROOT, scanForbiddenImports, tryLoadLegForTest } from './harness/loadLeg';
+import { assertLegShape, contentOf, loadLegForTest, loadShippedSet, REPO_ROOT, scanForbiddenImports, tryLoadLegForTest } from './harness/loadLeg';
+import type { LegModule } from '@legs/content';
 import { makeConvoy, makeRunState } from './harness/makeRunState';
 import { validateScript, type DecisionScript } from './harness/decisionScript';
 import { CompetentPolicy, competentCrossingChoice, ScriptedDecisions, type DriverContext } from './harness/scriptedDecisions';
 import { expectOutcome, outcomeProblems } from './harness/expectOutcome';
 import { REQUIRED_EVENTS } from './harness/requiredEvents';
 import {
-  createHarnessLeg, FIXTURE_SEED, HARNESS_CROSSING, HARNESS_LEG_ID, HARNESS_OBJECTIVE_IDS,
+  createHarnessLeg, FIXTURE_SEED, HARNESS_CONTENT, HARNESS_CROSSING, HARNESS_LEG_ID, HARNESS_OBJECTIVE_IDS,
   KNOWN_BAD_EXPECTATION, KNOWN_BAD_SCRIPT, KNOWN_GOOD_EXPECTATION, KNOWN_GOOD_SCRIPT,
 } from './harness/syntheticLeg';
+import { SHARED_EPITAPHS } from '@legs/epitaphs';
 
 const HARNESS_DIR = resolve(REPO_ROOT, 'tests', 'legs', 'harness');
 const script = (steps: DecisionScript['steps'], patch: Partial<DecisionScript> = {}): DecisionScript => ({ legId: HARNESS_LEG_ID, label: 'case', crossings: [HARNESS_CROSSING], steps, ...patch });
@@ -54,9 +56,23 @@ describe('loading', () => {
     const missing = await firstUnshipped();
     if (missing === null) console.log('harness: every leg has shipped; the unshipped-id half of this case has nothing to exercise');
     else await expect(loadLegForTest(missing)).rejects.toThrow(missing);
-    const synthetic = await loadLegForTest(HARNESS_LEG_ID, { indexPath: join(HARNESS_DIR, 'syntheticLeg.ts'), loader: async () => ({ default: createHarnessLeg() }) });
+    const synthetic = await loadLegForTest(HARNESS_LEG_ID, { indexPath: join(HARNESS_DIR, 'syntheticLeg.ts'), loader: async () => ({ default: createHarnessLeg(), content: HARNESS_CONTENT }) });
     expect(synthetic.id).toBe(HARNESS_LEG_ID);
     expect(synthetic.index).toBe(LEG_ORDER.indexOf(HARNESS_LEG_ID));
+  });
+
+  it('returns the companion, and fails at load on a validateContent problem naming it (WP-21 acceptance 8)', async () => {
+    const options = { indexPath: join(HARNESS_DIR, 'syntheticLeg.ts') };
+    const loaded = await tryLoadLegForTest(HARNESS_LEG_ID, { ...options, loader: async () => ({ default: createHarnessLeg(), content: HARNESS_CONTENT }) });
+    expect(loaded.shipped).toBe(true);
+    if (loaded.shipped) {
+      expect(loaded.content).toBe(HARNESS_CONTENT);
+      expect(contentOf(loaded.leg)).toBe(HARNESS_CONTENT);
+    }
+    const undeclaredLock = { ...HARNESS_CONTENT, crossings: [{ ...HARNESS_CROSSING, lockId: 'no_such_lock' }] };
+    await expect(tryLoadLegForTest(HARNESS_LEG_ID, { ...options, loader: async () => ({ default: createHarnessLeg(), content: undeclaredLock }) })).rejects.toThrow(/fork_fields.*content is invalid[\s\S]*lockId no_such_lock is never declared/);
+    const noCompanion = { default: createHarnessLeg() } as unknown as LegModule;
+    await expect(tryLoadLegForTest(HARNESS_LEG_ID, { ...options, loader: async () => noCompanion })).rejects.toThrow(/fork_fields: content export is undefined/);
   });
 
   it('try load: an unshipped id returns shipped false with the missing path', async () => {
@@ -69,7 +85,7 @@ describe('loading', () => {
 
   it('asserts the shape on load, naming the field', async () => {
     const wrongIndex = { ...createHarnessLeg(), index: 3 };
-    await expect(loadLegForTest(HARNESS_LEG_ID, { indexPath: join(HARNESS_DIR, 'syntheticLeg.ts'), loader: async () => ({ default: wrongIndex }) })).rejects.toThrow(/index/);
+    await expect(loadLegForTest(HARNESS_LEG_ID, { indexPath: join(HARNESS_DIR, 'syntheticLeg.ts'), loader: async () => ({ default: wrongIndex, content: HARNESS_CONTENT }) })).rejects.toThrow(/index/);
     const wrongId = { ...createHarnessLeg(), id: 'the_weave' as LegId };
     expect(() => assertLegShape(wrongId, HARNESS_LEG_ID)).toThrow(/id/);
     const noEvaluate = { ...createHarnessLeg(), evaluate: undefined as unknown as Leg['evaluate'] };
@@ -83,7 +99,7 @@ describe('loading', () => {
   it('forbidden import: a synthetic leg importing three fails at load with a message naming the import', async () => {
     const forbidden = join(HARNESS_DIR, 'forbidden', 'index.ts');
     expect(existsSync(forbidden)).toBe(true);
-    await expect(tryLoadLegForTest(HARNESS_LEG_ID, { indexPath: forbidden, loader: () => import('./harness/forbidden/index') })).rejects.toThrow(/imports three at module scope/);
+    await expect(tryLoadLegForTest(HARNESS_LEG_ID, { indexPath: forbidden, loader: async () => ({ ...(await import('./harness/forbidden/index')), content: HARNESS_CONTENT }) })).rejects.toThrow(/imports three at module scope/);
     expect(scanForbiddenImports("import type { Vector3 } from 'three';\n// import { Mesh } from 'three'\nconst x = 1;")).toEqual([]);
     expect(scanForbiddenImports("import {\n  Mesh,\n} from 'three/webgpu';")).toEqual(['three/webgpu']);
     expect(scanForbiddenImports("export * from '@world/index';\nimport '@audio';\nimport { a } from '../../render/x';")).toEqual(['@world/index', '@audio', '../../render/x']);
@@ -169,6 +185,35 @@ describe('the run loop', () => {
     expect(result.wallMs).toBeGreaterThan(0);
     expect(result.maxTickMs).toBeGreaterThan(0);
     expect(result.maxTickMs).toBeLessThan(result.wallMs);
+  });
+
+  it('applies the companion: its crossing and interaction resolve with no script list and no HarnessOptions.crossings, and a script overrides by id (WP-21 acceptance 9)', async () => {
+    const bare: DecisionScript = { legId: HARNESS_LEG_ID, label: 'companion only', steps: [
+      { at: 10, command: { kind: 'interaction', id: 'vault_inspect', anchor: 'vault' } },
+      { at: 15, crossing: 'vault_gate', option: 'block' },
+    ] };
+    const result = await runLeg(createHarnessLeg(), { seed: 18, script: bare });
+    assertClean(result);
+    expect(result.crossings.map((crossing) => crossing.def.id)).toEqual(['vault_gate']);
+    expect(result.crossings[0]?.def.crosser).toBe('lumen');
+    expect(result.decisions.filter((decision) => decision.kind === 'interaction').map((decision) => decision.outcome)).toEqual(['pending']);
+    expect(result.notes.some((note) => /is not declared/.test(note))).toBe(false);
+    expect(result.unfiredSteps).toEqual([]);
+    // Without the companion the same script finds neither: the crossing step is skipped and the interaction is refused as costly.
+    const stripped = await runLeg({ ...createHarnessLeg() }, { seed: 18, script: bare });
+    expect(stripped.crossings).toEqual([]);
+    expect(stripped.notes.some((note) => /crossing vault_gate is not declared/.test(note))).toBe(true);
+    expect(stripped.decisions.filter((decision) => decision.kind === 'interaction').map((decision) => decision.outcome)).toEqual(['costly']);
+    // A script def with the companion's id replaces it, and the explicit content option wins over the remembered one.
+    const overridden = await runLeg(createHarnessLeg(), { seed: 18, script: { ...bare, crossings: [{ ...HARNESS_CROSSING, crosser: 'sable' }] } });
+    assertClean(overridden);
+    expect(overridden.crossings[0]?.def.crosser).toBe('sable');
+    const explicit = await runLeg({ ...createHarnessLeg() }, { seed: 18, script: bare, content: HARNESS_CONTENT });
+    assertClean(explicit);
+    expect(explicit.logHash).toBe(result.logHash);
+    const restored = await runLeg(createHarnessLeg(), { seed: 18, script: bare, restoreAt: 12 });
+    assertClean(restored);
+    expect(restored.logHash).toBe(result.logHash);
   });
 });
 
@@ -345,6 +390,9 @@ describe('expectations', () => {
     assertClean(bad);
     expect(outcomeProblems(bad, KNOWN_BAD_EXPECTATION)).toEqual([]);
     expect(bad.run.tombstones.map((stone) => `${stone.member}:${stone.reason}`)).toEqual(['lumen:starvation']);
+    // The stone is one of the shared forty-eight (WP-21 section 6), with the name substituted.
+    const starvation = SHARED_EPITAPHS.filter((stone) => stone.reason === 'starvation').map((stone) => stone.inscription.replaceAll('{NAME}', 'LUMEN'));
+    expect(starvation).toContain(bad.run.tombstones[0]?.inscription);
   });
 
   it('expect subset: omitted expectation fields are not checked', async () => {
@@ -460,7 +508,7 @@ import { KNOWN_BAD_SCRIPT as BAD, KNOWN_GOOD_SCRIPT as GOOD } from './harness/sy
 /** Built from code points so the contract guard, which scans for the literal characters, never trips on this file. */
 const DASHES = new RegExp(`[${String.fromCharCode(0x2014)}${String.fromCharCode(0x2013)}]`);
 const fixture = (path: 'good' | 'bad', patch: Partial<LegFixture> = {}): LegFixture => ({
-  legId: HARNESS_LEG_ID, path, seed: CONTRACT_SEED, discClass: 'shell', difficulty: 'operator', pace: 'steady', rations: 'standard',
+  legId: HARNESS_LEG_ID, path, failureMode: 'casualty', seed: CONTRACT_SEED, discClass: 'shell', difficulty: 'operator', pace: 'steady', rations: 'standard',
   enteringLedger: { cycles: 1600, quota: 900, blocks: 120, bandwidth: 60 }, enteringDecisions: [],
   script: path === 'good' ? GOOD : BAD, expect: path === 'good' ? KNOWN_GOOD_EXPECTATION : KNOWN_BAD_EXPECTATION, ...patch,
 });
@@ -655,6 +703,30 @@ describe('the fixture contract', () => {
     expect(checkFixtureRun(syntheticFixtures.knownGood, panicked, leg)).toEqual(expect.arrayContaining([expect.stringMatching(/the run panicked/)]));
   });
 
+  it('failureMode costly: the section 7 rules replace the casualty rules for the known-bad path, and a leg other than boot_sector is warned (WP-21 acceptance 10)', async () => {
+    const leg = createHarnessLeg();
+    const errors = (f: LegFixture): readonly string[] => validateFixture(f, leg).filter((problem) => !isWarning(problem));
+    const costlyExpect = { survived: true, decisionOutcomes: [{ kind: 'interaction', outcome: 'costly' as const }], eventTypesPresent: ['context.switch'] };
+    const costly = fixture('bad', { failureMode: 'costly', script: { ...BAD, steps: [{ at: 10, command: { kind: 'interaction', id: 'console_query', anchor: 'console' } }] }, expect: costlyExpect });
+    expect(errors(costly)).toEqual([]);
+    expect(validateFixture(costly, leg)).toEqual([expect.stringMatching(/^warning: .*failureMode costly is written for boot_sector/)]);
+    const boot = fixture('bad', { ...costly, legId: 'boot_sector', script: { ...costly.script, legId: 'boot_sector', crossings: [] }, enteringLedger: { cycles: 1600, quota: 900, blocks: 120, bandwidth: 60 } });
+    expect(validateFixture(boot)).toEqual([]);
+    expect(errors(fixture('bad', { ...costly, expect: { survived: true, eventTypesPresent: ['context.switch'] } }))).toEqual([expect.stringMatching(/decision marked costly/)]);
+    expect(errors(fixture('bad', { ...costly, expect: { decisionOutcomes: costlyExpect.decisionOutcomes, eventTypesPresent: ['context.switch'] } }))).toEqual([expect.stringMatching(/survived true/)]);
+    expect(errors(fixture('bad', { ...costly, expect: { survived: true, decisionOutcomes: costlyExpect.decisionOutcomes } }))).toEqual([expect.stringMatching(/resourceDelta bound or an eventTypesPresent list/)]);
+    expect(errors(fixture('bad', { ...costly, expect: { survived: true, decisionOutcomes: costlyExpect.decisionOutcomes, resourceDelta: { cycles: { max: -1 } } } }))).toEqual([]);
+    expect(errors(fixture('bad', { ...costly, expect: { survived: true, decisionOutcomes: costlyExpect.decisionOutcomes, resourceDelta: { cycles: {} } } }))).toEqual([expect.stringMatching(/resourceDelta bound/)]);
+    // A run on a leg with no companion refuses the interaction, which the bus marks costly; the convoy survives.
+    const stripped = { ...leg };
+    const run = await runFixture(costly, stripped);
+    assertClean(run);
+    expect(checkFixtureRun(costly, run, stripped)).toEqual([]);
+    const good = await runFixture(syntheticFixtures.knownGood, leg);
+    expect(checkFixtureRun(costly, good, leg)).toEqual(expect.arrayContaining([expect.stringMatching(/marked no decision costly/)]));
+    expect(checkFixtureRun(syntheticFixtures.knownBad, run, stripped)).toEqual(expect.arrayContaining([expect.stringMatching(/produced no casualty/)]));
+  });
+
   it('loadFixtures returns null for a leg without a fixture module and reads a module with exactly two exports', async () => {
     const missing = await firstUnshipped();
     if (missing !== null) expect(await loadFixtures(missing)).toBeNull();
@@ -735,6 +807,8 @@ describe('the journey over synthetic legs', () => {
       expect(first.journeyHash).toBe(journeyHashOf(first.legs.map((result) => result.logHash), first.finalRun));
       expect(first.journeyHash).toMatch(/^[0-9a-f]{16}$/);
       expect(first.skipped).toEqual(LEG_ORDER.slice(3));
+      expect(first.handoffs.map((observation) => observation.handoff)).toEqual([1, 2, 3, 4, 5, 6]);
+      expect(first.handoffs.every((observation) => observation.status === 'skipped')).toBe(true);
       expect(first.finalRun.legIndex).toBe(3);
       expect(first.finalRun.status).toBe('in_progress');
       expect(first.survivors).toBe(5);
@@ -797,6 +871,7 @@ describe('the journey over synthetic legs', () => {
     const legs: Leg[] = [];
     for (const [index, id] of LEG_ORDER.slice(0, 13).entries()) {
       if (id === 'the_cistern') legs.push(handoffLeg(id, index, [{ ...pending('ring_closed', '41'), outcome: 'good' }]));
+      else if (id === 'the_narrows') legs.push(handoffLeg(id, index, [{ ...pending('manifest_seed', 'corrupted'), outcome: 'good' }]));
       else if (id === 'allocation_yards') legs.push(handoffLeg(id, index, [pending('executable_bit', 'left_set')]));
       else if (id === 'the_bus') legs.push(handoffLeg(id, index, [{ ...pending('device_attach', 'block'), outcome: 'good' }]));
       else if (id === 'the_archive') legs.push(handoffLeg(id, index, [{ ...pending('crash_outcome', 'recovered'), outcome: 'good' }, { ...pending('manifest_integrity', 'intact'), outcome: 'good' }]));
@@ -820,25 +895,32 @@ describe('the journey over synthetic legs', () => {
       expect(byNumber.get(4)?.producerWrote).toEqual(['crash_outcome', 'manifest_integrity']);
       expect(byNumber.get(5)?.status).toBe('skipped');
       expect(byNumber.get(5)?.reason).toContain('the_portal did not run');
+      // Hand-off 6 (WP-21 section 8): the Narrows seeds the Archive's manifest.
+      expect(byNumber.get(6)?.status).toBe('observed');
+      expect(byNumber.get(6)?.producerWrote).toEqual(['manifest_seed']);
+      expect(byNumber.get(6)?.writeBack).toBeNull();
       expect(journey.finalRun.decisions.filter((record) => record.kind === 'executable_bit').map((record) => record.outcome)).toEqual(['costly']);
       const check = replayJourney(journey, base);
       expect(check.problems).toEqual([]);
-      expect(check.handoffRecords).toBe(7);
-      expect(check.skippedDecisions).toBe(7);
+      expect(check.handoffRecords).toBe(8);
+      expect(check.skippedDecisions).toBe(8);
       const restored = await runJourney({ ...base, restoreAtBoundaries: true });
       try {
         expect(restored.journeyHash).toBe(journey.journeyHash);
-        expect(restored.finalRun.decisions.filter((record) => HANDOFFS.some((spec) => spec.kinds.includes(record.kind)))).toHaveLength(7);
+        expect(restored.finalRun.decisions.filter((record) => HANDOFFS.some((spec) => spec.kinds.includes(record.kind)))).toHaveLength(8);
       } finally {
         restored.release();
       }
     } finally {
       journey.release();
     }
-    const silent = await runJourney({ ...base, legs: legs.map((leg) => (leg.id === 'the_cistern' ? createSyntheticLeg({ id: 'the_cistern', index: 5, processes: 2, service: [20, 40] }) : leg)) });
+    const quiet = (id: LegId, index: number): Leg => createSyntheticLeg({ id, index, processes: 2, service: [20, 40] });
+    const silent = await runJourney({ ...base, legs: legs.map((leg) => (leg.id === 'the_cistern' ? quiet('the_cistern', 5) : leg.id === 'the_narrows' ? quiet('the_narrows', 4) : leg)) });
     try {
       expect(silent.handoffs.find((observation) => observation.handoff === 1)?.status).toBe('defaulted');
       expect(silent.handoffs.find((observation) => observation.handoff === 1)?.reason).toContain('fell back to its default');
+      expect(silent.handoffs.find((observation) => observation.handoff === 6)?.status).toBe('defaulted');
+      expect(silent.handoffs.find((observation) => observation.handoff === 6)?.reason).toContain('the archive opens with an intact manifest');
     } finally {
       silent.release();
     }

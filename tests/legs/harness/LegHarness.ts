@@ -16,10 +16,15 @@
  * provisional save and the live director's snapshot, a fresh runner
  * re-entered from `replayEntry`, then `kernel.restore`, `director.restore`,
  * the store from `file.run` and the streams from `file.rngStates`.
+ *
+ * WP-21 section 6: the leg's `content` companion (remembered by the loader
+ * or given as `HarnessOptions.content`) is applied through `enter`'s
+ * configure parameter, its stones ride ahead of the shared forty-eight in
+ * the epitaph source, and a `DecisionScript`'s own crossings and
+ * interactions add to or override the companion's by id.
  */
 import { createKernel, type KernelConfig, type KernelEvent, type SubsystemId } from '@kernel/index';
 import { CommandBus, type KernelMutators } from '@game/CommandBus';
-import type { EpitaphCopySource } from '@game/convoy/derezz';
 import type { CrossingDef, CrossingResult } from '@game/crossing/Crossing';
 import { LegRunner, type LegEvent, type LegRunOptions } from '@game/LegRunner';
 import type { LegFailure } from '@game/LegSandbox';
@@ -28,7 +33,10 @@ import { createRunStreams, restoreRunStreams, type ReplayEntry, type ReplayKerne
 import { createRunStore, type RunStore } from '@game/runStore';
 import type { SaveFileInput } from '@game/save';
 import type { DecisionRecord, Leg, LegId, LegOutcome, ResourceLedger, RunState, StageContext } from '@game/types';
-import type { DecisionScript, ScriptInteraction, ScriptStep } from './decisionScript';
+import type { LegContent } from '@legs/content';
+import { sharedEpitaphSource } from '@legs/epitaphs';
+import type { DecisionScript, ScriptStep } from './decisionScript';
+import { contentOf } from './loadLeg';
 import { makeRunState } from './makeRunState';
 import { makeDriver, type Driver, type DriverContext, type PolicyName } from './scriptedDecisions';
 
@@ -37,11 +45,6 @@ export const DEFAULT_MAX_TICKS = 20_000;
 export const DEFAULT_THROUGHPUT_TARGET = 0.1;
 export const HARNESS_BUILD_ID = 'wp20-harness';
 export const HARNESS_SAVED_AT = '2026-09-16T00:00:00.000Z';
-
-/** One test-time template per termination reason; the epitaph copy package supplies the real ones. */
-export const HARNESS_EPITAPHS: EpitaphCopySource = {
-  templates: (reason) => [{ id: `harness.${reason}`, reason, inscription: '{NAME} stopped.', cause: reason, codexEntry: `harness.${reason}` }],
-};
 
 export interface ScheduledCrossing {
   readonly at: number;
@@ -60,6 +63,8 @@ export interface HarnessOptions {
   /** Policy runs: crossings opened at `at`, the option chosen by the policy (ruling F3). */
   readonly crossings?: readonly ScheduledCrossing[];
   readonly throughputTarget?: number;
+  /** The companion to apply at entry; the one the loader remembered for this leg object when omitted (WP-21 section 6). */
+  readonly content?: LegContent;
 }
 
 export interface RestoreReport {
@@ -132,6 +137,8 @@ export class HarnessSession {
   readonly persisted: { readonly kind: 'boundary' | 'provisional'; readonly input: SaveFileInput }[] = [];
   /** While the runner reconstructs side state inside `resume`, sandbox failures are notes, not leg failures. */
   resuming = false;
+  /** The companion in force for the current leg; its stones are served ahead of the shared forty-eight. */
+  content: LegContent | null = null;
   private unsubscribe: (() => void) | null = null;
 
   constructor(readonly seed: number, run: RunState, readonly throughputTarget: number, collectors: Collectors = createCollectors()) {
@@ -173,7 +180,7 @@ export class HarnessSession {
       streams: this.streams,
       onEvent: () => undefined,
       replay: null,
-      epitaphs: HARNESS_EPITAPHS,
+      epitaphs: { templates: (reason) => sharedEpitaphSource(this.content?.epitaphs ?? []).templates(reason) },
       persist: (input, kind) => { this.persisted.push({ kind, input }); },
       buildId: HARNESS_BUILD_ID,
       savedAtIso: () => HARNESS_SAVED_AT,
@@ -252,7 +259,15 @@ function failedOutcome(leg: Leg, reason: string): LegOutcome {
   };
 }
 
-function restoreMidLeg(session: HarnessSession, leg: Leg, legOpts: LegRunOptions, crossings: readonly CrossingDef[], interactions: readonly ScriptInteraction[]): { readonly session: HarnessSession; readonly seq: number } {
+/** The script's crossings over the companion's: a script def with the same id replaces the companion's (WP-21 section 6). */
+export function mergeCrossings(companion: readonly CrossingDef[], script: readonly CrossingDef[]): readonly CrossingDef[] {
+  const byId = new Map<string, CrossingDef>();
+  for (const def of companion) byId.set(def.id, def);
+  for (const def of script) byId.set(def.id, def);
+  return [...byId.values()];
+}
+
+function restoreMidLeg(session: HarnessSession, leg: Leg, legOpts: LegRunOptions, configure: (runner: LegRunner) => void): { readonly session: HarnessSession; readonly seq: number } {
   const director = session.runner.director;
   const entry = session.runner.replayEntry;
   if (director === null || entry === null) throw new Error('restoreAt: no active leg to snapshot');
@@ -261,10 +276,9 @@ function restoreMidLeg(session: HarnessSession, leg: Leg, legOpts: LegRunOptions
   const directorState = director.snapshot();
   session.detach();
   const next = new HarnessSession(session.seed, structuredClone(entry.run), session.throughputTarget, session.collectors);
+  next.content = session.content;
   restoreRunStreams(next.streams, entry.rngStates);
-  next.runner.registerCrossings(crossings);
-  next.runner.enter(leg, legOpts);
-  for (const interaction of interactions) next.runner.registerInteraction(interaction.id, NOOP_HANDLER, interaction.target);
+  next.runner.enter(leg, legOpts, configure);
   const kernel = next.runner.kernel;
   const nextDirector = next.runner.director;
   if (kernel === null || nextDirector === null) throw new Error('restoreAt: the leg could not be re-entered');
@@ -286,9 +300,17 @@ export function runLegInSession(session: HarnessSession, leg: Leg, opts: Harness
   assertHeadless();
   const maxTicks = opts.maxTicks ?? DEFAULT_MAX_TICKS;
   const legOpts: LegRunOptions = { maxTicks, stageContext: null };
-  const driver: Driver = makeDriver(opts.script, opts.policy, opts.seed);
-  const crossings = opts.script?.crossings ?? [];
+  const content = opts.content ?? contentOf(leg);
+  const scriptCrossings = opts.script?.crossings ?? [];
+  const crossings = mergeCrossings(content?.crossings ?? [], scriptCrossings);
+  const driver: Driver = makeDriver(opts.script === undefined ? undefined : { ...opts.script, crossings }, opts.policy, opts.seed);
   const interactions = opts.script?.interactions ?? [];
+  /** The companion first, then the script's additions and overrides, once the director exists (section 6). */
+  const configure = (runner: LegRunner): void => {
+    if (content !== null) runner.applyContent(content);
+    if (scriptCrossings.length > 0) runner.registerCrossings(crossings);
+    for (const interaction of interactions) runner.registerInteraction(interaction.id, NOOP_HANDLER, interaction.target);
+  };
   const scheduled = (opts.crossings ?? []).map((entry) => ({ ...entry, done: false }));
   const collectors = session.collectors;
   const start = {
@@ -301,13 +323,9 @@ export function runLegInSession(session: HarnessSession, leg: Leg, opts: Harness
   let maxTickMs = 0;
   let current = session;
   const wrapped = instrument(leg, () => { collectors.stageCalls += 1; });
-  if (!alreadyEntered) {
-    current.runner.registerCrossings(crossings);
-    current.runner.enter(wrapped, legOpts);
-  }
-  if (current.runner.currentLeg !== null && current.runner.director !== null) {
-    for (const interaction of interactions) current.runner.registerInteraction(interaction.id, NOOP_HANDLER, interaction.target);
-  }
+  current.content = content;
+  if (!alreadyEntered) current.runner.enter(wrapped, legOpts, configure);
+  else if (current.runner.currentLeg !== null && current.runner.director !== null) configure(current.runner);
   const entry = current.runner.replayEntry === null ? null : structuredClone(current.runner.replayEntry);
   const requireKernel = (): ReplayKernel => {
     const kernel = current.runner.kernel;
@@ -351,7 +369,7 @@ export function runLegInSession(session: HarnessSession, leg: Leg, opts: Harness
     if (collectors.panics.length > start.panics) break;
     const tick = kernel.tick;
     if (opts.restoreAt !== undefined && restore === null && tick >= opts.restoreAt) {
-      const restored = restoreMidLeg(current, wrapped, legOpts, crossings, interactions);
+      const restored = restoreMidLeg(current, wrapped, legOpts, configure);
       current = restored.session;
       restore = { at: tick, seq: restored.seq };
       continue;

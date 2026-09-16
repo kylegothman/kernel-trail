@@ -30,6 +30,7 @@ import { DEPOT_LEGS } from './travel/segments';
 import { paceSpawnTransform } from './travel/workload';
 import { LEG_ORDER, type Epitaph, type Leg, type LegId, type LegOutcome, type LegStage, type RunState, type SaveFile, type StageContext } from './types';
 import type { ReplayWorkerHandle } from './workers/ReplayWorkerHandle';
+import type { LegContent } from '@legs/content';
 
 export type LegPhase = 'entering' | 'travelling' | 'crossing' | 'depot' | 'reclamation' | 'evaluating' | 'complete';
 
@@ -187,7 +188,8 @@ export class LegRunner {
     return director;
   }
 
-  enter(leg: Leg, opts: LegRunOptions): void {
+  /** `configure` runs once the director exists and before the first tick, so a caller registers crossings and interactions there (WP-21 section 3). */
+  enter(leg: Leg, opts: LegRunOptions, configure?: (runner: LegRunner, leg: Leg) => void): void {
     if (!Number.isSafeInteger(opts.maxTicks) || opts.maxTicks < 0) throw new RangeError('maxTicks must be a non-negative integer.');
     this.activeDirector?.dispose(); this.stage?.dispose(); this.stage = null;
     this.activeDirector = null; this.installKernel(null);
@@ -218,6 +220,13 @@ export class LegRunner {
       this.pendingCheckpoint = null;
     }
     this.deps.persist(this.saveInput(null), 'boundary');
+    configure?.(this, leg);
+  }
+
+  /** The companion's crossings and interactions, and nothing else: its epitaphs and codex entries are the host's to register (WP-21 sections 5 and 8). */
+  applyContent(content: LegContent): void {
+    this.registerCrossings(content.crossings);
+    for (const [id, entry] of Object.entries(content.interactions)) this.registerInteraction(id, entry.run, entry.target);
   }
 
   private skip(leg: Leg, reason: string): void {

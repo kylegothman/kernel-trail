@@ -11,6 +11,8 @@
  */
 declare module '@legs/*' {
   import type { Leg } from '@game/types';
+  import type { LegContent } from '@legs/content';
   const leg: Leg;
   export default leg;
+  export const content: LegContent;
 }

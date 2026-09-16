@@ -89,7 +89,8 @@ describe('shell', () => {
     const hyper = DEFINED.get('hyper');
     if (hyper === undefined) throw new Error('hyper undefined');
     f.shell.register(hyper);
-    expect(() => f.shell.register(hyper)).toThrow(/already registered/);
+    expect(() => f.shell.register(hyper)).not.toThrow();
+    expect(() => f.shell.register({ ...hyper, summary: `${hyper.summary} (changed)` })).toThrow(/already registered with a different definition; first differing line: registered "summary: /);
     const before = expectError(f.shell, 'hyper --traps');
     expect(before.topic).toBe('hyper');
     f.shell.registerHandler('hyper', () => ({ ok: true, lines: ['handled by the leg'] }));
