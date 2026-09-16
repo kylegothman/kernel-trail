@@ -19,3 +19,8 @@ export type { ResolvedTopic, TopicKind } from './man/ManPages';
 export { ERRNO_CALLS, ERRNO_NAMES, errnoPage, isErrno, substitutedPage } from './man/errnoPages';
 export { syscallPage, errnosOf, CALL_WRAPPERS, CALL_PREFIX } from './man/syscallPages';
 export { CONCEPT_PAGES, CODEX_TOPIC, codexRedirect, isCodexReference, noPage } from './man/conceptPages';
+export { createTerminal } from './Terminal';
+export type { Terminal, TerminalOptions } from './Terminal';
+export { TerminalView, commonPrefix, DEFAULT_MAX_SCROLLBACK_LINES, DEFAULT_PROMPT } from './render/TerminalView';
+export type { LineKind, TerminalViewOptions } from './render/TerminalView';
+export { terminalStyles, TERMINAL_CLASS, FIELD_OPACITY } from './render/terminal.css';

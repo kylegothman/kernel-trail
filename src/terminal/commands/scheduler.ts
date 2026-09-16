@@ -187,7 +187,7 @@ const schedHandler: ShippedHandler = {
 };
 
 const niceHandler: ShippedHandler = {
-  completions: [{ flag: null, kind: 'pid' }],
+  completions: [{ flag: null, kind: 'pid' }, { flag: 'n', kind: 'value' }],
   run(argv, ctx: ShellContext) {
     const bound = bindOrFail('nice', argv, { n: 1 });
     if (!bound.ok) return bound;

@@ -24,7 +24,9 @@ export type CommandFailure = Extract<CommandResult, { readonly ok: false }>;
 /** Enumerable argument kinds a command declares so Tab completion can offer live values. */
 export type CompletionKind =
   | 'pid' | 'scheduler' | 'replacement' | 'disk' | 'allocation' | 'device' | 'resource' | 'primitive'
-  | 'syscall' | 'syscall-arg' | 'topic' | 'deadlock-strategy' | 'signal';
+  | 'syscall' | 'syscall-arg' | 'topic' | 'deadlock-strategy' | 'signal'
+  /** A flag that takes one value with nothing to enumerate, declared so the positional count stays right. */
+  | 'value';
 
 export interface ArgCompletion {
   /** The flag the value follows, or null for a positional argument. */

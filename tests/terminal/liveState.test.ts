@@ -4,14 +4,21 @@
  * a copy taken when the terminal opened. The DOM batching and scrollback cases
  * run under happy-dom, which counts nodes and mutations but does not lay out.
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { createKernel } from '@kernel/Kernel';
 import { instructionProgram } from '@kernel/process/Program';
 import type { Actor } from '@kernel/sync/SyncSubsystem';
 import { asPageId, asPid, asResourceId, asTick } from '@kernel/types';
 import type { Instruction } from '@kernel/process/Program';
 import { REFERENCE_CONFIG } from '../kernel/fixtures/referenceConfig';
-import { curriculumDefinitions, expectError, expectErrorsNameTopics, expectOk, makeFixture, makeKernel, runUntil } from './harness';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { createTerminalHost } from '@game/terminalHost';
+import { createTerminal } from '@terminal/Terminal';
+import { History } from '@terminal/history';
+import { TerminalView, commonPrefix } from '@terminal/render/TerminalView';
+import { curriculumDefinitions, expectError, expectErrorsNameTopics, expectOk, fixtureRun, makeFixture, makeKernel, recordingSink, ROOT, runUntil } from './harness';
+import { stripComments } from '../kernel/sourceScan';
 
 const DEFINED = curriculumDefinitions();
 function shellWith(names: readonly string[], kernel = makeKernel()) {
@@ -144,6 +151,154 @@ describe('live state', () => {
     expect(later[1]).not.toEqual(snapshot[1]);
     expect(later[1]?.find(line => line.startsWith('page faults'))).not.toBe(snapshot[1]?.find(line => line.startsWith('page faults')));
     expect(later[2]).not.toEqual(snapshot[2]);
+  });
+});
+
+
+function baseTerminal(kernel = makeKernel()) {
+  const run = fixtureRun();
+  const host = createTerminalHost(kernel, recordingSink(kernel, run), () => run);
+  const terminal = createTerminal(host, { document });
+  document.body.appendChild(terminal.element);
+  return { kernel, run, host, terminal };
+}
+
+function keydown(target: HTMLElement, key: string): void {
+  target.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }));
+}
+
+describe('terminal surface', () => {
+  it('dom batching: rendering 500 output lines performs one DOM batch, one appendChild of a fragment (acceptance 21)', () => {
+    const { terminal } = baseTerminal();
+    const output = terminal.view.outputElement;
+    const observer = new MutationObserver(() => {});
+    observer.observe(output, { childList: true });
+    const appends = vi.spyOn(output, 'appendChild');
+    terminal.view.append(Array.from({ length: 500 }, (_, index) => `line ${index}`));
+    expect(observer.takeRecords()).toHaveLength(0);
+    expect(appends).not.toHaveBeenCalled();
+    expect(terminal.view.lineCount).toBe(0);
+    terminal.flush();
+    // One appendChild of one DocumentFragment. happy-dom re-enters appendChild per child while inserting the
+    // fragment and reports a record per node where a browser reports one, so fragment calls are counted and
+    // record nodes are summed.
+    const fragments = (): number => appends.mock.calls.filter(call => call[0]?.nodeType === 11).length;
+    expect(fragments()).toBe(1);
+    const records = observer.takeRecords();
+    expect(records.reduce((sum, record) => sum + record.addedNodes.length, 0)).toBe(500);
+    expect(records.every(record => record.removedNodes.length === 0)).toBe(true);
+    expect(terminal.view.lineCount).toBe(500);
+    terminal.flush();
+    expect(fragments()).toBe(1);
+    expect(observer.takeRecords()).toHaveLength(0);
+    observer.disconnect();
+    appends.mockRestore();
+    terminal.dispose();
+  });
+
+  it('scrollback trims from the head at 2,000 lines and never exceeds it (acceptance 22)', () => {
+    const { terminal } = baseTerminal();
+    expect(terminal.view.maxScrollbackLines).toBe(2000);
+    terminal.view.append(Array.from({ length: 2100 }, (_, index) => `line ${index}`));
+    terminal.flush();
+    expect(terminal.view.lineCount).toBe(2000);
+    expect(terminal.view.outputElement.firstElementChild?.textContent).toBe('line 100');
+    terminal.view.append(Array.from({ length: 300 }, (_, index) => `more ${index}`));
+    terminal.flush();
+    expect(terminal.view.lineCount).toBe(2000);
+    expect(terminal.view.outputElement.firstElementChild?.textContent).toBe('line 400');
+    expect(terminal.view.outputElement.lastElementChild?.textContent).toBe('more 299');
+    const small = new TerminalView({ document, maxScrollbackLines: 3 });
+    small.append(['a', 'b', 'c', 'd', 'e']);
+    small.flush();
+    expect(small.lineCount).toBe(3);
+    expect(small.outputElement.firstElementChild?.textContent).toBe('c');
+    terminal.dispose();
+  });
+
+  it('completion offers command names, then enumerable argument values from the registry and CALL_SPECS (acceptance 23)', () => {
+    const { kernel, host, terminal } = baseTerminal();
+    const shell = terminal.shell;
+    expect(shell.complete('p').candidates).toEqual(['pagetable', 'ps']);
+    expect(shell.complete('').candidates).toHaveLength(14);
+    const pid = kernel.spawn({ name: 'target', priority: 1, arrival: 0, burst: 5, service: 5, pages: 0 }, { program: instructionProgram([{ kind: 'compute' }]) });
+    expect(shell.complete('kill ').candidates).toContain(String(pid));
+    expect(shell.complete('nice -n 3 ').candidates).toContain(String(pid));
+    expect(shell.complete('vmstat --policy ').candidates).toEqual([...host.specs.replacementPolicies].sort());
+    expect(shell.complete('man EA').candidates).toEqual(['EACCES', 'EAGAIN']);
+    expect(shell.complete('man ECH').candidates).toEqual(['ECHILD']);
+    shell.registerAll([...curriculumDefinitions().values()].filter(def => ['sched', 'seekq', 'syscall', 'iomode'].includes(def.name)));
+    expect(shell.complete('sched --policy s').candidates).toEqual(['sjf', 'srtf']);
+    expect(shell.complete('seekq --policy c').candidates).toEqual(['clook', 'cscan']);
+    expect(shell.complete('syscall ').candidates).toEqual([...host.specs.names].sort());
+    expect(shell.complete('syscall kill ').candidates).toContain(String(pid));
+    expect(shell.complete('syscall ioctl ').candidates).toContain('tty0');
+    expect(shell.complete('iomode --device t').candidates).toEqual(['tty0']);
+    expect(shell.complete('nosuch ').candidates).toEqual([]);
+    expect(commonPrefix(['pstree', 'ps', 'pagetable'])).toBe('p');
+    terminal.dispose();
+  });
+
+  it('input: Enter runs the line, Up recalls it, Tab completes, Escape closes', () => {
+    const { terminal } = baseTerminal();
+    const input = terminal.view.inputElement;
+    terminal.open();
+    expect(terminal.isOpen).toBe(true);
+    input.value = 'ps';
+    keydown(input, 'Enter');
+    expect(input.value).toBe('');
+    expect(terminal.view.lineCount).toBe(0);
+    terminal.flush();
+    expect(terminal.view.lineCount).toBeGreaterThanOrEqual(2);
+    expect(terminal.view.outputElement.firstElementChild?.textContent).toBe('kt> ps');
+    expect(terminal.view.outputElement.firstElementChild?.className).toContain('echo');
+    keydown(input, 'ArrowUp');
+    expect(input.value).toBe('ps');
+    keydown(input, 'ArrowDown');
+    expect(input.value).toBe('');
+    input.value = 'pa';
+    keydown(input, 'Tab');
+    expect(input.value).toBe('pagetable ');
+    input.value = 'p';
+    keydown(input, 'Tab');
+    terminal.flush();
+    expect(terminal.view.outputElement.lastElementChild?.textContent).toBe('pagetable  ps');
+    input.value = 'nosuchcommand';
+    keydown(input, 'Enter');
+    terminal.flush();
+    expect(terminal.view.outputElement.lastElementChild?.className).toContain('error');
+    keydown(input, 'Escape');
+    expect(terminal.isOpen).toBe(false);
+    terminal.toggle();
+    expect(terminal.isOpen).toBe(true);
+    terminal.dispose();
+  });
+
+  it('history is capped at 200 entries, trimmed from the head, and skips blanks and repeats', () => {
+    const history = new History();
+    for (let index = 0; index < 250; index++) history.push(`cmd ${index}`);
+    expect(history.entries).toHaveLength(200);
+    expect(history.entries[0]).toBe('cmd 50');
+    history.push('   ');
+    history.push('cmd 249');
+    expect(history.entries).toHaveLength(200);
+    expect(history.up()).toBe('cmd 249');
+    expect(history.up()).toBe('cmd 248');
+    expect(history.down()).toBe('cmd 249');
+    expect(history.down()).toBeNull();
+  });
+
+  it('boundaries: the render layer imports design tokens only, with no three import and no colour literal (acceptance 19 and 20)', () => {
+    for (const file of ['render/terminal.css.ts', 'render/TerminalView.ts', 'Terminal.ts']) {
+      const raw = readFileSync(resolve(ROOT, 'src', 'terminal', file), 'utf8');
+      const source = stripComments(raw, false);
+      expect(source, file).not.toMatch(/from ['"]three/);
+      expect(source, file).not.toMatch(/#[0-9a-fA-F]{6}\b|0x[0-9a-fA-F]{6}\b/);
+      expect(stripComments(raw, true), file).not.toMatch(/innerHTML|localStorage/);
+      const kernelImports = source.match(/^import .*from ['"]@kernel.*$/gm) ?? [];
+      for (const line of kernelImports) expect(line, file).toMatch(/^import type/);
+    }
+    expect(readFileSync(resolve(ROOT, 'src', 'terminal', 'render', 'terminal.css.ts'), 'utf8')).toMatch(/from '@design'/);
   });
 });
 
