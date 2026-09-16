@@ -12,11 +12,10 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import { validateTable } from '@game/events/EventDeck';
 import { LEG_SEGMENTS } from '@game/travel/segments';
 import { LEG_ORDER, type Leg, type Pace } from '@game/types';
-import { loadFixtures } from './harness/fixtureContract';
 import { assertClean, runLeg, withInertPoison } from './harness/LegHarness';
 import { loadShippedSet, skipLine } from './harness/loadLeg';
 import { makeRunState } from './harness/makeRunState';
-import { REQUIRED_EVENTS } from './harness/requiredEvents';
+import { REQUIRED_EVENTS, runForRequiredEvents } from './harness/requiredEvents';
 
 const CI = process.env.CI !== undefined && process.env.CI !== '';
 /**
@@ -85,8 +84,7 @@ describe('every leg runs headlessly to completion', () => {
       }
 
       it('emits the events its objectives claim to assess', async () => {
-        const fixtures = zeroSegment ? await loadFixtures(leg.id) : null;
-        const result = fixtures === null ? await runLeg(leg, { seed: 4, policy: 'chaotic' }) : await runLeg(leg, { seed: 4, script: fixtures.knownGood.script });
+        const result = await runForRequiredEvents(leg);
         for (const required of REQUIRED_EVENTS[leg.id]) {
           expect(result.eventTypes.has(required), `${leg.id} never emitted ${required}`).toBe(true);
         }

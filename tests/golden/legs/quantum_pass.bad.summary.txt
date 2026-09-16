@@ -1,0 +1,7 @@
+type                           count  first   last
+context.switch                    13      1     57
+process.created                   13      1     47
+process.exited                    13      3     56
+process.reaped                    13      4     57
+process.starving                   4     15     36
+process.state_changed             51      1     57
