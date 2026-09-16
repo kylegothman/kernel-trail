@@ -18,7 +18,7 @@ import type { InvariantView } from '@kernel/invariants';
 import type { CallSpec } from '@kernel/syscall/validate';
 import type { ErrnoSubstitution } from '@kernel/syscall/errno';
 import type {
-  AllocationStrategy, BankersState, DiskSchedulingId, FsSnapshotState, IoSnapshotBuffer, IpcSnapshot, Kernel,
+  AllocationStrategy, BankersState, DiskSchedulingId, FsSnapshotState, IoSnapshotBuffer, IoSnapshotDevice, IpcSnapshot, Kernel,
   PageReplacementId, Pid, SchedulerId, SchedulerParams, SecuritySnapshotState, StorageRaidSnapshot, SyscallName,
   SyscallRequest, SyscallResult,
 } from '@kernel/types';
@@ -71,6 +71,8 @@ export interface TerminalHost {
   ipc(): IpcSnapshot;
   raid(): readonly StorageRaidSnapshot[];
   ioBuffers(): readonly IoSnapshotBuffer[];
+  /** The I/O subsystem's own device rows: `mode` there is the live transfer mode, where the view's Device.mode is the default. */
+  ioDevices(): readonly IoSnapshotDevice[];
   ioCharges(): { readonly issueTicks: number; readonly interruptTicks: number; readonly copyTicks: number; readonly dmaStealTicks: number };
   bankers(): BankersState;
   degree(): number;
@@ -103,6 +105,7 @@ export function createTerminalHost(kernel: KernelImpl, sink: CommandSink, run: (
     ipc: () => kernel.ipc.snapshotContribution(),
     raid: () => [...kernel.storageSubsystem.raid.values()].map(array => array.saveState()),
     ioBuffers: () => kernel.ioSubsystem.saveState().io.payload.buffers,
+    ioDevices: () => kernel.ioSubsystem.saveState().io.payload.devices,
     ioCharges: () => kernel.ioSubsystem.cpuCharges,
     bankers: () => kernel.deadlockSubsystem.resources.bankersState(),
     degree: () => kernel.memorySubsystem.pager.control.degreeOfMultiprogramming,

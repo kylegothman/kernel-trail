@@ -15,6 +15,7 @@ import { instructionProgram } from '@kernel/process/Program';
 import type { Actor } from '@kernel/sync/SyncSubsystem';
 import { asPageId, asPid, asResourceId, asTick } from '@kernel/types';
 import type { Instruction, Program } from '@kernel/process/Program';
+import type { DeviceId, DomainId } from '@kernel/types';
 import { createBoundedBuffer } from '@kernel/sync/scenarios/boundedBuffer';
 import { createReadersWriters } from '@kernel/sync/scenarios/readersWriters';
 import { ALL_DEFINITIONS, BASE_COMMAND_NAMES, SHIPPED_HANDLERS } from '@terminal/commands/index';
@@ -53,11 +54,14 @@ describe('definitions', () => {
     for (const name of SHIPPED_HANDLERS.keys()) expect(DEFINED.has(name), name).toBe(true);
     for (const name of DEFERRED_COMMANDS) expect(DEFINED.has(name), name).toBe(true);
     expect(new Set(ALL_DEFINITIONS.map(def => def.name)).size).toBe(ALL_DEFINITIONS.length);
+    expect(ALL_DEFINITIONS).toHaveLength(49);
+    expect(ALL_DEFINITIONS.map(def => def.name).sort()).toEqual([...DEFINED.keys()].sort());
     expect(BASE_COMMAND_NAMES).toHaveLength(14);
   });
 
   it('no direct mutation: no terminal source calls a kernel setter, restore or syscall (acceptance 7)', () => {
-    const files = ['Shell.ts', 'commands/base.ts', 'commands/process.ts', 'commands/scheduler.ts', 'commands/sync.ts', 'commands/deadlock.ts', 'commands/memory.ts', 'commands/index.ts'];
+    const files = ['Shell.ts', 'commands/base.ts', 'commands/process.ts', 'commands/scheduler.ts', 'commands/sync.ts', 'commands/deadlock.ts', 'commands/memory.ts',
+      'commands/storage.ts', 'commands/io.ts', 'commands/filesystem.ts', 'commands/security.ts', 'commands/index.ts'];
     for (const file of files) {
       const source = readFileSync(resolve(ROOT, 'src', 'terminal', file), 'utf8');
       expect(source, file).not.toMatch(/\.(setScheduler|setReplacementPolicy|setDiskPolicy|setAllocationStrategy|restore|syscall)\s*\(/);
@@ -538,7 +542,7 @@ describe('deadlock commands', () => {
 
 /** A process that touches four pages in a loop, on eight frames, with demand paging live. */
 function pagingKernel(frames = 8) {
-  const kernel = makeKernel({ totalFrames: frames, enabledSubsystems: ['process', 'scheduler', 'memory', 'vm'] });
+  const kernel = makeKernel({ totalFrames: frames, enabledSubsystems: ['process', 'scheduler', 'memory', 'vm', 'io', 'storage', 'deadlock'] });
   const pid = kernel.spawn({ name: 'pager', priority: 1, arrival: 0, burst: 200, service: 200, pages: 4, referenceString: Array.from({ length: 200 }, (_, i) => i % 4) });
   return { kernel, pid };
 }
@@ -658,17 +662,296 @@ describe('memory commands', () => {
   });
 });
 
+
+/** The opt-in paging storage fixture of tests/kernel/storage/costModel.test.ts: page faults become disk requests. */
+function diskKernel() {
+  const kernel = makeKernel({ totalFrames: 3, replacementPolicy: 'fifo', thrashingThreshold: 1e9,
+    enabledSubsystems: ['process', 'scheduler', 'memory', 'vm', 'storage', 'io'] },
+  { majorFaultTicks: 3, tlbMissTicks: 1, tlbHitTicks: 1, thrashingCriticalDemandRatio: 1e9, thrashingSuspendInterval: 1000 });
+  kernel.attachPagingStorage();
+  const access = (page: number, write = false): Instruction => ({ kind: 'access', page: asPageId(page), write });
+  const pid = kernel.spawn({ name: 'backed page reader', priority: 10, arrival: 0, burst: 100, service: 100, pages: 3 },
+    { program: instructionProgram([access(0), access(1, true), access(2), access(0), { kind: 'compute' }]) });
+  return { kernel, pid };
+}
+
+describe('storage commands', () => {
+  it('iostat measures disk service from the ring and the live queue, and describes one device', () => {
+    const { kernel } = diskKernel();
+    const f = shellWith(['iostat'], kernel);
+    const before = expectOk(f.shell, 'iostat');
+    expect(before.some(line => /^served\s+0 in/.test(line))).toBe(true);
+    runUntil(kernel, () => f.shell.rings.diskServed.length >= 2, 200);
+    const after = expectOk(f.shell, 'iostat --variance');
+    expect(after).not.toEqual(before);
+    expect(after.some(line => /^served\s+[1-9]/.test(line))).toBe(true);
+    expect(after.some(line => line.startsWith('wait variance'))).toBe(true);
+    expect(expectOk(f.shell, 'iostat --interval 5').some(line => /in 5 ticks/.test(line))).toBe(true);
+    const device = expectOk(f.shell, 'iostat --device disk0');
+    expect(device[0]).toBe('device       disk0');
+    const error = expectError(f.shell, 'iostat --device nvme9');
+    expect(error.errno).toBe('ENOENT');
+    expect(error.topic).toBe('iostat');
+  });
+
+  it('seekq lists the pending queue with ages, projects the path, and sets the policy through one dispatch', () => {
+    const { kernel } = diskKernel();
+    const f = shellWith(['seekq'], kernel);
+    const before = expectOk(f.shell, 'seekq --path');
+    expect(before[0]).toMatch(/^head at cylinder \d+ of 200, direction (up|down), policy look, 0 pending$/);
+    expect(before.at(-1)).toMatch(/^path: /);
+    kernel.run(2);
+    const after = expectOk(f.shell, 'seekq --path');
+    expect(after).not.toEqual(before);
+    expect(expectOk(f.shell, 'seekq --policy sstf')).toEqual(['disk policy set to sstf']);
+    expect(f.run.decisions).toHaveLength(1);
+    expect(f.sink.dispatched).toEqual([{ kind: 'set_disk', id: 'sstf' }]);
+    expect(expectError(f.shell, 'seekq --policy zigzag').topic).toBe('seekq');
+    expect(expectError(f.shell, 'seekq --compare').topic).toBe('seekq');
+    expect(f.run.decisions).toHaveLength(1);
+  });
+
+  it('raid reports the live array state and refuses reconfiguration', () => {
+    const f = shellWith(['raid']);
+    expect(expectOk(f.shell, 'raid')).toEqual(['no array configured']);
+    const storage = f.kernel.storageSubsystem;
+    const members = ['m0', 'm1', 'm2', 'm3'];
+    for (const drive of [...members, 'spare0']) storage.ensureDrive(drive);
+    const array = storage.registerRaid({ arrayId: 'array', level: 5, members, blocksPerMember: 16, spares: ['spare0'] });
+    const healthy = expectOk(f.shell, 'raid --status');
+    expect(healthy).toContain('status    healthy');
+    array.failDisk(1);
+    const degraded = expectOk(f.shell, 'raid');
+    expect(degraded).not.toEqual(healthy);
+    expect(degraded.some(line => line.startsWith('members') && line.includes('m1 FAILED'))).toBe(true);
+    expect(expectError(f.shell, 'raid --level 6').topic).toBe('raid');
+  });
+});
+
+describe('io commands', () => {
+  it('iomode lists the live devices and changes a mode through one ioctl dispatch', () => {
+    const f = shellWith(['iomode']);
+    const before = expectOk(f.shell, 'iomode');
+    expect(before.some(line => /^tty0\s/.test(line))).toBe(true);
+    runningProcess(f.kernel);
+    expect(expectOk(f.shell, 'iomode --device tty0 --set polling')).toEqual(['tty0 mode set to polling']);
+    expect(f.kernel.ioSubsystem.mode('tty0' as DeviceId)).toBe('polling');
+    expect(f.run.decisions).toHaveLength(1);
+    expect(f.sink.dispatched).toEqual([{ kind: 'syscall', request: { name: 'ioctl', pid: expect.any(Number), args: ['tty0', 'set_mode', 'polling'] } }]);
+    expect(expectOk(f.shell, 'iomode --device tty0')).not.toEqual(before.filter(line => line.startsWith('DEVICE') || /^tty0\s/.test(line)));
+    expect(expectOk(f.shell, 'iomode --device tty0')[1]).toMatch(/^tty0\s+\S+\s+polling\s+interrupt/);
+    expect(expectError(f.shell, 'iomode --set dma').topic).toBe('iomode');
+    expect(expectError(f.shell, 'iomode --device tty0 --set carrier').topic).toBe('iomode');
+    expect(expectError(f.shell, 'iomode --device nope').errno).toBe('ENOENT');
+    expect(expectError(f.shell, 'iomode --attach x block').topic).toBe('iomode');
+  });
+
+  it('irq counts interrupts from the ring and the pending lines from the view', () => {
+    const f = shellWith(['irq']);
+    const before = expectOk(f.shell, 'irq');
+    expect(before[0]).toMatch(/^interrupts\s+0 recorded/);
+    for (let count = 0; count < 3; count++) { f.kernel.ioSubsystem.interrupts.raise('timer' as DeviceId, { kind: 'timer' }); f.kernel.step(); }
+    const after = expectOk(f.shell, 'irq --rate --handlers --latency');
+    expect(after).not.toEqual(before);
+    expect(after[0]).toMatch(/^interrupts\s+[1-9]\d* recorded/);
+    expect(after.some(line => /^timer\s+\d+/.test(line))).toBe(true);
+    expect(after.some(line => line.startsWith('handler cost'))).toBe(true);
+    expect(after.some(line => line.startsWith('kernel I/O debt'))).toBe(true);
+    expect(expectError(f.shell, 'irq --coalesce 4').topic).toBe('irq');
+  });
+
+  it('devstat shows device queues and configured buffers, and refuses the write flags', () => {
+    const f = shellWith(['devstat']);
+    const before = expectOk(f.shell, 'devstat');
+    expect(before).toContain('0 buffers');
+    const device = 'buffered timer' as DeviceId;
+    f.kernel.ioSubsystem.registerTimerDevice({ id: device, latency: 20 });
+    f.kernel.ioSubsystem.configureBuffer(device, { kind: 'double' }, 3, 3);
+    f.kernel.ioSubsystem.submit({ kind: 'kernel', purpose: 'fixture' }, device);
+    f.kernel.step();
+    const after = expectOk(f.shell, 'devstat --copies');
+    expect(after).not.toEqual(before);
+    expect(after).toContain('1 buffers');
+    expect(after.some(line => line.startsWith('buffered timer') && line.includes('double'))).toBe(true);
+    expect(after.some(line => line.startsWith('copy ticks'))).toBe(true);
+    expect(expectOk(f.shell, `devstat --device "${device}"`)[1]).toMatch(/^buffered timer/);
+    expect(expectError(f.shell, 'devstat --async on').topic).toBe('devstat');
+    expect(expectError(f.shell, 'devstat --device nope').errno).toBe('ENOENT');
+  });
+});
+
+/** A formatted volume with one file, as tests/kernel/fs/inode.test.ts builds it at kernel level. */
+function fsKernel() {
+  const kernel = makeKernel({ enabledSubsystems: ['process', 'scheduler', 'storage', 'io', 'fs'] });
+  const fs = kernel.fileSystemSubsystem;
+  fs.format();
+  runUntil(kernel, () => fs.mounted, 20_000);
+  const inode = fs.createFile('/file');
+  runUntil(kernel, () => !fs.busy, 20_000);
+  return { kernel, fs, inode };
+}
+
+describe('filesystem commands', () => {
+  it('inode prints the live record, its names and block walk, and refuses an unknown id', () => {
+    const { kernel, fs, inode } = fsKernel();
+    const f = shellWith(['inode'], kernel);
+    const before = expectOk(f.shell, `inode ${inode} --links --blocks --method --walk`);
+    expect(before[0]).toBe(`inode        ${inode}`);
+    expect(before.some(line => line.startsWith('1 names: /file'))).toBe(true);
+    expect(fs.hardLink(asPid(1), '/file', '/alias').ok).toBe(true);
+    runUntil(kernel, () => fs.state().metadata.inodes.find(row => row.id === inode)?.linkCount === 2, 20_000);
+    const after = expectOk(f.shell, `inode ${inode} --links`);
+    expect(after).not.toEqual(before.slice(0, after.length));
+    expect(after.some(line => line.startsWith('2 names:'))).toBe(true);
+    expect(expectError(f.shell, 'inode 999').errno).toBe('ENOENT');
+    expect(expectError(f.shell, 'inode').topic).toBe('inode');
+    const disabled = shellWith(['inode'], makeKernel({ enabledSubsystems: ['process', 'scheduler'] }));
+    expect(expectError(disabled.shell, `inode ${inode}`).message).toContain('not enabled');
+  });
+
+  it('journal prints the live log and refuses mode changes', () => {
+    const { kernel, fs } = fsKernel();
+    const f = shellWith(['journal'], kernel);
+    const before = expectOk(f.shell, 'journal --tail 5');
+    expect(before[0]).toMatch(/^mode\s+metadata$/);
+    fs.createFile('/second');
+    runUntil(kernel, () => !fs.busy, 20_000);
+    const after = expectOk(f.shell, 'journal');
+    expect(after).not.toEqual(before);
+    expect(after.some(line => /^TICK\s+TX\s+PHASE\s+BLOCKS/.test(line))).toBe(true);
+    expect(expectError(f.shell, 'journal --mode data').topic).toBe('journal');
+    expect(expectError(f.shell, 'journal --tail none').topic).toBe('journal');
+  });
+
+  it('fsck reports mount state and inconsistencies live, and refuses repairs', () => {
+    const { kernel, fs } = fsKernel();
+    const f = shellWith(['fsck'], kernel);
+    const before = expectOk(f.shell, 'fsck --check');
+    expect(before[0]).toBe('mount state      mounted');
+    fs.createFile('/third');
+    runUntil(kernel, () => !fs.busy, 20_000);
+    expect(expectOk(f.shell, 'fsck')).not.toEqual(before);
+    expect(expectError(f.shell, 'fsck --repair').topic).toBe('fsck');
+    expect(expectError(f.shell, 'fsck --from-journal').topic).toBe('fsck');
+  });
+
+  it('lsof lists live descriptors with their inodes, counts, and unlinked files', () => {
+    const { kernel, fs, inode } = fsKernel();
+    const f = shellWith(['lsof'], kernel);
+    const before = expectOk(f.shell, 'lsof');
+    const pid = kernel.spawn({ name: 'reader', priority: 1, arrival: kernel.tick + 1000, burst: 1, service: 1, pages: 1 });
+    kernel.syscall({ pid, name: 'open', args: ['/file', 'r'] });
+    runUntil(kernel, () => fs.state().processes.some(row => row.pid === pid && row.descriptors.length > 0), 20_000);
+    const after = expectOk(f.shell, `lsof --pid ${pid}`);
+    expect(after).not.toEqual(before);
+    expect(after.some(line => line.startsWith(`P${pid}`) && line.includes(String(inode)) && line.includes('/file'))).toBe(true);
+    expect(expectOk(f.shell, 'lsof --counts').some(line => line.startsWith(`P${pid}`))).toBe(true);
+    expect(expectOk(f.shell, 'lsof --unlinked')).toHaveLength(1);
+    expect(expectError(f.shell, 'lsof --pid many').topic).toBe('lsof');
+    const disabled = shellWith(['lsof'], makeKernel({ enabledSubsystems: ['process', 'scheduler'] }));
+    expect(expectOk(disabled.shell, 'lsof')[0]).toContain('file system not enabled');
+  });
+
+  it('mount lists the live volume and refuses namespaces and semantics', () => {
+    const { kernel } = fsKernel();
+    const f = shellWith(['mount'], kernel);
+    const lines = expectOk(f.shell, 'mount --list');
+    expect(lines[0]).toBe('state         mounted');
+    expect(lines.some(line => line.startsWith('device'))).toBe(true);
+    const disabled = shellWith(['mount'], makeKernel({ enabledSubsystems: ['process', 'scheduler'] }));
+    expect(expectError(disabled.shell, 'mount').topic).toBe('mount');
+    const unformatted = shellWith(['mount']);
+    expect(expectOk(unformatted.shell, 'mount')[0]).toBe('state         unformatted');
+    expect(expectError(f.shell, 'mount vol /mnt').topic).toBe('mount');
+    expect(expectError(f.shell, 'mount --semantics session').topic).toBe('mount');
+    expect(expectError(f.shell, 'mount --vfs').topic).toBe('mount');
+  });
+});
+
+describe('security commands', () => {
+  const user = 'domain:user' as DomainId;
+  function secured() {
+    const f = shellWith(['access', 'ring', 'audit', 'chmod']);
+    f.kernel.securitySubsystem.defineDomain(user, 'User', 3);
+    return f;
+  }
+
+  it('access prints the live matrix and one domain row, and refuses edits', () => {
+    const f = secured();
+    const before = expectOk(f.shell, 'access --matrix');
+    expect(before[0]).toMatch(/^model acl/);
+    f.kernel.securitySubsystem.matrix.grant(user, 'inode:4', ['read', 'execute']);
+    const after = expectOk(f.shell, 'access');
+    expect(after).not.toEqual(before);
+    expect(after.some(line => line.startsWith('domain:user') && line.includes('rx'))).toBe(true);
+    const row = expectOk(f.shell, 'access --domain domain:user');
+    expect(row[0]).toBe('domain:user (User, ring 3)');
+    expect(row.some(line => line.startsWith('inode:4') && line.includes('rx'))).toBe(true);
+    expect(expectError(f.shell, 'access --domain domain:nobody').errno).toBe('ENOENT');
+    expect(expectError(f.shell, 'access --grant domain:user inode:4 write').topic).toBe('access');
+  });
+
+  it('ring lists live rings and the escalation attempts from the ring, and refuses --set', () => {
+    const f = secured();
+    const pid = runningProcess(f.kernel);
+    const before = expectOk(f.shell, 'ring --list');
+    f.kernel.securitySubsystem.bindProcess(pid, user);
+    const after = expectOk(f.shell, 'ring');
+    expect(after).not.toEqual(before);
+    expect(after.some(line => line.startsWith(`P${pid}`) && line.includes('domain:user') && /\s3\s/.test(line))).toBe(true);
+    expect(f.kernel.syscall({ name: 'ioctl', pid, args: ['kernel', 'set_ring', 0] })).toMatchObject({ ok: false, errno: 'EINVAL' });
+    const attempts = expectOk(f.shell, 'ring --attempts');
+    expect(attempts[0]).toMatch(/^[1-9]\d* ring transition attempts recorded$/);
+    expect(attempts.some(line => line.includes(`P${pid}`) && /\s3\s+0\s+yes$/.test(line))).toBe(true);
+    expect(expectError(f.shell, `ring --set ${pid} 0`).topic).toBe('ring');
+  });
+
+  it('audit replays denials with the cell that decided them and traces rights on an object', () => {
+    const f = secured();
+    const pid = runningProcess(f.kernel);
+    const other = f.kernel.spawn({ name: 'other', priority: 5, arrival: 0, burst: 10, service: 10, pages: 0 }, { program: instructionProgram([{ kind: 'compute' }]) });
+    f.kernel.securitySubsystem.bindProcess(pid, user);
+    const before = expectOk(f.shell, 'audit');
+    expect(before[0]).toBe('0 denials, 0 successful uses recorded');
+    expect(f.kernel.syscall({ name: 'kill', pid, args: [other, 0] })).toMatchObject({ ok: false, errno: 'EPERM' });
+    const after = expectOk(f.shell, 'audit --denied');
+    expect(after).not.toEqual(before);
+    expect(after[0]).toMatch(/^1 denials/);
+    expect(after.some(line => line.includes(`process:${other}`) && line.includes('control') && line.endsWith('denied'))).toBe(true);
+    const why = expectOk(f.shell, 'audit --why 1');
+    expect(why[1]).toContain(`cell [domain:user, process:${other}] holds nothing`);
+    f.kernel.securitySubsystem.matrix.grant(user, `process:${other}`, ['control']);
+    const rights = expectOk(f.shell, `audit --rights process:${other}`);
+    expect(rights[0]).toMatch(/^1 domains hold rights/);
+    expect(expectOk(f.shell, 'audit --decisions 1')).toHaveLength(3);
+    expect(expectError(f.shell, 'audit --why 9').topic).toBe('audit');
+  });
+
+  it('chmod maps the inode to its path and issues the chmod syscall through the sink', () => {
+    const { kernel, inode } = fsKernel();
+    const f = shellWith(['chmod'], kernel);
+    const done = expectOk(f.shell, `chmod r-- ${inode}`);
+    expect(done[0]).toMatch(new RegExp(`^chmod /file \\(inode ${inode}\\) r-- issued by P\\d+$`));
+    expect(f.sink.dispatched).toEqual([{ kind: 'syscall', request: { name: 'chmod', pid: expect.any(Number), args: ['/file', 'r--'] } }]);
+    expect(expectError(f.shell, 'chmod rwx 999').errno).toBe('ENOENT');
+    expect(expectError(f.shell, `chmod 777 ${inode}`).topic).toBe('chmod');
+    expect(expectError(f.shell, `chmod rwx ${inode} --sign`).topic).toBe('chmod');
+    const disabled = shellWith(['chmod'], makeKernel({ enabledSubsystems: ['process', 'scheduler'] }));
+    expect(expectError(disabled.shell, 'chmod rwx 2').message).toContain('not enabled');
+  });
+});
+
 describe('decisions', () => {
   it('decision recorded: every policy command appends exactly one DecisionRecord (acceptance 8)', () => {
     const { kernel } = pagingKernel();
-    const f = shellWith(['sched', 'nice', 'degree', 'resources', 'vmstat'], kernel);
+    const f = shellWith(['sched', 'nice', 'degree', 'resources', 'vmstat', 'iomode', 'seekq'], kernel);
     const pid = runningProcess(kernel);
-    const lines = ['sched --policy rr --quantum 2', `nice -n 3 ${pid}`, 'degree --set 3', 'resources --strategy ignore', 'vmstat --policy clock'];
+    const lines = ['sched --policy rr --quantum 2', `nice -n 3 ${pid}`, 'degree --set 3', 'resources --strategy ignore', 'vmstat --policy clock', 'iomode --device tty0 --set polling', 'seekq --policy scan'];
     for (const [index, line] of lines.entries()) {
       expectOk(f.shell, line);
       expect(f.run.decisions, line).toHaveLength(index + 1);
     }
-    expect(f.run.decisions.map(record => record.kind)).toEqual(['set_scheduler', 'syscall', 'set_degree', 'set_deadlock_strategy', 'set_replacement']);
+    expect(f.run.decisions.map(record => record.kind)).toEqual(['set_scheduler', 'syscall', 'set_degree', 'set_deadlock_strategy', 'set_replacement', 'syscall', 'set_disk']);
   });
 });
 

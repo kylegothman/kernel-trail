@@ -12,6 +12,27 @@ import { parseInteger } from '../parser';
 import { bindOrFail, fail, nearest, ok, pidArg, type ShippedHandler } from '../registry';
 import { callerPid, type ShellContext } from '../Shell';
 
+export const MAN_DEF: TerminalCommandDef = {
+  name: 'man',
+  usage: 'man <topic>',
+  summary: 'Read the manual page for a command, a concept or an error code.',
+  manual: [
+    'man prints the manual page for a topic. A topic is a command name (man ps), a',
+    'concept (man syscall), or an error code (man EPERM).',
+    '',
+    'Manual pages in this system are written to be read before you need them, which is',
+    'not how anyone reads them. Reading one after a failure is the normal case and is',
+    'expected. Every error message printed by this shell names the topic that explains',
+    'it, so the error itself tells you what to type next.',
+    '',
+    'A manual page never tells you which choice to make. It tells you what the choice',
+    'costs. The codex, which fills in as you encounter things, is where remedies live.',
+    '',
+    'See also: syscall, mode, codex.',
+  ].join('\n'),
+  chapter: { chapter: 2, title: 'Operating-System Structures', sections: ['2.2'] },
+};
+
 export const SYSCALL_DEF: TerminalCommandDef = {
   name: 'syscall',
   usage: 'syscall <name> [args...]',

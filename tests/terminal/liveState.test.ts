@@ -8,7 +8,8 @@ import { describe, expect, it } from 'vitest';
 import { createKernel } from '@kernel/Kernel';
 import { instructionProgram } from '@kernel/process/Program';
 import type { Actor } from '@kernel/sync/SyncSubsystem';
-import { asPid, asResourceId, asTick } from '@kernel/types';
+import { asPageId, asPid, asResourceId, asTick } from '@kernel/types';
+import type { Instruction } from '@kernel/process/Program';
 import { REFERENCE_CONFIG } from '../kernel/fixtures/referenceConfig';
 import { curriculumDefinitions, expectOk, makeFixture, makeKernel, runUntil } from './harness';
 
@@ -93,6 +94,21 @@ describe('live state', () => {
     expect(after).not.toEqual(before);
     expect(rate(after)).not.toBe(rate(before));
     expect(after.find(line => line.startsWith('page faults'))).not.toBe(before.find(line => line.startsWith('page faults')));
+  });
+
+  it('iostat live: queuing disk requests changes the output', () => {
+    const kernel = makeKernel({ totalFrames: 3, replacementPolicy: 'fifo', thrashingThreshold: 1e9, enabledSubsystems: ['process', 'scheduler', 'memory', 'vm', 'storage', 'io'] },
+      { majorFaultTicks: 3, tlbMissTicks: 1, tlbHitTicks: 1, thrashingCriticalDemandRatio: 1e9, thrashingSuspendInterval: 1000 });
+    kernel.attachPagingStorage();
+    const access = (page: number): Instruction => ({ kind: 'access', page: asPageId(page), write: false });
+    kernel.spawn({ name: 'reader', priority: 10, arrival: 0, burst: 100, service: 100, pages: 3 }, { program: instructionProgram([access(0), access(1), access(2), { kind: 'compute' }]) });
+    const f = shellWith(['iostat'], kernel);
+    const before = expectOk(f.shell, 'iostat');
+    runUntil(kernel, () => f.host.view().diskQueue.length > 0 || f.shell.rings.diskQueued.length > 0, 20);
+    const queued = expectOk(f.shell, 'iostat');
+    expect(queued).not.toEqual(before);
+    runUntil(kernel, () => f.shell.rings.diskServed.length > 0, 100);
+    expect(expectOk(f.shell, 'iostat')).not.toEqual(queued);
   });
 
   it('pagetable live: a page load changes the table for that address space', () => {
