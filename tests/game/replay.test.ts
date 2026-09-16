@@ -7,6 +7,7 @@
  * the same leg headless with the harness off, and the two hashes agree.
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { isMainThread } from 'node:worker_threads';
 import { createKernel, KernelImpl, type KernelOptions } from '../../src/kernel/Kernel';
 import { asPageId, type KernelEvent, type Pid, type SchedulerId, type Tick } from '../../src/kernel/types';
 import { LEG_ORDER, type RunState } from '../../src/game/types';
@@ -393,32 +394,36 @@ describe('runReplay', () => {
   it('throughput: microseconds per tick on an 8,000-tick busy leg, both workload classes measured', () => {
     // The kernel's memory and vm path is the cost (about 79 us per tick alone on an
     // M3 with every subsystem on, 13 with process, scheduler, sync and deadlock),
-    // and the loop adds nothing measurable. Both are printed; the budget is
-    // asserted on the scheduling leg, best of five rounds, because the full
-    // parallel suite loads the machine four to five times over (62 us per tick
-    // measured for the same leg under load), the same tolerance the AC22 cost
-    // gate takes. The full-subsystem number is a kernel-track finding.
+    // and the loop adds nothing measurable. Both are printed. The budget is
+    // asserted on the scheduling leg against this process's own CPU time, best of
+    // three rounds: the full parallel suite loads the machine four times over
+    // (54 us per tick of wall time measured for the same leg at a load average of
+    // 28), and vitest forks one process per file, so CPU time is the loop's cost
+    // and wall time is the runner's. Wall time is printed beside it.
     const budget = process.env['CI'] === undefined ? 400 : 1400;
     const label = process.env['CI'] === undefined ? 'local' : 'CI';
-    const measure = (name: string, config: SyntheticLegOptions['config'], rounds: number): number => {
+    const measure = (name: string, config: SyntheticLegOptions['config'], rounds: number): { cpuMs: number; wallMs: number } => {
       withSynthetic({ processes: 10, service: [700, 900], hooks: { isComplete: (at) => at >= 8000 }, ...(config === undefined ? {} : { config }) });
       const request = requestFor(23, initialRunState(23, 'shell', 'operator'), {}, { maxTicks: 10_000 });
-      let best = Number.POSITIVE_INFINITY;
+      let best = { cpuMs: Number.POSITIVE_INFINITY, wallMs: Number.POSITIVE_INFINITY };
       for (let round = 0; round < rounds; round++) {
+        const cpu0 = process.cpuUsage();
         const t0 = performance.now();
         const result = okResult(runReplay(request));
-        const ms = performance.now() - t0;
+        const wallMs = performance.now() - t0;
+        const cpu = process.cpuUsage(cpu0);
+        const cpuMs = (cpu.user + cpu.system) / 1000;
         expect(result.ticks).toBe(8000);
-        console.log(`replay throughput (${name}, round ${round + 1}): 8000 ticks in ${ms.toFixed(1)} ms, ${((ms * 1000) / 8000).toFixed(1)} us per tick`);
-        best = Math.min(best, ms);
+        console.log(`replay throughput (${name}, round ${round + 1}): 8000 ticks, cpu ${cpuMs.toFixed(1)} ms (${((cpuMs * 1000) / 8000).toFixed(1)} us per tick), wall ${wallMs.toFixed(1)} ms (${((wallMs * 1000) / 8000).toFixed(1)} us per tick)`);
+        if (cpuMs < best.cpuMs) best = { cpuMs, wallMs };
       }
-      console.log(`replay throughput (${name}): best ${best.toFixed(1)} ms, ${((best * 1000) / 8000).toFixed(1)} us per tick, budget ${budget} ms (${label})`);
+      console.log(`replay throughput (${name}): best cpu ${best.cpuMs.toFixed(1)} ms, ${((best.cpuMs * 1000) / 8000).toFixed(1)} us per tick, wall ${best.wallMs.toFixed(1)} ms, budget ${budget} ms (${label}, main thread ${isMainThread})`);
       undos.pop()?.();
       return best;
     };
     measure('every subsystem, 15 processes', undefined, 1);
-    const scheduling = measure('process, scheduler, sync and deadlock, 15 processes', { enabledSubsystems: ['process', 'scheduler', 'sync', 'deadlock'] }, 5);
-    expect(scheduling).toBeLessThan(budget);
+    const scheduling = measure('process, scheduler, sync and deadlock, 15 processes', { enabledSubsystems: ['process', 'scheduler', 'sync', 'deadlock'] }, 3);
+    expect(scheduling.cpuMs).toBeLessThan(budget);
   });
 
   it('stubs throw: the fourteen headless entries name phase 2', () => {

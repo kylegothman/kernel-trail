@@ -13,7 +13,7 @@ const machine = { hostname: os.hostname(), cpu: os.cpus()[0]?.model, platform: o
 console.log('GPU test machine:', JSON.stringify(machine));
 await build({ plugins: [allocationProbe], build: {
   outDir: '/private/tmp/kt-wp12-gpu-build', emptyOutDir: true,
-  rolldownOptions: { input: [resolve('tests/render/gpu/probe.html'),resolve('tests/render/gpu/focus.html'),resolve('tests/render/gpu/derezz.html'),resolve('tests/render/gpu/audio.html'),resolve('tests/render/gpu/hud.html')] },
+  rolldownOptions: { input: [resolve('tests/render/gpu/probe.html'),resolve('tests/render/gpu/focus.html'),resolve('tests/render/gpu/derezz.html'),resolve('tests/render/gpu/audio.html'),resolve('tests/render/gpu/hud.html'),resolve('tests/render/gpu/replay.html')] },
 } });
 if (process.argv.includes('--build-only')) process.exit(0);
 
@@ -219,6 +219,39 @@ try {
       assert.ok(result.coverage < 0.11, `${path}: coverage ${(result.coverage * 100).toFixed(2)}% exceeds 11%`);
       await page.screenshot({ path: join(os.tmpdir(), `kt-${path}.png`) });
       assert.equal(diagnostics.pageErrors.length, 0, 'WP-17 HUD page errors');
+      assert.deepEqual(diagnostics.messages.filter(message => message.startsWith('[console.error]')), []);
+      await page.evaluate(() => globalThis.__kernelTrailProbe.api.dispose());
+    } catch (error) {
+      console.error(`GPU test failed on ${path}:`, error.stack || String(error));
+      console.error(formatPageDiagnostics(diagnostics));
+      failures.push(`${path}: ${error.stack || String(error)}`);
+    } finally { await page.close(); }
+  }
+  // WP-18 replay probe. The three production workers spawned from their built
+  // chunks, one synthetic-leg replay through a test worker entry compared with
+  // the main-thread hash, one persist checksum compared with the main-thread
+  // value (acceptance 27), and the bake's source buffer detached after transfer
+  // as observed inside the worker (acceptance 26).
+  {
+    const path = 'wp18-replay';
+    const page = await browser.newPage({ viewport: { width: 800, height: 600 } });
+    const diagnostics = capturePageDiagnostics(page);
+    try {
+      console.log(`Starting ${path}`);
+      await navigateAndWaitForProbe(page, `http://127.0.0.1:${address.port}/tests/render/gpu/replay.html`, diagnostics);
+      const result = await page.evaluate(() => globalThis.__kernelTrailProbe.api.run());
+      console.log(`${path}:`, JSON.stringify(result));
+      results.push({ path, result });
+      assert.equal(result.productionReplay.ok, false, `${path}: the production replay worker answers a stub leg with an error`);
+      assert.match(result.productionReplay.message, /phase 2/, `${path}: the stub message names phase 2`);
+      assert.equal(result.replay.ok, true, `${path}: the synthetic-leg replay in a real worker: ${result.replay.message}`);
+      assert.equal(result.replay.hashMatchesMainThread, true, `${path}: worker and main-thread hashes agree`);
+      assert.equal(result.persist.matchesMainThread, true, `${path}: persist worker checksum equals the main-thread value`);
+      assert.equal(result.bake.validSet, true, `${path}: the production bake worker's set validates and matches generateBuffers`);
+      assert.equal(result.bake.probeSetValid, true, `${path}: the probe worker's set validates and matches generateBuffers`);
+      assert.equal(result.bake.detachedAfterTransfer, true, `${path}: the source buffer is detached after transfer`);
+      assert.equal(result.bake.transferred, 6, `${path}: six backing stores in the transfer list`);
+      assert.equal(diagnostics.pageErrors.length, 0, 'WP-18 replay page errors');
       assert.deepEqual(diagnostics.messages.filter(message => message.startsWith('[console.error]')), []);
       await page.evaluate(() => globalThis.__kernelTrailProbe.api.dispose());
     } catch (error) {

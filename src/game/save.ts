@@ -526,6 +526,19 @@ export async function loadGame(db: Database, id: string): Promise<LoadResult> {
   return { file: record.file, integrity: ok ? 'ok' : 'checksum_failed' };
 }
 
+/* ------------------------------------------------------------------ */
+/* The replays store. WP-18 scope correction U11.                      */
+/* ------------------------------------------------------------------ */
+
+/** One record per run, keyed by `runId`; a later write replaces the earlier. */
+export async function writeReplayRecord(db: Database, record: ReplayRecord): Promise<void> {
+  await db.put('replays', record);
+}
+
+export async function readReplayRecord(db: Database, runId: string): Promise<ReplayRecord | undefined> {
+  return db.get<ReplayRecord>('replays', runId);
+}
+
 /** Every save for one run, newest first. Drives the continue screen. */
 export async function listSaves(db: Database, runId: string): Promise<StoredSave[]> {
   const all = await db.list<StoredSave>('saves');
