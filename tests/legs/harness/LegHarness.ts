@@ -93,8 +93,15 @@ export interface HarnessResult {
   readonly logHash: string;
   readonly restore: RestoreReport | null;
   readonly wallMs: number;
-  /** Per kernel tick advanced: an action that simulates n ticks in one slot is amortised over n (ruling F5). */
+  /**
+   * Per kernel tick advanced: an action that simulates n ticks in one slot is
+   * amortised over n (ruling F5). `maxTickMs` is reported but never asserted:
+   * inside a parallel runner it measures the worst operating-system deschedule
+   * of the run, not the leg. Assert `medianTickMs` (WP-22 era timing ruling).
+   */
   readonly maxTickMs: number;
+  readonly medianTickMs: number;
+  readonly p95TickMs: number;
   readonly notes: readonly string[];
   /** Times `createStage` was called; always 0 in the run loop. */
   readonly stageCalls: number;
@@ -320,7 +327,7 @@ export function runLegInSession(session: HarnessSession, leg: Leg, opts: Harness
   };
   const ledgerBefore = { ...session.store.get().resources };
   const wallStart = performance.now();
-  let maxTickMs = 0;
+  const tickSamples: number[] = [];
   let current = session;
   const wrapped = instrument(leg, () => { collectors.stageCalls += 1; });
   current.content = content;
@@ -386,7 +393,7 @@ export function runLegInSession(session: HarnessSession, leg: Leg, opts: Harness
     driver.beforeTick(ctx);
     runner.observeCommands(current.bus.drain(kernel.tick));
     if (collectors.panics.length > start.panics || runner.finished) {
-      maxTickMs = Math.max(maxTickMs, (performance.now() - slotStart) / Math.max(1, kernel.tick - tick));
+      tickSamples.push((performance.now() - slotStart) / Math.max(1, kernel.tick - tick));
       break;
     }
     runner.preTick(kernel.tick);
@@ -401,7 +408,7 @@ export function runLegInSession(session: HarnessSession, leg: Leg, opts: Harness
     }
     runner.postTick(kernel.tick, events);
     driver.afterTick(ctx, collectors.log.slice(eventStart));
-    maxTickMs = Math.max(maxTickMs, (performance.now() - slotStart) / Math.max(1, kernel.tick - tick));
+    tickSamples.push((performance.now() - slotStart) / Math.max(1, kernel.tick - tick));
   }
   const ticks = current.runner.ticksElapsed;
   const onCredit = current.runner.director?.travel.onCredit ?? false;
@@ -413,6 +420,11 @@ export function runLegInSession(session: HarnessSession, leg: Leg, opts: Harness
     outcome = failedOutcome(leg, describe(error));
   }
   const wallMs = performance.now() - wallStart;
+  const sorted = [...tickSamples].sort((a, b) => a - b);
+  const quantile = (q: number): number => (sorted.length === 0 ? 0 : sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))] ?? 0);
+  const maxTickMs = sorted.at(-1) ?? 0;
+  const medianTickMs = quantile(0.5);
+  const p95TickMs = quantile(0.95);
   const legEvents = collectors.log.slice(start.log);
   const run = structuredClone(current.store.get());
   const result: HarnessResult = {
@@ -435,6 +447,8 @@ export function runLegInSession(session: HarnessSession, leg: Leg, opts: Harness
     restore: restore === null ? null : { at: restore.at, seq: restore.seq, remainderHash: hashEventLog(legEvents.filter((event) => event.seq > restore.seq)) },
     wallMs,
     maxTickMs,
+    medianTickMs,
+    p95TickMs,
     notes: collectors.notes.slice(start.notes),
     stageCalls: collectors.stageCalls - start.stageCalls,
     entry,
