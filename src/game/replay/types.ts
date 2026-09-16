@@ -108,6 +108,9 @@ export interface ReplayResult {
   };
 }
 
+/** What a leg produced, live or replayed, in the shape the planner and the phrasing read. */
+export type ObservedLeg = Pick<ReplayResult, 'casualties' | 'scheduling' | 'memory' | 'storage'>;
+
 export interface ReplayHighlight {
   readonly tick: number;
   readonly type: string;
