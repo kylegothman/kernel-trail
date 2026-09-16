@@ -287,6 +287,16 @@ export class RunDirector {
       drawEvent: () => this.drawEvent(), inflict: (id, affliction, at) => this.inflict(id, affliction, at), derezz: (id, reason, at) => this.kill(id, reason, at),
       record: (choice, outcome, at) => this.record('crossing', choice, outcome, at) });
   }
+  /**
+   * A pure read of a crossing's context, with no record, no phase change and
+   * no RNG draw. The boot package uses it to reopen a crossing that `resume`
+   * restored, since the saved run already holds that crossing's
+   * `crossing_open` record and `openCrossing` would append a second one.
+   */
+  surveyCrossing(def: CrossingDef): CrossingContext {
+    this.registerCrossings([def]);
+    return this.crossingRunner().survey(def);
+  }
   openCrossing(def: CrossingDef): CrossingContext {
     this.registerCrossings([def]); const context = this.crossingRunner().survey(def); this.currentPhase = 'crossing';
     this.record('crossing_open', def.id, 'pending', this.deps.kernel.tick);
