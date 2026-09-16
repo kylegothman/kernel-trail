@@ -26,7 +26,7 @@ import { Score } from './score/Score';
 import { LoadModel, type LoadThresholds } from './score/loadModel';
 import { DEFAULT_ROOT_MIDI } from './synth/tuning';
 import { REDUCED_MOTION_ENVELOPE_SCALE } from './synth/constants';
-import { FrameEventQueue, type FrameAggregates } from './events/FrameEventQueue';
+import { FrameEventQueue, type FrameAggregates } from '@world/FrameEventQueue';
 import { CENTRED_POSITION_SOURCE, type PositionSource } from './events/PositionSource';
 import { SoundBank, type SoundHost } from './events/eventSounds';
 import { AudioConsumer, type ConsumerHost } from './events/AudioConsumer';
@@ -195,10 +195,10 @@ export class AudioEngine implements VoiceHost, SoundHost, ConsumerHost {
   }
 
   /**
-   * Drain the local queue through the consumer. The fixed order of
-   * architecture 3.3 is the fanout's business; here audio is the only consumer.
-   * TODO(astra): WP-14 supplies FrameEventQueue; switch the import and register
-   * `this.consumer` with the shared fanout instead of draining here.
+   * Drain the engine's own queue through the consumer. The fixed order of
+   * architecture 3.3 is the shared queue's business; here audio is the only
+   * consumer.
+   * TODO(astra): WP-19 registers this.consumer with queue.registerAudio and stops calling frame()
    */
   frame(): FrameAggregates {
     const consumer = this.consumer;
