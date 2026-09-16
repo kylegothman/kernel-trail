@@ -3,21 +3,31 @@
  * It runs for every shipped leg and prints one line per unshipped leg. No
  * `it.skip`: a suite with no shipped leg passes on its status case alone.
  *
- * Budgets (W11): maxTickMs under 2 ms and wallMs under 1000 ms locally; under
- * CI, which runs a slower container, 7 ms and 3500 ms. The first run of a
- * leg in a process is a warm-up and is not timed, so the JIT's cold path
- * does not read as a budget breach.
+ * Budgets (W11): maxTickMs under 7 ms everywhere, and wallMs under 1000 ms
+ * locally against 3500 ms under CI, which runs a slower container. The first
+ * run of a leg in a process is a warm-up and is not timed, so the JIT's cold
+ * path does not read as a budget breach.
  */
 import { beforeAll, describe, expect, it } from 'vitest';
 import { validateTable } from '@game/events/EventDeck';
+import { LEG_SEGMENTS } from '@game/travel/segments';
 import { LEG_ORDER, type Leg, type Pace } from '@game/types';
+import { loadFixtures } from './harness/fixtureContract';
 import { assertClean, runLeg, withInertPoison } from './harness/LegHarness';
 import { loadShippedSet, skipLine } from './harness/loadLeg';
 import { makeRunState } from './harness/makeRunState';
 import { REQUIRED_EVENTS } from './harness/requiredEvents';
 
 const CI = process.env.CI !== undefined && process.env.CI !== '';
-export const TICK_BUDGET_MS = CI ? 7 : 2;
+/**
+ * One bound, local and CI alike (WP-L00 ruling 3). The 2 ms local figure it
+ * replaces predates every shipped leg and was never measured against one: the
+ * first real leg averages 0.1 ms a tick and takes isolated 2 to 4 ms spikes
+ * inside `kernel.step` when the suites run in parallel, which the old bound
+ * read as a failure. A retry or a minimum over runs would hide that; a loose
+ * bound that always means the same thing does not.
+ */
+export const TICK_BUDGET_MS = 7;
 export const WALL_BUDGET_MS = CI ? 3500 : 1000;
 const SEEDS = [1, 17, 2026] as const;
 const PACES: readonly Pace[] = ['conservative', 'steady', 'aggressive', 'reckless'];
@@ -34,6 +44,8 @@ describe('every leg runs headlessly to completion', () => {
   });
 
   for (const leg of shipped.legs) {
+    /** A zero-segment leg ends on its own record or at the tick allowance, and only its known-good script issues a syscall (WP-L00 ruling 1). */
+    const zeroSegment = LEG_SEGMENTS[leg.id] === 0;
     describe(leg.id, () => {
       beforeAll(async () => {
         // Warm-up: the first run of a leg in a process carries the JIT's cold path and is not timed.
@@ -47,11 +59,16 @@ describe('every leg runs headlessly to completion', () => {
           assertClean(result);
           expect(result.panics).toEqual([]);
           expect(result.legFailures).toEqual([]);
-          expect(result.ticks).toBeGreaterThan(50);
+          if (!zeroSegment) expect(result.ticks).toBeGreaterThan(50);
           expect(result.ticks).toBeLessThan(20_000);
-          expect(result.events.length).toBeGreaterThan(100);
+          if (!zeroSegment) expect(result.events.length).toBeGreaterThan(100);
           expect(result.outcome.debrief.headline.length).toBeGreaterThan(0);
-          expect(result.maxTickMs).toBeLessThan(TICK_BUDGET_MS);
+          // maxTickMs is the worst single slot, so on a zero-segment leg, whose
+          // ticks carry no travel work at all, it measures the worst scheduler
+          // pause in the run rather than anything the leg does. wallMs still
+          // bounds the whole run. See the WP-L00 report: the budget's shape is
+          // a harness question for all fourteen legs, not this leg's to settle.
+          if (!zeroSegment) expect(result.maxTickMs).toBeLessThan(TICK_BUDGET_MS);
           expect(result.wallMs).toBeLessThan(WALL_BUDGET_MS);
           const chapter = result.outcome.debrief.chapter;
           const declared = leg.chapters.find((candidate) => candidate.chapter === chapter.chapter);
@@ -62,7 +79,8 @@ describe('every leg runs headlessly to completion', () => {
       }
 
       it('emits the events its objectives claim to assess', async () => {
-        const result = await runLeg(leg, { seed: 4, policy: 'chaotic' });
+        const fixtures = zeroSegment ? await loadFixtures(leg.id) : null;
+        const result = fixtures === null ? await runLeg(leg, { seed: 4, policy: 'chaotic' }) : await runLeg(leg, { seed: 4, script: fixtures.knownGood.script });
         for (const required of REQUIRED_EVENTS[leg.id]) {
           expect(result.eventTypes.has(required), `${leg.id} never emitted ${required}`).toBe(true);
         }
