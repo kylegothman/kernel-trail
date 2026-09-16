@@ -106,7 +106,7 @@ describe('CounterfactualPlanner', () => {
     expect(plan?.request.overrides.replacement).toBe('optimal');
     if (plan === undefined) throw new Error('no plan');
     const text = phraseCounterfactual({ baseline: leg, alternative: { ...fakeResult(leg), memory: { ...leg.memory, pageFaults: 90 } }, request: plan.request, floor: plan.floor });
-    expect(text).toBe('Under optimal replacement, an unachievable floor, page faults fall from 201 to 90. Every Program survives either way.');
+    expect(text).toBe('Under optimal replacement (the unachievable floor), page faults fall from 201 to 90. Every Program survives either way.');
   });
 
   it('seek row: high seek distance plans clook', () => {

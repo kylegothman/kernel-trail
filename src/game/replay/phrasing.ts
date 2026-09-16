@@ -198,10 +198,12 @@ function programSentence(input: PhrasingInput, alt: string): string {
 /**
  * At most two sentences. With a casualty: the Program sentence, then the
  * metric. Without one: the metric sentence, then what the alternative did to
- * the convoy.
+ * the convoy. The optimal row carries "(the unachievable floor)" after the
+ * policy phrase.
  */
 export function phraseCounterfactual(input: PhrasingInput): string {
-  const alt = input.floor === true ? `${describeAlternative(input.request)}, an unachievable floor` : describeAlternative(input.request);
+  // The floor label is a parenthetical on the policy phrase, never a clause of its own.
+  const alt = input.floor === true ? `${describeAlternative(input.request)} (the unachievable floor)` : describeAlternative(input.request);
   const metric = metricFor(input.request);
   if (input.baseline.casualties.length > 0) return `${programSentence(input, alt)} ${metricSentence(input, metric)}`;
   const before = metricValue(input.baseline, metric);
