@@ -29,3 +29,13 @@ export { buildWorkedExample, renderEventLine, summarise, WORKED_EXAMPLE_MAX_LINE
 export type { WorkedExampleInput } from './codex/workedExample';
 export { buildIndex, search, tokenise } from './codex/search';
 export type { CodexSearchIndex } from './codex/search';
+export { CARD_CSS, buildCardCss } from './cards/cards.css';
+export { citation } from './cards/card';
+export type { Card } from './cards/card';
+export { createDebriefCard } from './cards/DebriefCard';
+export { createTombstoneCard } from './cards/TombstoneCard';
+export type { TombstoneCardOptions } from './cards/TombstoneCard';
+export { createPanicCard } from './cards/PanicCard';
+export type { PanicCardOptions } from './cards/PanicCard';
+export { createLegUnavailableCard } from './cards/LegUnavailableCard';
+export type { LegUnavailableOptions } from './cards/LegUnavailableCard';
