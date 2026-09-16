@@ -19,10 +19,12 @@ import type {
   PageReplacementId,
   SchedulerId,
   SchedulerParams,
+  SyscallName,
   SyscallRequest,
   SyscallResult,
   Tick,
 } from '@kernel/types';
+import { asPid } from '@kernel/types';
 import type { DecisionRecord, LegId, Pace, Rations, RunState } from '@game/types';
 import type { Store } from './store';
 
@@ -102,7 +104,10 @@ export function describeChoice(cmd: Command): string {
     case 'use_ability':
       return cmd.target === null ? cmd.member : `${cmd.member} -> ${cmd.target}`;
     case 'syscall':
-      return `${cmd.request.name}(${cmd.request.args.map(String).join(', ')})`;
+      // JSON-quoted args and the calling pid, so `commandFromRecord` can rebuild
+      // the exact request: a `"7"` and a `7` validate differently in the syscall
+      // table, and the pid is what the call acts as. WP-18 pre-flight ruling 1.
+      return `${cmd.request.name}(${cmd.request.args.map((a) => JSON.stringify(a)).join(', ')}) pid=${cmd.request.pid}`;
     case 'interaction':
       return `${cmd.id} @ ${cmd.anchor}`;
     case 'terminal':
@@ -214,4 +219,103 @@ export class CommandBus {
 
 function assertNever(x: never): never {
   throw new Error(`CommandBus: unhandled command ${JSON.stringify(x)}`);
+}
+
+/* ------------------------------------------------------------------ */
+/* The inverse, for replay. WP-18 scope correction U2.                 */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Exhaustive over the frozen unions: a member added to any of them is a
+ * compile error here, so the parser can never accept a stale id or refuse a
+ * live one, and no kernel registry has to be imported to validate a string.
+ */
+const SCHEDULER_IDS: Readonly<Record<SchedulerId, true>> = {
+  fcfs: true, sjf: true, srtf: true, priority: true, priority_aging: true, rr: true, mlfq: true,
+};
+const REPLACEMENT_IDS: Readonly<Record<PageReplacementId, true>> = {
+  fifo: true, lru: true, clock: true, optimal: true, lfu: true, random: true,
+};
+const DISK_IDS: Readonly<Record<DiskSchedulingId, true>> = {
+  fcfs: true, sstf: true, scan: true, cscan: true, look: true, clook: true,
+};
+const ALLOCATION_IDS: Readonly<Record<AllocationStrategy, true>> = {
+  first_fit: true, best_fit: true, worst_fit: true, buddy: true,
+};
+const PACES: Readonly<Record<Pace, true>> = { conservative: true, steady: true, aggressive: true, reckless: true };
+const RATIONS: Readonly<Record<Rations, true>> = { generous: true, standard: true, lean: true, starved: true };
+const SYSCALL_NAMES: Readonly<Record<SyscallName, true>> = {
+  fork: true, exec: true, exit: true, wait: true, kill: true, getpid: true, nice: true,
+  mmap: true, munmap: true, brk: true,
+  open: true, close: true, read: true, write: true, seek: true, stat: true, unlink: true, mkdir: true,
+  sem_wait: true, sem_post: true, mutex_lock: true, mutex_unlock: true,
+  request: true, release: true,
+  ioctl: true, sync: true, chmod: true,
+};
+
+function isMember<K extends string>(table: Readonly<Record<K, true>>, value: string): value is K {
+  return Object.prototype.hasOwnProperty.call(table, value);
+}
+
+const isScalar = (v: unknown): v is string | number | boolean =>
+  typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean';
+
+function syscallFromChoice(choice: string): Command | null {
+  const m = /^([a-z_]+)\((.*)\) pid=(\d+)$/s.exec(choice);
+  const name = m?.[1];
+  const inner = m?.[2];
+  const pid = Number(m?.[3]);
+  if (name === undefined || inner === undefined || !isMember(SYSCALL_NAMES, name) || !Number.isSafeInteger(pid)) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(`[${inner}]`);
+  } catch {
+    return null;
+  }
+  if (!Array.isArray(parsed) || !parsed.every(isScalar)) return null;
+  return { kind: 'syscall', request: { name, pid: asPid(pid), args: parsed } };
+}
+
+/**
+ * The exact inverse of `describeChoice` for the kinds replay applies, so a
+ * recorded decision lands in a replay through the same `apply` as live play.
+ * Returns null for `terminal` and `interaction`, which are audit lines whose
+ * effect was recorded as a separate command, for `use_ability`, and for a
+ * choice string that does not parse or names an unknown id.
+ */
+export function commandFromRecord(record: DecisionRecord): Command | null {
+  const choice = record.choice;
+  switch (record.kind) {
+    case 'set_scheduler': {
+      const m = /^([a-z_]+)(?: q=(\d+))?$/.exec(choice);
+      const to = m?.[1];
+      if (to === undefined || !isMember(SCHEDULER_IDS, to)) return null;
+      const quantum = m?.[2];
+      return quantum === undefined ? { kind: 'set_scheduler', to } : { kind: 'set_scheduler', to, quantum: Number(quantum) };
+    }
+    case 'set_replacement':
+      return isMember(REPLACEMENT_IDS, choice) ? { kind: 'set_replacement', to: choice } : null;
+    case 'set_disk_policy':
+      return isMember(DISK_IDS, choice) ? { kind: 'set_disk_policy', to: choice } : null;
+    case 'set_allocation':
+      return isMember(ALLOCATION_IDS, choice) ? { kind: 'set_allocation', to: choice } : null;
+    case 'set_pace':
+      return isMember(PACES, choice) ? { kind: 'set_pace', to: choice } : null;
+    case 'set_rations':
+      return isMember(RATIONS, choice) ? { kind: 'set_rations', to: choice } : null;
+    case 'set_degree': {
+      const to = Number(choice);
+      return /^-?\d+$/.test(choice) && Number.isSafeInteger(to) ? { kind: 'set_degree', to } : null;
+    }
+    case 'syscall':
+      return syscallFromChoice(choice);
+    case 'use_ability':
+      // TODO(astra): WP-19 replays abilities through the RunDirector
+      return null;
+    case 'interaction':
+    case 'terminal':
+      return null;
+    default:
+      return null;
+  }
 }
