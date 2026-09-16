@@ -5,7 +5,7 @@
 import { describe, expect, it } from 'vitest';
 import type { SyscallRequest, SyscallResult, Tick } from '../../src/kernel/types';
 import { createRunStore } from '../../src/game/runStore';
-import { CommandBus, COMMAND_QUEUE_CAPACITY, describeChoice, type Command, type CommandHandlers, type KernelMutators } from '../../src/game/CommandBus';
+import { CommandBus, COMMAND_QUEUE_CAPACITY, commandFromRecord, describeChoice, type Command, type CommandHandlers, type KernelMutators } from '../../src/game/CommandBus';
 import { worstCaseRun } from '../ui/fixtures';
 
 const tick = (n: number): Tick => n as Tick;
@@ -100,6 +100,28 @@ describe('CommandBus', () => {
     const bus = new CommandBus({ store: r.store, kernel, handlers: { useAbility: () => undefined, interaction: () => undefined, terminal: () => undefined } });
     expect(() => bus.apply({ kind: 'set_scheduler', to: 'sjf' }, origin, tick(5))).toThrow('scheduler refused');
     expect(r.store.get().decisions).toHaveLength(1);
+  });
+
+  // WP-18 scope correction U2, quote-and-wait ruled approved in the WP-18 pre-flight.
+  it('commandFromRecord inverts describeChoice for every replayed kind and is null for the rest', () => {
+    const r = rig();
+    for (const cmd of EVERY_COMMAND) r.bus.apply(cmd, origin, tick(7));
+    const replayed = new Set(['set_scheduler', 'set_replacement', 'set_disk_policy', 'set_allocation', 'set_pace', 'set_rations', 'set_degree', 'syscall']);
+    r.store.get().decisions.forEach((d, i) => {
+      const cmd = EVERY_COMMAND[i];
+      if (cmd === undefined) throw new Error('fixture');
+      expect(commandFromRecord(d), d.choice).toEqual(replayed.has(cmd.kind) ? cmd : null);
+    });
+    // The variants EVERY_COMMAND does not cover: a scheduler without a quantum, and typed syscall args.
+    const bare: Command = { kind: 'set_scheduler', to: 'srtf' };
+    expect(commandFromRecord({ tick: tick(1), legId: 'boot_sector', kind: 'set_scheduler', choice: describeChoice(bare), outcome: 'pending', relatedObjective: null })).toEqual(bare);
+    const typed: Command = { kind: 'syscall', request: { name: 'open', pid: 4 as never, args: ['/tmp, a', 1, true] } };
+    expect(describeChoice(typed)).toBe('open("/tmp, a", 1, true) pid=4');
+    expect(commandFromRecord({ tick: tick(1), legId: 'boot_sector', kind: 'syscall', choice: describeChoice(typed), outcome: 'pending', relatedObjective: null })).toEqual(typed);
+    // Unknown ids and unparseable strings are refused rather than guessed.
+    for (const [kind, choice] of [['set_scheduler', 'warp q=4'], ['set_replacement', 'magic'], ['set_degree', 'six'], ['syscall', 'kill(7)'], ['syscall', 'teleport(1) pid=2']] as const) {
+      expect(commandFromRecord({ tick: tick(1), legId: 'boot_sector', kind, choice, outcome: 'pending', relatedObjective: null }), `${kind} ${choice}`).toBeNull();
+    }
   });
 
   it('is bounded: a stuck key cannot queue past the capacity', () => {
