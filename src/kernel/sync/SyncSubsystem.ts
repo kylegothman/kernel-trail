@@ -187,6 +187,8 @@ export class SyncSubsystem implements ScenarioContext, RequirementContext {
   nextPermit(): number { return this.nextPermitId++; }
   reserved(generation: number): boolean { return this.reservations.has(generation); }
   removeWait(generation: number): void { this.waits.delete(generation); this.reservations.delete(generation); }
+  /** Busy-wait ticks a process has burned on an atomic lock; WP-15's top reads it beside IoSubsystem.pollTicks. */
+  spinTicks(pid: Pid): number { return this.spins.get(pid) ?? 0; }
   newWait(actor: Actor, resource: ResourceId, operation: WaitOperation): number {
     check(!this.allWaits().some(wait => sameActor(wait.actor, actor)), 'actor already has a wait');
     const generation = this.nextGeneration++;
