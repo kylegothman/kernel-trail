@@ -14,12 +14,20 @@
  * costs LUMEN 90, and a `wait` crossing then simulates enough ticks for the
  * drain to reach zero, so the crossing record is marked `fatal` and LUMEN's
  * tombstone reads `starvation` on every seed.
+ *
+ * WP-21 section 6: the leg ships a `content` companion, `HARNESS_CONTENT`,
+ * carrying its crossing, a handler per interaction and a layout whose
+ * anchors are the three interaction anchors, and its stage is
+ * `layoutStage` over that layout.
  */
 import type { LegId, Leg, LegEvaluationContext, LegOutcome, InteractionDef, RandomEventDef, LearningObjective } from '@game/types';
 import type { CrossingDef } from '@game/crossing/Crossing';
+import type { LegContent } from '@legs/content';
+import { layoutStage } from '@legs/layout';
 import { createSyntheticLeg, SYNTHETIC_CHAPTER, type SyntheticLegOptions } from '../../game/fixtures/syntheticLeg';
 import type { DecisionScript } from './decisionScript';
 import type { OutcomeExpectation } from './expectOutcome';
+import { rememberContent } from './loadLeg';
 
 export const HARNESS_LEG_ID: LegId = 'fork_fields';
 export const HARNESS_LEG_INDEX = 1;
@@ -51,6 +59,29 @@ export const HARNESS_INTERACTIONS: readonly InteractionDef[] = [
   { id: 'gate_overclock', label: 'Overclock the gate', description: 'Push a Program through the gate at a cost to its integrity.', anchor: 'gate', cost: { integrity: 90 }, enabledWhen: () => true },
 ];
 
+/** The companion (WP-21 section 6): every anchor is an interaction anchor, so `extras` is empty; `gate_overclock` lands its integrity cost on LUMEN. */
+export const HARNESS_CONTENT: LegContent = {
+  legId: HARNESS_LEG_ID,
+  crossings: [HARNESS_CROSSING],
+  interactions: {
+    vault_inspect: { run: () => undefined, target: null },
+    console_query: { run: () => undefined, target: null },
+    gate_overclock: { run: () => undefined, target: 'lumen' },
+  },
+  epitaphs: [],
+  codex: [],
+  terminalHandlers: {},
+  layout: {
+    anchors: [
+      { id: 'vault', kind: 'frame_vault', position: [0, 0, -8], label: 'The vault' },
+      { id: 'console', kind: 'stele', position: [4, 0, 0], facing: [0, 0, 1], label: 'The console' },
+      { id: 'gate', kind: 'beam', position: [-4, 0, 6], label: 'The gate' },
+    ],
+    cameraTargets: ['vault', 'gate'],
+    extras: [],
+  },
+};
+
 export interface HarnessLegOptions extends SyntheticLegOptions {
   /** Observed by the `no stage` and anchor cases. */
   readonly onDispose?: () => void;
@@ -58,7 +89,7 @@ export interface HarnessLegOptions extends SyntheticLegOptions {
 
 export function createHarnessLeg(options: HarnessLegOptions = {}): Leg {
   const base = createSyntheticLeg({ id: HARNESS_LEG_ID, index: HARNESS_LEG_INDEX, ...options });
-  return {
+  const leg: Leg = {
     ...base,
     title: 'Synthetic harness leg',
     subtitle: 'The composite fixture the smoke-test harness proves itself on',
@@ -67,11 +98,8 @@ export function createHarnessLeg(options: HarnessLegOptions = {}): Leg {
     interactions: HARNESS_INTERACTIONS,
     createStage(ctx) {
       options.onStage?.(ctx);
-      return {
-        update: () => undefined,
-        anchor: (id) => (HARNESS_ANCHORS.includes(id) ? { anchor: id } : null),
-        dispose: () => { options.onDispose?.(); },
-      };
+      const stage = layoutStage(HARNESS_CONTENT.layout);
+      return { ...stage, dispose: () => { stage.dispose(); options.onDispose?.(); } };
     },
     evaluate(ctx: LegEvaluationContext): LegOutcome {
       const casualties = ctx.run.convoy.filter((member) => member.status === 'derezzed').map((member) => member.id);
@@ -93,6 +121,8 @@ export function createHarnessLeg(options: HarnessLegOptions = {}): Leg {
       };
     },
   };
+  rememberContent(leg, HARNESS_CONTENT);
+  return leg;
 }
 
 /** The first leaked block of the Verge at zero fragmentation: 20 fragments precede the leaked blocks (narrative 11.6 at F = 0). */

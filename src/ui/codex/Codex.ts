@@ -24,7 +24,7 @@ import type { Store } from '@game/store';
 import type { CodexCounterfactual, CodexEntry, CodexProfileState, CodexWorkedExample } from '@game/codexTypes';
 import type { EventConsumer } from '@world/FrameEventQueue';
 import type { CodexRegistry } from './entries';
-import { matchesUnlock, structureFor, type CodexSignal } from './triggers';
+import { isCommandOccurrence, matchesUnlock, structureFor, type CodexSignal } from './triggers';
 import { buildWorkedExample } from './workedExample';
 import { buildIndex, type CodexSearchIndex } from './search';
 
@@ -82,6 +82,8 @@ export class Codex implements EventConsumer {
   private readonly counterfactuals = new Map<string, CodexCounterfactual>();
   /** Entries whose trigger fired while their structure was off screen. */
   private readonly held = new Map<string, KernelEvent | null>();
+  /** Matching command submissions seen per entry, for a `command` unlock's `nth` (WP-21 section 5). */
+  private readonly commandCounts = new Map<string, number>();
   private readonly listeners: UnlockListener[] = [];
   private readonly unsubscribes: (() => void)[] = [];
   private seen: string[];
@@ -139,7 +141,11 @@ export class Codex implements EventConsumer {
 
   /* ---- host-reported facts ------------------------------------------ */
 
-  /** A crossing option taken or a leg completed: facts only the leg runner knows. */
+  /**
+   * Facts the host reports: a crossing option taken or a leg completed from
+   * the leg runner, a command submitted from `Shell.onCommand`, and a metric
+   * read from the telemetry store once per tick (WP-21 section 5).
+   */
   signal(signal: CodexSignal): void {
     this.offer(signal, this.lastEvent);
   }
@@ -262,9 +268,18 @@ export class Codex implements EventConsumer {
     this.lastObjectives = objectives;
   }
 
+  /** The count of this entry's matching command submissions after this one. */
+  private countCommand(id: string): number {
+    const next = (this.commandCounts.get(id) ?? 0) + 1;
+    this.commandCounts.set(id, next);
+    return next;
+  }
+
   private offer(signal: CodexSignal, trigger: KernelEvent | null): void {
     for (const { id, unlock } of this.registry.unlocks()) {
-      if (this.unlockedThisRun(id) || !matchesUnlock(unlock, signal)) continue;
+      if (this.unlockedThisRun(id)) continue;
+      const occurrence = unlock.kind === 'command' && isCommandOccurrence(unlock, signal) ? this.countCommand(id) : 1;
+      if (!matchesUnlock(unlock, signal, occurrence)) continue;
       const structure = structureFor(unlock);
       if (structure !== null && !this.onScreen(structure)) {
         if (!this.held.has(id)) this.held.set(id, trigger);

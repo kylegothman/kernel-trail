@@ -31,7 +31,11 @@ export type CodexUnlock =
   | { readonly kind: 'event'; readonly type: string }
   | { readonly kind: 'objective'; readonly id: string }
   | { readonly kind: 'crossing'; readonly option: 'spin' | 'block' | 'monitor' | 'wait' }
-  | { readonly kind: 'leg_complete'; readonly leg: LegId };
+  | { readonly kind: 'leg_complete'; readonly leg: LegId }
+  /** A terminal submission of `name`, carrying `flag` if given, on its `nth` matching submission if given (WP-21 section 5). */
+  | { readonly kind: 'command'; readonly name: string; readonly flag?: string; readonly nth?: number }
+  /** A telemetry metric, keyed as `HudTelemetry` and `ObservedLeg` key it (`scheduling.contextSwitches`), first read strictly above `above`. */
+  | { readonly kind: 'metric'; readonly id: string; readonly above: number };
 
 export interface CodexWorkedExample {
   readonly capturedAtTick: Tick;

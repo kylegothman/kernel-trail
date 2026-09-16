@@ -20,8 +20,9 @@
 
 import type { Leg, LegId } from '@game/types';
 import { LEG_ORDER } from '@game/types';
+import type { LegModule } from './content';
 
-export const LEG_LOADERS: Readonly<Record<LegId, () => Promise<{ default: Leg }>>> = {
+export const LEG_LOADERS: Readonly<Record<LegId, () => Promise<LegModule>>> = {
   // TODO(astra): build src/legs/boot_sector/index.ts. Legs are specified in the curriculum map; the kernel side is sim spec 3 (process management).
   boot_sector: () => import('@legs/boot_sector'),
   // TODO(astra): build src/legs/fork_fields/index.ts. Kernel side is sim spec 3.4 to 3.6 (fork, exec, exit, wait, orphans).

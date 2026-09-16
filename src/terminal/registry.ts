@@ -106,15 +106,42 @@ export function nearest(name: string, candidates: readonly string[]): string | n
   return best;
 }
 
+/** A definition as the lines it is compared by, so a differing re-registration can name the first one that differs. */
+function definitionLines(def: TerminalCommandDef): readonly string[] {
+  const chapter = def.chapter === null ? 'null' : `${def.chapter.chapter} ${JSON.stringify(def.chapter.title)} [${def.chapter.sections.join(', ')}]`;
+  return [`name: ${def.name}`, `usage: ${def.usage}`, `summary: ${def.summary}`, `chapter: ${chapter}`, ...def.manual.split('\n').map((line, i) => `manual[${i}]: ${line}`)];
+}
+
+/** Null when the two definitions are byte-identical, else the first line of each that differs. */
+export function firstDefinitionDifference(registered: TerminalCommandDef, candidate: TerminalCommandDef): { readonly registered: string; readonly candidate: string } | null {
+  const a = definitionLines(registered);
+  const b = definitionLines(candidate);
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    if (a[i] !== b[i]) return { registered: a[i] ?? '<end of definition>', candidate: b[i] ?? '<end of definition>' };
+  }
+  return null;
+}
+
 export class CommandRegistry {
   private readonly commands = new Map<string, TerminalCommand>();
   private readonly pending = new Map<string, TerminalCommandDef>();
 
   constructor(private readonly shipped: ReadonlyMap<string, ShippedHandler>) {}
 
-  /** Pair a definition with its shipped handler. Throws on a collision or a missing handler outside the deferred set. */
+  /**
+   * Pair a definition with its shipped handler. A byte-identical
+   * re-registration is a no-op, so a leg may re-ship a base definition
+   * through `Leg.terminalCommands` (WP-21 section 4); a differing one throws
+   * naming the first differing line, as does a missing handler outside the
+   * deferred set.
+   */
   register(def: TerminalCommandDef): void {
-    if (this.commands.has(def.name) || this.pending.has(def.name)) throw new Error(`terminal command '${def.name}' is already registered`);
+    const existing = this.commands.get(def.name)?.def ?? this.pending.get(def.name);
+    if (existing !== undefined) {
+      const difference = firstDefinitionDifference(existing, def);
+      if (difference === null) return;
+      throw new Error(`terminal command '${def.name}' is already registered with a different definition; first differing line: registered "${difference.registered}" versus new "${difference.candidate}"`);
+    }
     const handler = this.shipped.get(def.name);
     if (handler !== undefined) { this.commands.set(def.name, { def, ...handler }); return; }
     if (!DEFERRED_COMMANDS.includes(def.name)) throw new Error(`terminal command '${def.name}' has no handler in this build; only ${DEFERRED_COMMANDS.join(', ')} may be registered without one`);

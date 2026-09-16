@@ -9,6 +9,12 @@
  * run: the known-good path meets every declared objective, the known-bad
  * path produces a casualty and a decision marked fatal, neither panics, and
  * neither leaves a step unfired.
+ *
+ * WP-21 section 7: a known-bad path may be `costly` rather than a
+ * `casualty`. The Boot Sector has no death path by design and is the case
+ * this exists for; a costly known-bad expectation names a decision marked
+ * costly, says the convoy survives, and proves the failure happened with a
+ * `resourceDelta` bound or an `eventTypesPresent` list.
  */
 import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -27,6 +33,8 @@ export const FIXTURE_SEED = 0x4b54524c;
 export interface LegFixture {
   readonly legId: LegId;
   readonly path: 'good' | 'bad';
+  /** How the known-bad path fails: a Program dies, or the convoy pays and survives (Boot Sector). */
+  readonly failureMode: 'casualty' | 'costly';
   readonly seed: number;
   readonly discClass: DiscClass;
   readonly difficulty: DifficultyTier;
@@ -53,6 +61,7 @@ function isFixture(value: unknown): value is LegFixture {
   if (typeof value !== 'object' || value === null) return false;
   const f = value as Record<string, unknown>;
   return typeof f.legId === 'string' && (f.path === 'good' || f.path === 'bad') && typeof f.seed === 'number'
+    && (f.failureMode === 'casualty' || f.failureMode === 'costly')
     && typeof f.script === 'object' && f.script !== null && typeof f.expect === 'object' && f.expect !== null
     && typeof f.enteringLedger === 'object' && f.enteringLedger !== null && Array.isArray(f.enteringDecisions);
 }
@@ -116,11 +125,18 @@ export function validateFixture(f: LegFixture, leg?: Leg): readonly string[] {
       const unknown = named.filter((id) => !declared.includes(id));
       if (unknown.length > 0) problems.push(`${label}: the known-good expectation names objectives the leg does not declare [${unknown.join(', ')}]`);
     }
-  } else {
+  } else if (f.failureMode === 'casualty') {
     const namesCasualty = (expected.casualties !== undefined && expected.casualties.length > 0) || (expected.casualtyCount !== undefined && expected.casualtyCount > 0) || expected.survived === false;
     if (!namesCasualty) problems.push(`${label}: the known-bad expectation must say which Program dies (casualties, casualtyCount or survived false)`);
     if (!(expected.decisionOutcomes ?? []).some((entry) => entry.outcome === 'fatal')) problems.push(`${label}: the known-bad expectation must name the decision marked fatal (decisionOutcomes)`);
     if (expected.ticksBetween === undefined) problems.push(`${label}: the known-bad expectation must say roughly when (ticksBetween)`);
+  } else {
+    if (f.legId !== 'boot_sector') problems.push(`warning: ${label}: failureMode costly is written for boot_sector, which has no death path by design; a leg with a death path is expected to use casualty`);
+    if (!(expected.decisionOutcomes ?? []).some((entry) => entry.outcome === 'costly')) problems.push(`${label}: a costly known-bad expectation must name the decision marked costly (decisionOutcomes)`);
+    if (expected.survived !== true) problems.push(`${label}: a costly known-bad expectation must say the convoy survives (survived true)`);
+    const bounded = expected.resourceDelta !== undefined && Object.values(expected.resourceDelta).some((bounds) => bounds !== undefined && (bounds.min !== undefined || bounds.max !== undefined));
+    const witnessed = expected.eventTypesPresent !== undefined && expected.eventTypesPresent.length > 0;
+    if (!bounded && !witnessed) problems.push(`${label}: a costly known-bad expectation must prove the failure happened with a resourceDelta bound or an eventTypesPresent list`);
   }
   return problems;
 }
@@ -159,9 +175,12 @@ export function checkFixtureRun(f: LegFixture, result: HarnessResult, leg: Leg):
     const declared = leg.objectives.map((objective) => objective.id);
     const missed = declared.filter((id) => !result.outcome.objectivesMet.includes(id));
     if (missed.length > 0) problems.push(`${label}: the known-good run missed declared objectives [${missed.join(', ')}]`);
-  } else {
+  } else if (f.failureMode === 'casualty') {
     if (result.outcome.casualties.length === 0) problems.push(`${label}: the known-bad run produced no casualty`);
     if (!result.decisions.some((record) => record.outcome === 'fatal')) problems.push(`${label}: the known-bad run marked no decision fatal`);
+  } else {
+    if (!result.outcome.survived) problems.push(`${label}: the costly known-bad run did not survive`);
+    if (!result.decisions.some((record) => record.outcome === 'costly')) problems.push(`${label}: the costly known-bad run marked no decision costly`);
   }
   for (const problem of outcomeProblems(result, f.expect)) problems.push(`${label}: ${problem}`);
   return problems;

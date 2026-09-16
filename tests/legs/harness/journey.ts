@@ -48,21 +48,22 @@ export interface JourneyOptions {
 }
 
 export interface HandoffSpec {
-  readonly handoff: 1 | 2 | 3 | 4 | 5;
+  readonly handoff: 1 | 2 | 3 | 4 | 5 | 6;
   readonly producer: LegId;
   readonly consumer: LegId;
   readonly kinds: readonly string[];
-  /** The consumer's documented default when the record is absent (00-LEG-BUILD-ORDER, the five hand-offs). */
+  /** The consumer's documented default when the record is absent (00-LEG-BUILD-ORDER, the five hand-offs; WP-21 section 8 for the sixth). */
   readonly defaultWhenAbsent: string;
 }
 
-/** The five hand-offs of `00-LEG-BUILD-ORDER.md`, the only cross-leg couplings in the project. */
+/** The five hand-offs of `00-LEG-BUILD-ORDER.md` plus hand-off 6 of WP-21 section 8: the only cross-leg couplings in the project. */
 export const HANDOFFS: readonly HandoffSpec[] = [
   { handoff: 1, producer: 'the_cistern', consumer: 'the_gridlock', kinds: ['ring_closed'], defaultWhenAbsent: 'the opening card omits the tick' },
   { handoff: 2, producer: 'allocation_yards', consumer: 'arbiter_wall', kinds: ['executable_bit'], defaultWhenAbsent: 'cleared; the leg opens clean' },
   { handoff: 3, producer: 'the_bus', consumer: 'the_archive', kinds: ['device_attach'], defaultWhenAbsent: 'open clean' },
   { handoff: 4, producer: 'the_archive', consumer: 'arbiter_wall', kinds: ['crash_outcome', 'manifest_integrity'], defaultWhenAbsent: 'intact' },
   { handoff: 5, producer: 'arbiter_wall', consumer: 'the_portal', kinds: ['escalation_outcome', 'privilege_excess'], defaultWhenAbsent: 'all_blocked and an excess of 0' },
+  { handoff: 6, producer: 'the_narrows', consumer: 'the_archive', kinds: ['manifest_seed'], defaultWhenAbsent: 'the archive opens with an intact manifest' },
 ];
 
 export const HANDOFF_KINDS: ReadonlySet<string> = new Set(HANDOFFS.flatMap((spec) => spec.kinds));
