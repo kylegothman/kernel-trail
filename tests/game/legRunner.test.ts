@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { asTick, createKernel, type KernelEvent } from '../../src/kernel/index';
 import { CommandBus, type KernelMutators } from '../../src/game/CommandBus';
 import { LegRunner, type LegEvent, type LegRunnerDeps } from '../../src/game/LegRunner';
+import { ZERO_SEGMENT_TICK_ALLOWANCE } from '../../src/game/RunDirector';
 import { createRunStore } from '../../src/game/runStore';
 import { initialRunState, runReplay } from '../../src/game/replay/runReplay';
 import { createRunStreams, saveRunStreams, type ReplayRequest } from '../../src/game/replay/types';
@@ -61,15 +62,31 @@ describe('LegRunner boundaries', () => {
     expect(r.runner.phase).toBe('travelling'); expect(r.kernelChanged.mock.calls.at(-1)?.[0]).toBe(r.runner.kernel);
     expect(r.persist.mock.calls[0]?.[0].kernel).toBeNull();
   });
-  it('skips Boot Sector travel, never constructs its stage headlessly, and exits once', () => {
+  it('a zero-segment leg never constructs its stage headlessly, ends on a leg_done record, and exits once', () => {
     const r = rig(); const stage = vi.fn(() => { throw new Error('headless stage'); });
     r.runner.enter({ ...createSyntheticLeg(), createStage: stage }, options);
-    expect(r.runner.finished).toBe(true); expect(r.runner.ticksElapsed).toBe(0);
+    expect(r.runner.finished).toBe(false); expect(r.runner.ticksElapsed).toBe(0);
+    tick(r); tick(r);
+    expect(r.runner.finished).toBe(false);
+    r.store.mutate(run => { run.decisions.push({ tick: asTick(2), legId: 'boot_sector', kind: 'leg_done', choice: 'gate', outcome: 'pending', relatedObjective: null }); });
+    expect(r.runner.finished).toBe(true); expect(r.runner.ticksElapsed).toBe(2);
     const outcome = r.runner.exit(); const balance = { ...r.store.get().resources };
     expect(r.runner.exit()).toBe(outcome); expect(r.store.get().resources).toEqual(balance);
+    expect(r.store.get().decisions.filter(record => record.kind === 'leg_done')).toHaveLength(1);
     expect(stage).not.toHaveBeenCalled(); expect(r.store.get().legIndex).toBe(1);
     const card = r.notifications.find(event => event.kind === 'debrief');
     expect(card?.kind === 'debrief' ? card.view.dividend : null).toBe(0);
+  });
+  it('a zero-segment leg with no leg_done record completes at the tick allowance as a normal completion, and an early exit records its own leg_done', () => {
+    const late = rig(); late.runner.enter(createSyntheticLeg(), options);
+    for (let i = 0; i < ZERO_SEGMENT_TICK_ALLOWANCE + 5 && !late.runner.finished; i++) tick(late);
+    expect(late.runner.finished).toBe(true); expect(late.runner.ticksElapsed).toBe(ZERO_SEGMENT_TICK_ALLOWANCE);
+    expect(late.runner.director?.tickLimitReached).toBe(false); expect(late.failure).not.toHaveBeenCalled();
+    late.runner.exit();
+    expect(late.store.get().decisions.filter(record => record.kind === 'leg_done').map(record => [record.tick, record.choice])).toEqual([[ZERO_SEGMENT_TICK_ALLOWANCE, 'exit']]);
+    const early = rig(); early.runner.enter(createSyntheticLeg(), options);
+    tick(early); early.runner.exit();
+    expect(early.store.get().decisions.filter(record => record.kind === 'leg_done').map(record => [record.tick, record.choice])).toEqual([[1, 'exit']]);
   });
   it.each(['kernelConfig', 'populate'] as const)('a throwing %s preserves resources and streams and allows the next leg', phase => {
     const r = rig(); const before = { ...r.store.get().resources }; const rng = saveRunStreams(r.streams);
@@ -609,7 +626,7 @@ describe('approved replay entry and terminal provenance regressions', () => {
       expect(replay.eventLogHash).toBe(expectedHash);
       expect(replay.score).toEqual(r.store.get().score);
       expect(replay.diagnostics.skippedDecisions).toBe(0);
-      if (legId === 'boot_sector') expect(replay.ticks).toBe(0);
+      if (legId === 'boot_sector') expect(replay.ticks).toBe(ZERO_SEGMENT_TICK_ALLOWANCE);
     }
   });
 
@@ -680,6 +697,8 @@ describe('approved replay entry and terminal provenance regressions', () => {
     const decisions: DecisionRecord[] = legs.flatMap(leg => [
       { legId: leg.id, tick: asTick(0), kind: 'set_rations', choice: 'standard', outcome: 'pending', relatedObjective: null },
       { legId: leg.id, tick: asTick(0), kind: 'interaction', choice: 'exhaust-entry @ console', outcome: 'pending', relatedObjective: null },
+      // The zero-segment Boot Sector ends on its leg_done record, here at tick 0 (WP-L00 ruling 1).
+      ...(leg.id === 'boot_sector' ? [{ legId: leg.id, tick: asTick(0), kind: 'leg_done', choice: 'exit', outcome: 'pending', relatedObjective: null } as DecisionRecord] : []),
     ]);
     try {
       const replay = runReplay({ seed, discClass: 'shell', difficulty: 'operator', legs: legs.map(leg => leg.id), decisions,
@@ -723,7 +742,7 @@ describe('approved replay entry and terminal provenance regressions', () => {
         },
       });
       expect(replay.ok, JSON.stringify(replay)).toBe(true);
-      expect(log).toEqual(specs.flatMap(([id]) => [`enter:${id}`, `config:${id}`, `populate:${id}`, `admit:${id}`, `dispatch:${id}`, `evaluate:${id}`]));
+      expect(log).toEqual(specs.flatMap(([id]) => [`enter:${id}`, `config:${id}`, `populate:${id}`, `admit:${id}`, `dispatch:${id}`, ...(id === 'boot_sector' ? [`dispatch:${id}`] : []), `evaluate:${id}`]));
       expect(entries).toEqual([
         { leg: 'boot_sector', beforeBandwidth: 0, beforeCharges: [0, 0, 0, 0, 0], bandwidth: 36, charges: [2, 2, 3, 2, 2], pace: 'steady' },
         { leg: 'fork_fields', beforeBandwidth: 0, beforeCharges: [0, 0, 0, 0, 0], bandwidth: 60, charges: [2, 2, 3, 2, 2], pace: 'conservative' },

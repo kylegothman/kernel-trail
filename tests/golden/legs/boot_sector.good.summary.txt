@@ -1,0 +1,5 @@
+type                           count  first   last
+context.switch                     1      1      1
+process.created                    5      1      8
+process.state_changed              6      1      8
+syscall.invoked                    7      3      9
