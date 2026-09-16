@@ -323,3 +323,24 @@ describe('src/legs boundaries', () => {
     expect(valueImports).toEqual(['@game/replay/runReplay']);
   });
 });
+
+describe('the leg scope correction', () => {
+  it('exists, is under 250 lines, has no em dash, and covers every item of WP-21 section 10 (acceptance 16)', () => {
+    const path = resolve(REPO_ROOT, 'docs', 'astra', '00-LEG-SCOPE-CORRECTION.md');
+    const text = readFileSync(path, 'utf8');
+    expect(text.split('\n').length).toBeLessThan(250);
+    expect(text).not.toMatch(new RegExp(`[${String.fromCharCode(0x2014)}${String.fromCharCode(0x2013)}]`));
+    const headings = text.split('\n').filter((line) => line.startsWith('## ')).map((line) => line.slice(3));
+    expect(headings).toHaveLength(17);
+    expect(headings.map((heading) => Number.parseInt(heading, 10))).toEqual(Array.from({ length: 17 }, (_, i) => i + 1));
+    const required = [
+      'src/legs/<id>/index.ts', 'export const content: LegContent', 'layoutStage(content.layout)', '`three`, `@world`, `@render`,\n`@ui` or `@audio`',
+      'Shell.registerAll', 'byte for byte', 'LEG_DEFERRED_COMMANDS', 'WP-15', 'content.codex', 'workedExample', 'command', 'metric',
+      'tests/legs/<id>/fixtures.ts', 'knownGood', 'knownBad', 'failureMode', 'DecisionScript', 'crossings: content.crossings',
+      '0x4b54524c', 'startingLedger', 'legDividend', 'LEG_SEGMENTS', 'serialFraction', 'quantumForPace', 'PACE_TABLE',
+      'headlessLegs.ts', 'legs.d.ts', 'REQUIRED_EVENTS', 'chaotic', 'asKernelEvents', 'StructureKind', 'custom',
+      'sharedEpitaphSource', 'manifest_seed', 'thirteen', 'SCHED-RR-2a', 'set_capacity', 'ProcessSpec',
+    ];
+    for (const phrase of required) expect(text, phrase).toContain(phrase);
+  });
+});
