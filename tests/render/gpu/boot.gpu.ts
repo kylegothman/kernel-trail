@@ -13,6 +13,7 @@ import { layout as bootSectorLayout } from '../../../src/legs/boot_sector/stage'
 import { makeGridFloor, makeHorizon, makeSlab, makeStele } from '../../../src/world/forms';
 import { PS_DEF } from '../../../src/terminal/commands/process';
 import { createSyntheticLeg } from '../../game/fixtures/syntheticLeg';
+import { awaitReadback } from './awaitReadback';
 
 const SEED = 77;
 const MEASURED_FRAMES = 120;
@@ -155,7 +156,7 @@ async function initialize(): Promise<void> {
       // before disposal can hide them. This uses the same public target as the benchmark.
       const output = context.backend.postChain?.budget.targets.get('tonemap_output');
       assert(output !== undefined, 'Boot probe needs its final render target');
-      await renderer.readRenderTargetPixelsAsync(output, 0, 0, 1, 1);
+      await awaitReadback(renderer.readRenderTargetPixelsAsync(output, 0, 0, 1, 1), controlled);
       await yieldBrowser();
       assert(rendererErrors.length === 0, `Boot renderer errors:\n${rendererErrors.join('\n')}`);
       assert(consoleErrors.length === 0, `Boot console errors:\n${consoleErrors.join('\n')}`);
