@@ -291,32 +291,51 @@ function deepCopy<T>(value: T): T {
   return out as T;
 }
 
+const compareCanonical = (a: unknown, b: unknown): number => {
+  const x = canonicalise(a);
+  const y = canonicalise(b);
+  return x < y ? -1 : x > y ? 1 : 0;
+};
+
+/** Numeric keys numerically, string keys by code unit, anything else by canonical form. */
+const compareKeys = (a: unknown, b: unknown): number => {
+  if (typeof a === 'number' && typeof b === 'number') return a - b;
+  if (typeof a === 'string' && typeof b === 'string') return a < b ? -1 : a > b ? 1 : 0;
+  return compareCanonical(a, b);
+};
+
+/**
+ * Maps and Sets to arrays, recursively, so `canonicalise` accepts the value:
+ * a Map becomes key-sorted pairs and a Set a list sorted by canonical form,
+ * so the result is independent of insertion order. One rule shared by the
+ * save checksum and the replay event log hash (WP-18 scope correction U6),
+ * so a save and a replay flatten the same way.
+ */
+export function withoutMapsAndSets(value: unknown): unknown {
+  if (value === null || typeof value !== 'object') return value;
+  if (value instanceof Map) {
+    const pairs = [...value.entries()].map(([k, v]): readonly [unknown, unknown] => [withoutMapsAndSets(k), withoutMapsAndSets(v)]);
+    return pairs.sort((a, b) => compareKeys(a[0], b[0]));
+  }
+  if (value instanceof Set) {
+    return [...value].map((v) => withoutMapsAndSets(v)).sort(compareCanonical);
+  }
+  if (Array.isArray(value)) return value.map((v: unknown) => withoutMapsAndSets(v));
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) out[k] = withoutMapsAndSets(v);
+  return out;
+}
+
 /**
  * `KernelSnapshot.metrics.memory.workingSets` and every
  * `ProtectionDomain.rights` are Maps, which `canonicalise` refuses. Convert
  * before checksumming or storing as an exported JSON file. Both are flattened
  * to key-sorted arrays of pairs, so the result is independent of insertion
- * order. (The domain rights were missed by the scaffold; WP-17 added them.)
+ * order. (The domain rights were missed by the scaffold; WP-17 added them,
+ * and WP-18 generalised the walk to `withoutMapsAndSets` with the same order.)
  */
 export function checksumSafeSnapshot(snapshot: KernelSnapshot): unknown {
-  const byKey = (a: readonly [string, unknown], b: readonly [string, unknown]): number =>
-    a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0;
-  return {
-    ...snapshot,
-    domains: snapshot.domains.map((d) => ({
-      ...d,
-      rights: [...d.rights.entries()].map(([k, v]): readonly [string, unknown] => [k, [...v]]).sort(byKey),
-    })),
-    metrics: {
-      scheduling: snapshot.metrics.scheduling,
-      memory: {
-        ...snapshot.metrics.memory,
-        workingSets: [...snapshot.metrics.memory.workingSets.entries()].sort(
-          (a, b) => a[0] - b[0],
-        ),
-      },
-    },
-  };
+  return withoutMapsAndSets(snapshot);
 }
 
 /* ------------------------------------------------------------------ */
