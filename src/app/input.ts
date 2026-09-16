@@ -24,6 +24,7 @@ export function installInput(options: {
   readonly toggleCodex: () => void;
   readonly commit: (write: () => void) => void;
   readonly paused: (paused: boolean) => void;
+  readonly controlsBlocked?: () => boolean;
 }): () => void {
   const position = new Vector3();
   const editable = (): boolean => {
@@ -32,6 +33,7 @@ export function installInput(options: {
       active.matches('input, textarea, select, [contenteditable="true"]'));
   };
   const scale = (value: number): void => {
+    if (options.controlsBlocked?.() === true) return;
     options.loop.setTimeScale(value);
     options.paused(value === 0);
   };

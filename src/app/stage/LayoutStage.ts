@@ -4,6 +4,7 @@ import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js
 import type { BufferGeometry, Object3D } from 'three/webgpu';
 import { DASH, HATCH_ID, LAYER, SEMANTICS, gainFor, linearColor } from '@design';
 import type { LegStage } from '@game/types';
+import { PROFILES } from '@platform';
 import type { LegLayout } from '@legs/layout';
 import { getMaterial } from '@render';
 import type { FocusCameraRig, InstancedBatchDesc, InstancedBatchHandle } from '@render';
@@ -14,6 +15,7 @@ import { GeometryLeases, cachedGeometry } from '@world/forms';
 import { SdfAtlas } from '@world/labels/SdfAtlas';
 import { StageBuilder } from '@world/StageBuilder';
 import { InstancedStructure } from '@world/structures/base/InstancedStructure';
+import { assertCeiling } from '@world/instancing/assertCeiling';
 import type { InstanceData } from '@world/instancing/InstancedBatch';
 import {
   LayoutStructure, formFocusTarget, formGeometry, layoutFormKind, preparedFormGeometry,
@@ -178,6 +180,9 @@ export function buildLayoutStage(
     ids.add(anchor.id);
     const kind = layoutFormKind(anchor.kind);
     counts.set(kind, (counts.get(kind) ?? 0) + 1);
+  }
+  for (const count of counts.values()) {
+    if (count > 8) assertCeiling('page_frames', count, PROFILES[context.quality]);
   }
   const builder = new StageBuilder(context, services, focus);
   builder.addEnvironment();

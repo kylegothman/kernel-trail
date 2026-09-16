@@ -13,7 +13,7 @@ import { createTerminalHost } from '@game/terminalHost';
 import type { RunSummary } from '@game/save';
 import { LEG_ORDER, type LegId } from '@game/types';
 import { LEG_LOADERS } from '@legs/registry';
-import type { LegModule } from '@legs/content';
+import { validateContent, type LegModule } from '@legs/content';
 import { sharedEpitaphSource } from '@legs/epitaphs';
 import { BlendedPerspectiveCamera, FocusCameraRig, holoLabel, getMaterial, createLabelPlateMaterial, acquireGlass, releaseGlass } from '@render';
 import { DerezzPool } from '@render/derezz/DerezzPool';
@@ -54,6 +54,12 @@ import { buildLayoutStage, type LayoutStage } from './stage/LayoutStage';
 import { throughputTargetFor } from './throughput';
 import { browserFrameHooks, type FrameState } from './frame';
 import { installInput, type CameraTarget } from './input';
+import { CrossingPanel } from './panels/CrossingPanel';
+import { DepotPanel } from './panels/DepotPanel';
+import { ReclamationPanel } from './panels/ReclamationPanel';
+import { CodexPanel } from './panels/CodexPanel';
+import { InteractionPanel } from './panels/InteractionPanel';
+import type { DeferredPanel } from './panels/panel';
 
 export interface BrowserSession {
   readonly loop: GameLoop;
@@ -137,8 +143,9 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
       focusEngage: () => engine.ui.focusEngage(), focusRelease: () => engine.ui.focusRelease() }, injectStyle: true });
   const registry = createCodexRegistry();
   let index = initial.legIndex;
+  const numericMetrics: Record<string, number> = {};
   const codex = createCodex({ registry, runStore, profile, currentLeg: () => LEG_ORDER[index] ?? 'the_portal', onScreen: () => true,
-    metrics: () => { const t = telemetry.get(); return { tick: t.tick, cpuUtilisation: t.cpuUtilisation, faultRate: t.faultRate, thrashingThreshold: t.thrashingThreshold, quantum: t.quantum }; } });
+    metrics: () => numericMetrics });
   let disposed = false;
   let transitioning = false;
   let suppressLegEvents = false;
@@ -152,6 +159,7 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
   const stones = new Set<Card>();
   const timers = new Set<ReturnType<typeof setTimeout>>();
   const writes: (() => void)[] = [];
+  const panels: DeferredPanel[] = [];
   const modules = new Map<LegId, LegModule>();
   const loads = new Map<LegId, Promise<LegModule>>();
   const loaders = options.loaders ?? LEG_LOADERS;
@@ -162,20 +170,24 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
     profileWrites = profileWrites.then(() => writeCodexProfile(boot.db, snapshot, new Date().toISOString())).catch(error => panic(describe(error)));
   });
   const commit = (write: () => void): void => { if (!disposed) writes.push(write); };
-  const flushUi = (): void => { for (const write of writes.splice(0)) { if (!disposed) write(); } };
+  const flushUi = (): void => {
+    for (const write of writes.splice(0)) { if (!disposed) write(); }
+    if (!disposed) for (const panel of panels) panel.flush();
+  };
   const present = (next: Card): void => {
     card?.dispose(); card = next;
-    Object.assign(next.el.style, { pointerEvents: 'auto', position: 'absolute', top: '20%', left: '25%', maxWidth: '50%', maxHeight: '65%', overflow: 'auto' });
+    Object.assign(next.el.style, { pointerEvents: 'auto', position: 'absolute', zIndex: '5', top: '20%', left: '25%', maxWidth: '50%', maxHeight: '65%', overflow: 'auto' });
     boot.overlay.append(next.el);
   };
   const addAction = (root: HTMLElement, text: string, action: () => void): void => {
     const button = doc.createElement('button'); button.type = 'button'; button.textContent = text;
     button.addEventListener('click', action); root.append(button);
   };
-  const openCodex = (_id?: string): void => { /* The panel is connected in the next assembly step. */ };
+  const openCodex = (id?: string): void => { if (id === undefined) codexPanel.toggle(); else codexPanel.open(id); };
   function panic(message: string): void {
     if (disposed || panicked) return;
     panicked = true; loop?.stop();
+    for (const panel of panels) panel.close();
     commit(() => {
       const next = createPanicCard(doc, { message, tick: runner?.kernel?.tick ?? asTick(0) });
       addAction(next.el, 'Back to title', () => {
@@ -212,7 +224,9 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
           timers.add(timer);
         });
         break;
-      case 'crossing_open': case 'depot_open': case 'reclamation_open': break;
+      case 'crossing_open': crossingPanel.open(event.def, event.context); break;
+      case 'depot_open': depotPanel.open(event.depot); break;
+      case 'reclamation_open': reclamationPanel.open(event.layout); break;
     }
   }
   runner = new LegRunner({ runStore, commandBus: bus, createKernel, streams, replay,
@@ -234,18 +248,49 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
     },
     onFailure: failure => panic(describe(failure.error)), onRunnerFailure: message => panic(message),
   });
+  const crossingPanel = new CrossingPanel({ document: doc, overlay: boot.overlay, runner });
+  const depotPanel = new DepotPanel({ document: doc, overlay: boot.overlay, runner, run: () => runStore.get() });
+  const reclamationPanel = new ReclamationPanel({ document: doc, overlay: boot.overlay, runner });
+  const codexPanel = new CodexPanel({ document: doc, overlay: boot.overlay, codex, registry });
+  const interactionPanel = new InteractionPanel({ document: doc, overlay: boot.overlay, runner, bus, run: () => runStore.get(),
+    crossing: (def, context) => crossingPanel.open(def, context), depot: depot => depotPanel.open(depot), reclamation: layout => reclamationPanel.open(layout) });
+  panels.push(interactionPanel, crossingPanel, depotPanel, reclamationPanel, codexPanel);
   let worldAggregates: FrameAggregates | null = null;
   let audioAggregates: FrameAggregates | null = null;
   const hooks = browserFrameHooks({ boot, runner, scene, focus, target, state: frame, stage: () => stage, effects, pool, engine, hud, terminal: () => terminal,
     endConsumers() {
       if (worldAggregates !== null) { router.endFrame(worldAggregates); worldAggregates = null; }
       if (audioAggregates !== null) { engine.observeAggregates(audioAggregates); engine.consumer.endFrame(); audioAggregates = null; }
-    }, commit: flushUi, panic, canFinish: () => !panicked && !transitioning });
+    }, commit: flushUi, panic, canFinish: () => !panicked && !transitioning,
+    audioRunning: () => !panicked && !transitioning && loop.currentTimeScale > 0 });
   const host = createRunHost({ runner, commandBus: bus, runStore, telemetry, hooks });
   host.queue.addWorld({ name: router.name, consume: event => router.consume(event), endFrame: aggregates => { worldAggregates = aggregates; } });
   host.queue.addAudio({ name: engine.consumer.name, beginFrame: () => engine.consumer.beginFrame(), consume: event => engine.consumer.consume(event), endFrame: aggregates => { audioAggregates = aggregates; } });
   host.queue.addCodex(codex); host.queue.addHud(hud);
-  loop = new GameLoop({ host });
+  let metricKernel: LegRunner['kernel'] = null;
+  let metricTick = -1;
+  loop = new GameLoop({ host: { ...host,
+    applyPendingCommands(at) {
+      if (!transitioning && !panicked && !disposed) host.applyPendingCommands(at);
+    },
+    fixedUpdate(at) {
+      if (transitioning || panicked || disposed) return;
+      host.fixedUpdate(at);
+      const kernel = runner.kernel;
+      if (kernel === null || (metricKernel === kernel && metricTick === kernel.tick)) return;
+      metricKernel = kernel; metricTick = kernel.tick;
+      const metrics = kernel.invariantState().metrics;
+      for (const [key, value] of Object.entries(telemetry.get())) if (typeof value === 'number') numericMetrics[key] = value;
+      numericMetrics.tick = kernel.tick;
+      for (const [domain, values] of Object.entries(metrics)) for (const [key, value] of Object.entries(values)) {
+        if (typeof value === 'number') numericMetrics[`${domain}.${key}`] = value;
+      }
+      for (const { unlock } of registry.unlocks()) if (unlock.kind === 'metric') {
+        const value = numericMetrics[unlock.id];
+        if (value !== undefined) codex.signal({ kind: 'metric', id: unlock.id, value });
+      }
+    },
+  } });
   const unwatchKernel = runner.onKernelChanged(kernel => {
     const old = terminal; terminal = null;
     if (old !== null) commit(() => old.dispose());
@@ -258,7 +303,12 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
       if (runner.kernel !== kernel) return;
       const handlers = new Map(SHIPPED_HANDLERS);
       for (const [name, run] of Object.entries(module.content.terminalHandlers)) handlers.set(name, { run });
-      const next = createTerminal(createTerminalHost(kernel, sinkOverBus(bus, leg.id, currentKernel), () => runStore.get()), { document: doc, handlers });
+      const sink = sinkOverBus(bus, leg.id, currentKernel);
+      const next = createTerminal(createTerminalHost(kernel, {
+        dispatch: (request, at) => transitioning || panicked || disposed
+          ? { ok: false, message: 'The session is not accepting commands.' }
+          : sink.dispatch(request, at),
+      }, () => runStore.get()), { document: doc, handlers });
       next.shell.registerAll(leg.terminalCommands);
       next.shell.onCommand((name, argv) => codex.signal({ kind: 'command', name, argv }));
       next.element.style.pointerEvents = 'auto'; boot.overlay.append(next.element); terminal = next;
@@ -268,7 +318,8 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
     engine.resetForLeg();
   });
   const unbindInput = installInput({ document: doc, canvas: boot.canvas, loop, focus, target, structures: () => stage?.structures ?? [], terminal: () => terminal,
-    toggleCodex: () => openCodex(), commit, paused: paused => hooks.onRunStateChanged(!paused) });
+    toggleCodex: () => openCodex(), commit, paused: paused => hooks.onRunStateChanged(!paused),
+    controlsBlocked: () => transitioning || panicked || disposed });
   const unbindVisibility = installVisibilityGovernor(loop, {
     onHide: () => { if (!disposed && runner.kernel !== null) runner.saveProvisional(); },
     onShow: () => undefined, onBlur: () => undefined, onFocus: () => undefined,
@@ -277,8 +328,7 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
   const resize = (): void => { focus.setViewport(view.innerWidth / Math.max(1, view.innerHeight), view.innerHeight); atlas?.setViewport(view.innerHeight); };
   view.addEventListener('resize', resize);
   const hide = (): void => { if (!disposed && runner.kernel !== null) runner.saveProvisional(); };
-  const visibility = (): void => { if (doc.hidden) hide(); };
-  view.addEventListener('pagehide', hide); doc.addEventListener('visibilitychange', visibility);
+  view.addEventListener('pagehide', hide);
   commit(() => {
     hud.element.style.pointerEvents = 'auto';
     hud.cell('legRail').title = `Seed ${initial.seed}`;
@@ -294,6 +344,11 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
         const loader = loaders[id];
         if (loader === undefined) throw new Error(`Leg ${id} is not in this build.`);
         return loader();
+      }).then(module => {
+        const problems = validateContent(module.default, module.content);
+        if (module.default.id !== id) throw new Error(`Leg ${id} loaded ${module.default.id}.`);
+        if (problems.length > 0) throw new Error(problems.join('\n'));
+        return module;
       }).then(module => { clearTimeout(timer); timers.delete(timer); resolve(module); }, error => { clearTimeout(timer); timers.delete(timer); reject(error); });
     });
     loads.set(id, pending);
@@ -327,16 +382,19 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
     const services: StageServices = { createBatch: desc => boot.backend.createInstancedBatch(desc), postFocus: post.state };
     stage = buildLayoutStage(module.content.layout, ctx, services, focus, atlas);
     await stage.ready;
+    if (!disposed) interactionPanel.open(module.default, module.content);
   }
   async function advance(to = index + 1): Promise<void> {
     if (disposed || transitioning || panicked) return;
     transitioning = true;
     const previousScale = loop.currentTimeScale;
     loop.setTimeScale(0);
+    hooks.onRunStateChanged(false);
     try {
       suppressLegEvents = true;
       try { if (runner.kernel !== null) runner.exit(); } finally { suppressLegEvents = false; }
       clearStage();
+      interactionPanel.close(); crossingPanel.close(); depotPanel.close(); reclamationPanel.close();
       commit(() => { card?.dispose(); card = null; });
       index = to;
       const id = LEG_ORDER[index];
@@ -355,7 +413,23 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
       runner.enter(module.default, { maxTicks: MAX_TICKS, stageContext: { quality: boot.tier, run: runStore.get() } }, r => r.applyContent(module.content));
       if (runner.kernel !== null && !panicked) await showLayout(module);
     } catch (error) { panic(describe(error)); }
-    finally { transitioning = false; if (!disposed && !panicked) loop.setTimeScale(previousScale); }
+    finally { transitioning = false; if (!disposed && !panicked) { loop.setTimeScale(previousScale); hooks.onRunStateChanged(previousScale > 0); } }
+  }
+  function restoreDecisionPanels(module: LegModule): void {
+    const phase = runner.phase;
+    if (phase !== 'depot') depotPanel.close();
+    if (phase === 'crossing') {
+      const opened = runStore.get().decisions.findLast(record => record.legId === module.default.id && record.kind === 'crossing_open');
+      const def = module.content.crossings.find(crossing => crossing.id === opened?.choice);
+      if (def === undefined) throw new Error('The saved crossing is not defined by this leg.');
+      // Survey preserves the saved opening record. Repeated panel opens are idempotent.
+      crossingPanel.open(def, runner.surveyCrossing(def));
+    } else crossingPanel.close();
+    if (phase === 'reclamation') {
+      const layout = runner.director?.snapshot().reclamation?.layout;
+      if (layout === null || layout === undefined) throw new Error('The saved reclamation round has no layout.');
+      reclamationPanel.open(layout);
+    } else reclamationPanel.close();
   }
   const session: BrowserSession = { loop, runner,
     dispose() {
@@ -365,13 +439,15 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
       // Approved runner teardown path. Suppress teardown cards while exit releases its stage.
       if (runner.kernel !== null) runner.exit();
       loop.stop();
+      try { boot.backend.renderFrame({ scene, camera, alpha: 0, dtSeconds: 0, elapsedSeconds: frame.elapsedSeconds }); } catch { /* Teardown can follow device loss. */ }
       for (const write of writes.splice(0)) write();
       disposed = true;
       view.cancelAnimationFrame(emergencyFrame);
       for (const timer of timers) clearTimeout(timer);
       timers.clear();
       unbindLoss(); unbindInput(); unbindVisibility(); unwatchKernel(); unwatchCodex(); unbindSettings();
-      view.removeEventListener('resize', resize); view.removeEventListener('pagehide', hide); doc.removeEventListener('visibilitychange', visibility);
+      view.removeEventListener('resize', resize); view.removeEventListener('pagehide', hide);
+      for (const panel of panels) panel.dispose();
       terminal?.dispose(); terminal = null; card?.dispose(); for (const stone of stones) stone.dispose(); stones.clear();
       codex.dispose(); hud.dispose(); engine.dispose(); clearStage(); leases.dispose(); focus.dispose(); replay.dispose();
     },
@@ -385,7 +461,10 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
         const content = modules.get(leg.id)?.content;
         if (content !== undefined) { epitaphs = sharedEpitaphSource(content.epitaphs); r.applyContent(content); }
       })) throw new Error('The saved journey could not be resumed.');
-      if (module !== undefined && runner.kernel !== null) await showLayout(module);
+      if (module !== undefined && runner.kernel !== null) {
+        await showLayout(module);
+        restoreDecisionPanels(module);
+      }
     } else await advance(index);
     if (!disposed && !panicked) loop.start();
     return session;

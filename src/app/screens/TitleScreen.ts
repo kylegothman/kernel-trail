@@ -8,6 +8,7 @@ import { loadOutcome } from '@game/persist/LoadService';
 import { LEG_LOADERS } from '@legs/registry';
 import { PROFILES, setUserTier, type QualityTier } from '@platform/index';
 import { CYAN, FONT_STACK, SLATE, VOID, cssColor } from '@design';
+import { PerspectiveCamera, Scene } from 'three/webgpu';
 import type { BootContext, SessionStart } from '../boot';
 
 const DISC_OPTIONS: readonly DiscClass[] = ['shell', 'daemon', 'compiler'];
@@ -17,18 +18,20 @@ const LEG_LOAD_TIMEOUT_MS = 10_000;
 
 export interface TitleScreen {
   readonly element: HTMLElement;
-  /** The saved-run availability check, exposed so hosts can observe its completion. */
+  /** Availability data is ready; its DOM is committed by the next title frame. */
   readonly ready: Promise<void>;
   dispose(): void;
 }
 
 export type StartFromTitle = (start: SessionStart, boot: BootContext) => void | Promise<unknown>;
 
-function select<T extends string>(doc: Document, labelText: string, choices: readonly T[], value: T): {
+interface ChoiceControl<T extends string> {
   readonly label: HTMLLabelElement;
   readonly control: HTMLSelectElement;
   value(): T;
-} {
+}
+
+function select<T extends string>(doc: Document, labelText: string, choices: readonly T[], value: T): ChoiceControl<T> {
   const label = doc.createElement('label');
   label.textContent = labelText;
   label.style.cssText = `display:grid;gap:6px;margin:14px 0;color:${cssColor(SLATE.primary)};font:13px ${FONT_STACK.mono}`;
@@ -46,12 +49,10 @@ function select<T extends string>(doc: Document, labelText: string, choices: rea
   return { label, control, value: () => choices.find(choice => choice === control.value) ?? value };
 }
 
-function button(doc: Document, text: string): HTMLButtonElement {
-  const element = doc.createElement('button');
+function prepareButton(element: HTMLButtonElement, text: string): void {
   element.type = 'button';
   element.textContent = text;
   element.style.cssText = `padding:10px 16px;background:${cssColor(VOID.base)};color:${cssColor(SLATE.primary)};border:1px solid ${cssColor(CYAN.dim)};font:14px ${FONT_STACK.mono};cursor:pointer`;
-  return element;
 }
 
 /** A query override is numeric and unsigned, matching the generated 32-bit seed. */
@@ -77,61 +78,72 @@ function withTimeout<T>(work: Promise<T>): Promise<T> {
 /** No modal role, backdrop or focus trap. The callback runs in the click gesture. */
 export function mountTitleScreen(boot: BootContext, onStart: StartFromTitle): TitleScreen {
   const doc = boot.overlay.ownerDocument;
+  const view = doc.defaultView;
+  if (view === null) throw new Error('The title screen needs a browser window.');
+  const scene = new Scene();
+  const camera = new PerspectiveCamera(46, view.innerWidth / Math.max(1, view.innerHeight), 0.1, 2000);
   const element = doc.createElement('section');
-  element.className = 'kt-title-screen';
-  element.style.cssText = `pointer-events:auto;position:absolute;top:12%;left:50%;transform:translateX(-50%);width:min(420px,calc(100% - 48px));box-sizing:border-box;padding:28px;background:${cssColor(VOID.base, 0.95)};border:1px solid ${cssColor(CYAN.dim)};color:${cssColor(SLATE.primary)};font-family:${FONT_STACK.mono}`;
-  const heading = doc.createElement('h1');
-  heading.textContent = 'KERNEL TRAIL';
-  heading.style.cssText = `margin:0 0 24px;font:600 27px ${FONT_STACK.mono};letter-spacing:3px`;
-  const disc = select(doc, 'Disc class', DISC_OPTIONS, 'shell');
-  const difficulty = select(doc, 'Difficulty', DIFFICULTY_OPTIONS, 'operator');
-  const quality = select(doc, 'Quality', QUALITY_OPTIONS, 'auto');
-  const actions = doc.createElement('div');
-  actions.style.cssText = 'display:flex;gap:12px;margin-top:24px;flex-wrap:wrap';
-  const newRun = button(doc, 'New run');
-  const continueRun = button(doc, 'Continue');
-  continueRun.hidden = true;
-  continueRun.disabled = true;
+  const newRun = doc.createElement('button');
+  const continueRun = doc.createElement('button');
   const status = doc.createElement('p');
-  status.className = 'kt-title-status';
-  status.setAttribute('aria-live', 'polite');
-  status.style.cssText = `margin:18px 0 0;font:12px/1.6 ${FONT_STACK.mono};color:${cssColor(SLATE.primary)}`;
-  actions.append(newRun, continueRun);
-  element.append(heading, disc.label, difficulty.label, quality.label, actions, status);
-  boot.overlay.append(element);
+  let disc: ChoiceControl<DiscClass> | null = null;
+  let difficulty: ChoiceControl<DifficultyTier> | null = null;
+  let quality: ChoiceControl<QualityTier | 'auto'> | null = null;
 
   let disposed = false;
   let starting = false;
   let saved: SaveFile | null = null;
   let canContinue = false;
+  let pendingFrame = 0;
+  const writes: (() => void)[] = [];
+
+  const renderAndCommit = (): void => {
+    pendingFrame = 0;
+    try {
+      boot.backend.renderFrame({ scene, camera, alpha: 0, dtSeconds: 0, elapsedSeconds: 0 });
+    } catch { /* A renderer loss must not prevent error text or title cleanup. */ }
+    for (const write of writes.splice(0)) write();
+  };
+  const commit = (write: () => void): void => {
+    if (disposed) return;
+    writes.push(write);
+    if (pendingFrame === 0) pendingFrame = view.requestAnimationFrame(() => { if (!disposed) renderAndCommit(); });
+  };
 
   const controls = (disabled: boolean): void => {
     newRun.disabled = disabled;
     continueRun.disabled = disabled || !canContinue;
-    disc.control.disabled = disabled;
-    difficulty.control.disabled = disabled;
-    quality.control.disabled = disabled;
+    if (disc !== null) disc.control.disabled = disabled;
+    if (difficulty !== null) difficulty.control.disabled = disabled;
+    if (quality !== null) quality.control.disabled = disabled;
   };
   const reportStartFailure = (error: unknown): void => {
     if (disposed) return;
     starting = false;
-    controls(false);
-    status.textContent = error instanceof Error ? error.message : String(error);
+    commit(() => {
+      controls(false);
+      status.textContent = error instanceof Error ? error.message : String(error);
+    });
   };
   const dispose = (): void => {
     if (disposed) return;
     disposed = true;
-    newRun.removeEventListener('click', startNew);
-    continueRun.removeEventListener('click', startSaved);
-    element.remove();
+    view.cancelAnimationFrame(pendingFrame);
+    writes.length = 0;
+    writes.push(() => {
+      newRun.removeEventListener('click', startNew);
+      continueRun.removeEventListener('click', startSaved);
+      element.remove();
+    });
+    // The next session frame restores its scene after this final title commit.
+    renderAndCommit();
   };
   const begin = (start: SessionStart): void => {
     if (disposed || starting) return;
     starting = true;
-    controls(true);
-    status.textContent = 'Starting run...';
+    commit(() => { controls(true); status.textContent = 'Starting run...'; });
     try {
-      const chosen = quality.value();
+      const chosen = quality?.value() ?? 'auto';
       const tier = chosen === 'auto' ? boot.tier : setUserTier(boot.caps, boot.buildId, chosen).tier;
       boot.backend.setQuality(PROFILES[tier]);
       boot.backend.postChain?.setTier(tier);
@@ -142,12 +154,30 @@ export function mountTitleScreen(boot: BootContext, onStart: StartFromTitle): Ti
   };
   const startNew = (): void => {
     try {
-      begin({ kind: 'new', seed: seedForNewRun(doc.defaultView?.location.search ?? ''), discClass: disc.value(), difficulty: difficulty.value() });
+      begin({ kind: 'new', seed: seedForNewRun(view.location.search), discClass: disc?.value() ?? 'shell', difficulty: difficulty?.value() ?? 'operator' });
     } catch (error) { reportStartFailure(error); }
   };
   const startSaved = (): void => { if (saved !== null && canContinue) begin({ kind: 'resume', file: saved }); };
-  newRun.addEventListener('click', startNew);
-  continueRun.addEventListener('click', startSaved);
+  commit(() => {
+    element.className = 'kt-title-screen';
+    element.style.cssText = `pointer-events:auto;position:absolute;top:12%;left:50%;transform:translateX(-50%);width:min(420px,calc(100% - 48px));box-sizing:border-box;padding:28px;background:${cssColor(VOID.base, 0.95)};border:1px solid ${cssColor(CYAN.dim)};color:${cssColor(SLATE.primary)};font-family:${FONT_STACK.mono}`;
+    const heading = doc.createElement('h1');
+    heading.textContent = 'KERNEL TRAIL';
+    heading.style.cssText = `margin:0 0 24px;font:600 27px ${FONT_STACK.mono};letter-spacing:3px`;
+    disc = select(doc, 'Disc class', DISC_OPTIONS, 'shell');
+    difficulty = select(doc, 'Difficulty', DIFFICULTY_OPTIONS, 'operator');
+    quality = select(doc, 'Quality', QUALITY_OPTIONS, 'auto');
+    const actions = doc.createElement('div');
+    actions.style.cssText = 'display:flex;gap:12px;margin-top:24px;flex-wrap:wrap';
+    prepareButton(newRun, 'New run'); prepareButton(continueRun, 'Continue');
+    continueRun.hidden = true; continueRun.disabled = true;
+    status.className = 'kt-title-status'; status.setAttribute('aria-live', 'polite');
+    status.style.cssText = `margin:18px 0 0;font:12px/1.6 ${FONT_STACK.mono};color:${cssColor(SLATE.primary)}`;
+    newRun.addEventListener('click', startNew); continueRun.addEventListener('click', startSaved);
+    actions.append(newRun, continueRun);
+    element.append(heading, disc.label, difficulty.label, quality.label, actions, status);
+    boot.overlay.append(element);
+  });
 
   const inspectSavedRun = async (): Promise<void> => {
     try {
@@ -161,21 +191,19 @@ export function mountTitleScreen(boot: BootContext, onStart: StartFromTitle): Ti
         }
       }
       if (disposed || starting || saved === null) return;
-      continueRun.hidden = false;
-      status.textContent = 'Checking the saved journey...';
+      commit(() => { continueRun.hidden = false; status.textContent = 'Checking the saved journey...'; });
       const ids = LEG_ORDER.slice(0, saved.run.legIndex + 1);
       const results = await Promise.allSettled(ids.map(id => withTimeout(Promise.resolve().then(() => LEG_LOADERS[id]()))));
       if (disposed || starting) return;
       const unavailable = ids.find((_id, index) => results[index]?.status === 'rejected');
       if (unavailable !== undefined) {
-        status.textContent = `This save passed through ${unavailable}, which is not in this build`;
+        commit(() => { status.textContent = `This save passed through ${unavailable}, which is not in this build`; });
         return;
       }
       canContinue = true;
-      continueRun.disabled = false;
-      status.textContent = '';
+      commit(() => { continueRun.disabled = false; status.textContent = ''; });
     } catch (error) {
-      if (!disposed && !starting) status.textContent = `The saved run could not be read: ${error instanceof Error ? error.message : String(error)}`;
+      if (!disposed && !starting) commit(() => { status.textContent = `The saved run could not be read: ${error instanceof Error ? error.message : String(error)}`; });
     }
   };
   return { element, ready: inspectSavedRun(), dispose };

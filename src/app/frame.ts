@@ -32,6 +32,7 @@ export function browserFrameHooks(options: {
   readonly commit: () => void;
   readonly panic: (message: string) => void;
   readonly canFinish: () => boolean;
+  readonly audioRunning: () => boolean;
 }): Pick<SimHost, 'variableUpdate' | 'render' | 'onFrameMetrics' | 'onRunStateChanged'> {
   const { boot, focus, state } = options;
   const governor = new QualityGovernor(boot.tier, profile => {
@@ -66,7 +67,7 @@ export function browserFrameHooks(options: {
     },
     onRunStateChanged(running) {
       const context = options.engine.adapter.context;
-      if (context !== null) void (running ? context.resume() : context.suspend()).catch(() => undefined);
+      if (context !== null) void (running && options.audioRunning() ? context.resume() : context.suspend()).catch(() => undefined);
     },
   };
 }

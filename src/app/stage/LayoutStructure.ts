@@ -40,10 +40,9 @@ export function formGeometry(kind: FormKind, tier: QualityTier): BufferGeometry 
 /** Surface attributes belong to a prepared clone, never the library's source. */
 export function preparedFormGeometry(kind: FormKind, tier: QualityTier): BufferGeometry {
   const source = formGeometry(kind, tier);
-  if (kind === 'horizon') return source;
   return cachedGeometry(`layout.${kind}.${source.name}.page_clean`, () => {
     const geometry = source.clone();
-    prepareSemanticGeometry(geometry, 'page_clean');
+    if (kind !== 'horizon') prepareSemanticGeometry(geometry, 'page_clean');
     return geometry;
   });
 }
