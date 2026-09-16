@@ -13,7 +13,10 @@ import { resolve } from 'node:path';
 import { createKernel } from '@kernel/Kernel';
 import { instructionProgram } from '@kernel/process/Program';
 import type { Actor } from '@kernel/sync/SyncSubsystem';
-import { asResourceId, asTick } from '@kernel/types';
+import { asPageId, asPid, asResourceId, asTick } from '@kernel/types';
+import type { Instruction, Program } from '@kernel/process/Program';
+import { createBoundedBuffer } from '@kernel/sync/scenarios/boundedBuffer';
+import { createReadersWriters } from '@kernel/sync/scenarios/readersWriters';
 import { ALL_DEFINITIONS, BASE_COMMAND_NAMES, SHIPPED_HANDLERS } from '@terminal/commands/index';
 import { DEFERRED_COMMANDS } from '@terminal/registry';
 import { createWorkloadKernel } from '../kernel/scheduler/workloadRunner';
@@ -54,7 +57,7 @@ describe('definitions', () => {
   });
 
   it('no direct mutation: no terminal source calls a kernel setter, restore or syscall (acceptance 7)', () => {
-    const files = ['Shell.ts', 'commands/base.ts', 'commands/process.ts', 'commands/scheduler.ts', 'commands/index.ts'];
+    const files = ['Shell.ts', 'commands/base.ts', 'commands/process.ts', 'commands/scheduler.ts', 'commands/sync.ts', 'commands/deadlock.ts', 'commands/memory.ts', 'commands/index.ts'];
     for (const file of files) {
       const source = readFileSync(resolve(ROOT, 'src', 'terminal', file), 'utf8');
       expect(source, file).not.toMatch(/\.(setScheduler|setReplacementPolicy|setDiskPolicy|setAllocationStrategy|restore|syscall)\s*\(/);
@@ -317,6 +320,355 @@ describe('scheduler commands', () => {
     expect(expectOk(f.shell, 'gantt --last 6')[0]).toBe('P2[24-27] P3[27-30]');
     expect(expectOk(f.shell, 'gantt --metrics').some(line => line.startsWith('waiting time'))).toBe(true);
     expect(expectError(f.shell, 'gantt --replay sjf').topic).toBe('gantt');
+  });
+});
+
+
+function syncKernel() {
+  return makeKernel({ scheduler: 'rr', schedulerParams: { ...REFERENCE_CONFIG.schedulerParams, quantum: 1 }, enabledSubsystems: ['process', 'scheduler', 'sync'] });
+}
+
+/** The unprotected counter of tests/kernel/sync/raceDetector.test.ts: two processes lose increments under RR q=1. */
+function racingCounter() {
+  const kernel = syncKernel();
+  const cell = 'region:counter';
+  const instructions: Instruction[] = [
+    { kind: 'sync', operation: { op: 'load', cell, into: 'counter', rmw: true } },
+    { kind: 'sync', operation: { op: 'add', into: 'counter', value: { kind: 'literal', value: 1 } } },
+    { kind: 'sync', operation: { op: 'store', cell, value: { kind: 'register', name: 'counter' }, rmw: true } },
+  ];
+  const source = instructionProgram(instructions);
+  const program: Program = { ...source, at: index => source.at(index % source.length) };
+  const pids = [0, 1].map(index => kernel.spawn({ name: `counter:${index}`, priority: 20, arrival: 0, burst: 300, service: 300, pages: 1 }, { program, serialFraction: 1 }));
+  const pcb = kernel.process(pids[0] ?? asPid(0));
+  if (pcb === undefined) throw new Error('missing counter process');
+  const region = asResourceId('counter');
+  kernel.ipc.createSharedRegion({ id: region, space: pcb.addressSpaceId, pages: [asPageId(0)], attached: [], value: 0 });
+  kernel.syncSubsystem.addRegionCell(cell, region);
+  return { kernel, pids };
+}
+
+describe('sync commands', () => {
+  it('lock lists live primitives with holders and queues, and refuses the write flags', () => {
+    const f = shellWith(['lock'], syncKernel());
+    const before = expectOk(f.shell, 'lock --list');
+    const lock = asResourceId('ledger');
+    f.kernel.syncSubsystem.createMutex(lock);
+    const pid = runningProcess(f.kernel);
+    expect(f.kernel.syscall({ name: 'mutex_lock', pid, args: [lock] }).ok).toBe(true);
+    const after = expectOk(f.shell, 'lock');
+    expect(after).not.toEqual(before);
+    expect(after.some(line => line.startsWith('ledger') && line.includes(`P${pid}`))).toBe(true);
+    expect(expectError(f.shell, 'lock --inherit on').topic).toBe('lock');
+  });
+
+  it('race lists detected races from the ring and shows the interleaving that caused one', () => {
+    const { kernel } = racingCounter();
+    const f = shellWith(['race'], kernel);
+    expect(expectOk(f.shell, 'race')).toEqual(['no data races detected']);
+    kernel.run(600);
+    const list = expectOk(f.shell, 'race --list');
+    expect(list.length).toBeGreaterThan(1);
+    expect(list[0]).toMatch(/^\s*N\s+TICK\s+PARTICIPANTS/);
+    const shown = expectOk(f.shell, 'race --show 1');
+    expect(shown[1]).toMatch(/^expected \d+, got \d+$/);
+    expect(shown.length).toBeGreaterThan(2);
+    expect(expectOk(f.shell, 'race --expected').some(line => line.includes('lost'))).toBe(true);
+    expect(expectError(f.shell, 'race --show 999').topic).toBe('race');
+  });
+
+  it('trace strace: its line count equals the syscall.invoked count over the same window (acceptance 17)', () => {
+    const f = shellWith(['trace']);
+    let invoked = 0;
+    f.kernel.events.onAny(event => { if (event.type === 'syscall.invoked') invoked += 1; });
+    const pid = runningProcess(f.kernel);
+    f.kernel.syscall({ name: 'getpid', pid, args: [] });
+    f.kernel.syscall({ name: 'kill', pid, args: [999, 0] });
+    f.kernel.syscall({ name: 'nice', pid, args: [2] });
+    f.kernel.run(5);
+    const lines = expectOk(f.shell, 'trace');
+    expect(invoked).toBeGreaterThan(0);
+    expect(lines).toHaveLength(invoked);
+    expect(lines.some(line => line.includes('kill(999, 0) = ESRCH'))).toBe(true);
+    expect(lines.some(line => line.includes('getpid() = ' + String(pid)))).toBe(true);
+    expect(expectOk(f.shell, `trace --pid ${pid}`).every(line => line.includes(`P${pid}`))).toBe(true);
+    expect(expectOk(f.shell, `trace --from ${f.kernel.tick + 1}`)).toEqual([]);
+    expect(expectError(f.shell, 'trace --replay 1').topic).toBe('trace');
+    expect(expectError(f.shell, 'trace --from soon').topic).toBe('trace');
+  });
+
+  it('sem lists the live semaphores, the acquisition order of a process, and refuses --set', () => {
+    const kernel = syncKernel();
+    const buffer = createBoundedBuffer(kernel, {});
+    const f = shellWith(['sem'], kernel);
+    const before = expectOk(f.shell, 'sem --list');
+    expect(before.some(line => line.startsWith(buffer.empty))).toBe(true);
+    kernel.run(40);
+    const after = expectOk(f.shell, 'sem');
+    expect(after).not.toEqual(before);
+    const producer = buffer.actors.find(actor => actor.role === 'producer');
+    const order = expectOk(f.shell, `sem --order ${producer?.actor.pid ?? 0}`);
+    expect(order[0]).toContain('acquisition order');
+    expect(order.length).toBeGreaterThan(2);
+    expect(expectOk(f.shell, `sem --trace ${buffer.mutex}`).length).toBeGreaterThan(1);
+    expect(expectError(f.shell, 'sem --set empty 3').topic).toBe('sem');
+  });
+
+  it('buffer reads the live bounded buffer and refuses resizing', () => {
+    const kernel = syncKernel();
+    createBoundedBuffer(kernel, {});
+    const f = shellWith(['buffer'], kernel);
+    const before = expectOk(f.shell, 'buffer');
+    expect(before[0]).toMatch(/^buffer\s+/);
+    kernel.run(60);
+    const after = expectOk(f.shell, 'buffer');
+    expect(after).not.toEqual(before);
+    expect(after.some(line => line.startsWith('produced') && !line.endsWith(' 0'))).toBe(true);
+    expect(expectError(f.shell, 'buffer --capacity 8').topic).toBe('buffer');
+    const empty = shellWith(['buffer']);
+    expect(expectOk(empty.shell, 'buffer')).toEqual(['no bounded buffer is running']);
+  });
+
+  it('rwlock reports the live lock and scenario statistics and refuses --policy', () => {
+    const kernel = syncKernel();
+    createReadersWriters(kernel, { policy: 'writer_pref' });
+    const f = shellWith(['rwlock'], kernel);
+    const before = expectOk(f.shell, 'rwlock --stats');
+    expect(before[0]).toBe('default policy writer_pref');
+    kernel.run(300);
+    const after = expectOk(f.shell, 'rwlock --stats');
+    expect(after).not.toEqual(before);
+    expect(after.some(line => /writer\s+P\d+\s+1/.test(line) || /reader\s+P\d+\s+[1-9]/.test(line))).toBe(true);
+    expect(expectError(f.shell, 'rwlock --policy fair').topic).toBe('rwlock');
+  });
+});
+
+/** The mixed resource-and-mutex cycle of tests/kernel/deadlock/detection.test.ts. */
+function deadlockKernel() {
+  const kernel = makeKernel({ scheduler: 'rr', deadlockStrategy: 'detect',
+    schedulerParams: { ...REFERENCE_CONFIG.schedulerParams, quantum: 1, agingInterval: 0, starvationThreshold: 10_000, starvationFatalThreshold: 20_000 },
+    enabledSubsystems: ['process', 'scheduler', 'sync', 'deadlock'] }, { deadlockRecovery: 'none' });
+  const resource = asResourceId('mixed:R'); const lock = asResourceId('mixed:lock');
+  kernel.deadlockSubsystem.declare({ id: resource, displayName: 'R', totalInstances: 1, preemptible: false });
+  kernel.syncSubsystem.createMutex(lock);
+  const first = kernel.spawn({ name: 'resource-first', priority: 20, arrival: 0, burst: 1000, service: 1000, pages: 0 }, { program: instructionProgram([
+    { kind: 'syscall', call: { name: 'request', pid: asPid(0), args: [resource, 1] } },
+    { kind: 'syscall', call: { name: 'mutex_lock', pid: asPid(0), args: [lock] } },
+  ]) });
+  const second = kernel.spawn({ name: 'mutex-first', priority: 20, arrival: 0, burst: 1000, service: 1000, pages: 0 }, { program: instructionProgram([
+    { kind: 'syscall', call: { name: 'mutex_lock', pid: asPid(0), args: [lock] } },
+    { kind: 'syscall', call: { name: 'request', pid: asPid(0), args: [resource, 1] } },
+  ]) });
+  return { kernel, first, second, resource, lock };
+}
+
+/** The textbook allocation of sim spec 8.6.3 through the real resource table, as tests/kernel/deadlock/bankers.test.ts arranges it. */
+function bankersKernel() {
+  const kernel = makeKernel({ deadlockStrategy: 'detect', enabledSubsystems: ['process', 'scheduler', 'sync', 'deadlock'] });
+  const [A, B, C] = [asResourceId('A'), asResourceId('B'), asResourceId('C')];
+  for (const [id, totalInstances] of [[A, 10], [B, 5], [C, 7]] as const) kernel.declareResource({ id, displayName: id, totalInstances, preemptible: false });
+  const max = [[7, 5, 3], [3, 2, 2], [9, 0, 2], [2, 2, 2], [4, 3, 3]];
+  const allocation = [[0, 1, 0], [2, 0, 0], [3, 0, 2], [2, 1, 1], [0, 0, 2]];
+  const pids = max.map((_, index) => kernel.spawn({ name: `Bankers P${index}`, priority: 10, burst: 1000, service: 1000, arrival: 0, pages: 0 }, { program: instructionProgram([{ kind: 'compute' }]) }));
+  const vector = (row: readonly number[]) => [A, B, C].map((id, j) => [id, row[j] ?? 0] as const);
+  pids.forEach((pid, i) => { kernel.declareClaims(pid, vector(max[i] ?? [])); kernel.deadlockSubsystem.resources.grant(pid, vector(allocation[i] ?? [])); });
+  kernel.setDeadlockStrategy('avoid');
+  return { kernel, pids, A, B, C };
+}
+
+describe('deadlock commands', () => {
+  it('wfg cycle: prints the cycle from detectDeadlock rotated to its lowest pid, matching the kernel report', () => {
+    const d = deadlockKernel();
+    const f = shellWith(['wfg'], d.kernel);
+    const before = expectOk(f.shell, 'wfg');
+    expect(before).toContain('no cycle');
+    d.kernel.run(20);
+    const report = d.kernel.detectDeadlock();
+    expect(report?.cycle).toEqual([d.first, d.second]);
+    const after = expectOk(f.shell, 'wfg --cycle');
+    expect(after).not.toEqual(before);
+    expect(after).toContain(`cycle: P${d.first} -> P${d.second} -> P${d.first}`);
+    expect(after.some(line => line.startsWith(`P${d.first} -> P${d.second}`))).toBe(true);
+    expect(after.some(line => line.startsWith(`P${d.second} -> P${d.first}`))).toBe(true);
+    const explained = expectOk(f.shell, `wfg --explain ${d.first}-${d.second}`);
+    expect(explained[0]).toMatch(/demonstrates (mutual_exclusion|hold_and_wait|no_preemption|circular_wait)/);
+    expect(expectError(f.shell, 'wfg --explain 7-8').topic).toBe('wfg');
+    expect(expectError(f.shell, 'wfg --explain 7->8').topic).toBe('man');
+    expect(expectError(f.shell, 'wfg --watch').topic).toBe('wfg');
+  });
+
+  it('bankers trace: one line per SafetyTraceStep using its explanation, and the matrices from the host (acceptance 14)', () => {
+    const b = bankersKernel();
+    const f = shellWith(['bankers'], b.kernel);
+    const state = expectOk(f.shell, 'bankers --state');
+    expect(state[0]).toBe('available: A=3 B=3 C=2');
+    expect(state[1]).toMatch(/^PID\s+max A\s+max B\s+max C\s+alloc A/);
+    expect(state).toHaveLength(2 + 5);
+    const pid = b.pids[1] ?? asPid(0);
+    const check = expectOk(f.shell, `bankers --check ${pid} A 1`);
+    const result = b.kernel.evaluateBankers(pid, b.A, 1);
+    expect(check[1], check.join('\n')).toBe('safe: yes');
+    expect(check.slice(3)).toEqual(result.trace.map(step => step.explanation));
+    expect(check.length - 3).toBe(result.trace.length);
+    const sequence = expectOk(f.shell, 'bankers --sequence');
+    expect(sequence).toEqual(['safe: yes', 'sequence: P3 P5 P2 P4 P6']);
+    b.kernel.deadlockSubsystem.resources.grant(b.pids[0] ?? asPid(0), [[b.A, 3]]);
+    expect(expectOk(f.shell, 'bankers --state')).not.toEqual(state);
+    const error = expectError(f.shell, `bankers --check ${pid} Z 1`);
+    expect(error.topic).toBe('bankers');
+    expect(error.errno).toBe('ENOENT');
+  });
+
+  it('resources lists the live table and changes the strategy through exactly one dispatch', () => {
+    const f = shellWith(['resources'], makeKernel({ deadlockStrategy: 'detect' }));
+    const before = expectOk(f.shell, 'resources');
+    f.kernel.declareResource({ id: asResourceId('gate_c'), displayName: 'gate', totalInstances: 2, preemptible: false });
+    const after = expectOk(f.shell, 'resources --list');
+    expect(after).not.toEqual(before);
+    expect(after.some(line => line.startsWith('gate_c'))).toBe(true);
+    expect(expectOk(f.shell, 'resources --strategy ignore')).toEqual(['deadlock strategy set to ignore']);
+    expect(f.kernel.config.deadlockStrategy).toBe('ignore');
+    expect(f.run.decisions).toHaveLength(1);
+    expect(f.run.decisions[0]?.kind).toBe('set_deadlock_strategy');
+    expect(expectError(f.shell, 'resources --strategy pray').topic).toBe('resources');
+    expect(expectError(f.shell, 'resources --rank gate_c 1').topic).toBe('resources');
+    expect(f.run.decisions).toHaveLength(1);
+  });
+});
+
+/** A process that touches four pages in a loop, on eight frames, with demand paging live. */
+function pagingKernel(frames = 8) {
+  const kernel = makeKernel({ totalFrames: frames, enabledSubsystems: ['process', 'scheduler', 'memory', 'vm'] });
+  const pid = kernel.spawn({ name: 'pager', priority: 1, arrival: 0, burst: 200, service: 200, pages: 4, referenceString: Array.from({ length: 200 }, (_, i) => i % 4) });
+  return { kernel, pid };
+}
+
+describe('memory commands', () => {
+  it('free reports live totals and, with -f, the shape of the free space', () => {
+    const { kernel } = pagingKernel();
+    const f = shellWith(['free'], kernel);
+    const before = expectOk(f.shell, 'free');
+    expect(before[0]).toBe('total      8 frames');
+    kernel.run(20);
+    const after = expectOk(f.shell, 'free -f');
+    expect(after).not.toEqual(before);
+    expect(after.some(line => line.startsWith('free') && !line.includes('8 frames'))).toBe(true);
+    expect(after.some(line => /free runs/.test(line))).toBe(true);
+    expect(expectOk(f.shell, 'free -h')[0]).toContain('KiB');
+    expect(expectError(f.shell, 'free --shape').topic).toBe('free');
+  });
+
+  it('pagetable prints the live table of the running process, translates addresses and refuses bad pages', () => {
+    const { kernel, pid } = pagingKernel();
+    const f = shellWith(['pagetable'], kernel);
+    expect(expectError(f.shell, 'pagetable').topic).toBe('pagetable');
+    const before = expectOk(f.shell, `pagetable ${pid}`);
+    expect(before[0]).toContain('0 resident');
+    kernel.run(20);
+    const after = expectOk(f.shell, `pagetable ${pid} --bits`);
+    expect(after).not.toEqual(before);
+    expect(after[1]).toMatch(/PAGE\s+FRAME\s+VALID\s+DIRTY\s+REF\s+SWAPPED\s+R\s+W\s+X\s+ACCESSES/);
+    const translated = expectOk(f.shell, `pagetable ${pid} --translate 4300`);
+    expect(translated.some(line => line.startsWith('page') && line.endsWith('1'))).toBe(true);
+    expect(translated.some(line => line.startsWith('offset') && line.endsWith('204'))).toBe(true);
+    expect(expectOk(f.shell, `pagetable ${pid} --entry 0`)).toHaveLength(3);
+    expect(expectError(f.shell, `pagetable ${pid} --entry 9`).errno).toBe('EINVAL');
+    expect(expectError(f.shell, 'pagetable 999').errno).toBe('ESRCH');
+  });
+
+  it('tlb reports the live hit rate and entries, flushes through the sink, and refuses --entries', () => {
+    const { kernel } = pagingKernel();
+    const f = shellWith(['tlb'], kernel);
+    const before = expectOk(f.shell, 'tlb --stats');
+    expect(before[0]).toBe('capacity       16');
+    kernel.run(30);
+    const after = expectOk(f.shell, 'tlb');
+    expect(after).not.toEqual(before);
+    expect(after.length).toBeGreaterThan(4);
+    const flushed = expectOk(f.shell, 'tlb --flush');
+    expect(flushed[0]).toMatch(/^TLB flushed by P\d+$/);
+    expect(f.sink.dispatched).toEqual([{ kind: 'syscall', request: { name: 'ioctl', pid: expect.any(Number), args: ['kernel', 'tlb_flush'] } }]);
+    expect(expectOk(f.shell, 'tlb').some(line => line.startsWith('valid entries  0'))).toBe(true);
+    expect(expectError(f.shell, 'tlb --entries 32').topic).toBe('tlb');
+  });
+
+  it('frag reports both fragmentation measures live and refuses replays', () => {
+    const { kernel } = pagingKernel();
+    const f = shellWith(['frag'], kernel);
+    const before = expectOk(f.shell, 'frag');
+    expect(before.some(line => line.startsWith('external'))).toBe(true);
+    expect(before.some(line => line.startsWith('internal'))).toBe(true);
+    kernel.run(20);
+    expect(expectOk(f.shell, 'frag --external')).not.toEqual(before);
+    expect(expectOk(f.shell, 'frag --internal')).toHaveLength(1);
+    expect(expectError(f.shell, 'frag --compact').topic).toBe('frag');
+  });
+
+  it('vmstat reads the live fault counters and changes the policy through one dispatch', () => {
+    const { kernel } = pagingKernel(2);
+    const f = shellWith(['vmstat'], kernel);
+    const before = expectOk(f.shell, 'vmstat');
+    expect(before[0]).toBe('page faults          0');
+    kernel.run(60);
+    const after = expectOk(f.shell, 'vmstat --interval 60 --faults');
+    expect(after).not.toEqual(before);
+    expect(after.some(line => /^last 60 ticks: [1-9]\d* faults/.test(line))).toBe(true);
+    expect(after.some(line => /^TICK\s+PID\s+PAGE\s+MAJOR/.test(line))).toBe(true);
+    expect(expectOk(f.shell, 'vmstat --policy fifo')).toEqual(['replacement policy now fifo']);
+    expect(f.run.decisions).toHaveLength(1);
+    expect(f.sink.dispatched).toEqual([{ kind: 'set_replacement', id: 'fifo' }]);
+    expect(expectError(f.shell, 'vmstat --policy magic').topic).toBe('vmstat');
+    expect(expectError(f.shell, 'vmstat --interval 0').topic).toBe('vmstat');
+  });
+
+  it('ws reports live working sets against allocated frames and the budget', () => {
+    const { kernel, pid } = pagingKernel();
+    const f = shellWith(['ws'], kernel);
+    const before = expectOk(f.shell, 'ws');
+    expect(before[0]).toBe('window 10 ticks');
+    kernel.run(20);
+    const after = expectOk(f.shell, `ws ${pid} --budget`);
+    expect(after).not.toEqual(before);
+    expect(after.some(line => line.startsWith('budget: working sets total'))).toBe(true);
+    expect(expectError(f.shell, 'ws --window 5').topic).toBe('ws');
+    expect(expectError(f.shell, 'ws 999').errno).toBe('ESRCH');
+  });
+
+  it('degree reads the live degree and sets it through exactly one dispatch', () => {
+    const { kernel } = pagingKernel();
+    const f = shellWith(['degree'], kernel);
+    const before = expectOk(f.shell, 'degree');
+    expect(before[0]).toBe('degree      8');
+    expect(expectOk(f.shell, 'degree --set 2')).toEqual(['degree of multiprogramming set to 2']);
+    expect(f.host.degree()).toBe(2);
+    expect(f.run.decisions).toHaveLength(1);
+    expect(f.run.policy.degreeOfMultiprogramming).toBe(2);
+    expect(expectOk(f.shell, 'degree')).not.toEqual(before);
+    expect(expectError(f.shell, 'degree --set 0').topic).toBe('degree');
+    expect(expectError(f.shell, 'degree --set 99').topic).toBe('degree');
+    expect(expectError(f.shell, 'degree --suspend 3').topic).toBe('degree');
+    expect(f.run.decisions).toHaveLength(1);
+  });
+
+  it('belady is a definition without a handler until a leg supplies one', () => {
+    const f = shellWith(['belady']);
+    const error = expectError(f.shell, 'belady --policy fifo --frames 3');
+    expect(error.topic).toBe('belady');
+    expect(error.message).toContain('no handler');
+  });
+});
+
+describe('decisions', () => {
+  it('decision recorded: every policy command appends exactly one DecisionRecord (acceptance 8)', () => {
+    const { kernel } = pagingKernel();
+    const f = shellWith(['sched', 'nice', 'degree', 'resources', 'vmstat'], kernel);
+    const pid = runningProcess(kernel);
+    const lines = ['sched --policy rr --quantum 2', `nice -n 3 ${pid}`, 'degree --set 3', 'resources --strategy ignore', 'vmstat --policy clock'];
+    for (const [index, line] of lines.entries()) {
+      expectOk(f.shell, line);
+      expect(f.run.decisions, line).toHaveLength(index + 1);
+    }
+    expect(f.run.decisions.map(record => record.kind)).toEqual(['set_scheduler', 'syscall', 'set_degree', 'set_deadlock_strategy', 'set_replacement']);
   });
 });
 
