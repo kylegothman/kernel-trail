@@ -325,7 +325,11 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
     onShow: () => undefined, onBlur: () => undefined, onFocus: () => undefined,
   });
   const unbindLoss = boot.backend.onDeviceLost(info => panic(info.reason));
-  const resize = (): void => { focus.setViewport(view.innerWidth / Math.max(1, view.innerHeight), view.innerHeight); atlas?.setViewport(view.innerHeight); };
+  const resize = (): void => {
+    const aspect = view.innerWidth / Math.max(1, view.innerHeight);
+    focus.setViewport(aspect, view.innerHeight); atlas?.setViewport(view.innerHeight);
+    stage?.frameCamera(target, aspect, view.innerHeight);
+  };
   view.addEventListener('resize', resize);
   const hide = (): void => { if (!disposed && runner.kernel !== null) runner.saveProvisional(); };
   view.addEventListener('pagehide', hide);
@@ -381,8 +385,12 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
       kernel: { process: pid => runner.kernel?.process(pid), get tick() { return runner.kernel?.tick ?? asTick(0); } } };
     const services: StageServices = { createBatch: desc => boot.backend.createInstancedBatch(desc), postFocus: post.state };
     stage = buildLayoutStage(module.content.layout, ctx, services, focus, atlas);
+    stage.frameCamera(target, view.innerWidth / Math.max(1, view.innerHeight), view.innerHeight);
     await stage.ready;
-    if (!disposed) interactionPanel.open(module.default, module.content);
+    if (!disposed) {
+      stage.frameCamera(target, view.innerWidth / Math.max(1, view.innerHeight), view.innerHeight);
+      interactionPanel.open(module.default, module.content);
+    }
   }
   async function advance(to = index + 1): Promise<void> {
     if (disposed || transitioning || panicked) return;

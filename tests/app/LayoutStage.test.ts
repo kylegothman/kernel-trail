@@ -266,3 +266,127 @@ describe('browser layout stage', () => {
     for (const disposed of owned.values()) expect(disposed).toHaveBeenCalledOnce();
   });
 });
+
+/** Label shaping stays a browser boundary; retain realistic text width for framing. */
+function framingHarness() {
+  const base = setup();
+  const assets: Awaited<ReturnType<typeof holoLabel>>[] = [];
+  const provider: typeof holoLabel = async (text, _semantic, _tier, capHeight) => {
+    const object = new Group();
+    const width = Math.max(1, text.length + 2) * capHeight * 0.85;
+    const geometry = new PlaneGeometry(width, capHeight * 1.4);
+    const mesh = new Mesh(geometry, materials.createLabelPlateMaterial());
+    mesh.position.set(width / 2, -capHeight * 0.2, 0);
+    mesh.layers.set(LAYER.TEXT); object.add(mesh);
+    const asset = {
+      object, mesh, minimumDevicePixels: MIN_GLYPH_PX, microRem: TYPE_SCALE.micro.sizeRem,
+      dispose: vi.fn(() => { geometry.dispose(); mesh.material.dispose(); object.removeFromParent(); }),
+    };
+    assets.push(asset);
+    return asset;
+  };
+  const atlas = new SdfAtlas('high', base.focus, 900, provider);
+  cleanups.push(() => atlas.dispose());
+  return { ...base, atlas, assets, place: vi.spyOn(atlas, 'place'), context: { ...base.context, labels: atlas } };
+}
+
+describe('browser layout presentation', () => {
+  it('keeps a layout floor within one module and retains the separate environment ground', async () => {
+    const { GRID, MODULE_PITCH_M } = await import('@design');
+    const harness = setup();
+    const stage = build(harness, {
+      anchors: [{ id: 'plate', kind: 'grid_floor', position: [0, 0, 0] }], cameraTargets: [], extras: ['plate'],
+    });
+    await stage.ready;
+    const source = stage.structures[0]?.sourceGeometry;
+    if (!source) throw new Error('Expected a layout floor');
+    source.computeBoundingBox();
+    const size = source.boundingBox?.getSize(new Vector3());
+    expect(size?.x).toBeCloseTo(MODULE_PITCH_M);
+    expect(size?.z).toBeCloseTo(MODULE_PITCH_M);
+    const ground = harness.scene.getObjectByName('kt.env.ground.grid');
+    if (!(ground instanceof Mesh)) throw new Error('Expected the environment ground');
+    ground.geometry.computeBoundingBox();
+    expect(ground.geometry.boundingBox?.getSize(new Vector3()).x).toBeCloseTo(GRID.planeSizeM);
+    expect(source).not.toBe(ground.geometry);
+  });
+
+  it('assembles the ambient and key lights for lit stand-ins', async () => {
+    const { DirectionalLight, HemisphereLight } = await import('three/webgpu');
+    const harness = setup();
+    const stage = build(harness, {
+      anchors: [{ id: 'slab', kind: 'slab', position: [0, 0, 0] }], cameraTargets: ['slab'], extras: [],
+    });
+    await stage.ready;
+    const lights = harness.scene.getObjectByName('kt.lights')?.children ?? [];
+    expect(lights.filter(light => light instanceof HemisphereLight)).toHaveLength(1);
+    expect(lights.filter(light => light instanceof DirectionalLight)).toHaveLength(1);
+    expect(lights.every(light => light.layers.isEnabled(LAYER.LIGHTS))).toBe(true);
+  });
+
+  for (const leg of ['boot_sector', 'quantum_pass', 'allocation_yards', 'the_narrows'] as const) {
+    for (const [width, height] of [[1440, 900], [900, 900]] as const) {
+      it(`frames ${leg} stand-ins and label plates at ${width} by ${height}`, async () => {
+        const { CAMERA, WORLD_CAP_HEIGHT_M } = await import('@design');
+        const layouts = {
+          boot_sector: () => import('@legs/boot_sector/stage'),
+          quantum_pass: () => import('@legs/quantum_pass/stage'),
+          allocation_yards: () => import('@legs/allocation_yards/stage'),
+          the_narrows: () => import('@legs/the_narrows/stage'),
+        };
+        const { layout } = await layouts[leg]();
+        const harness = framingHarness();
+        const stage = build(harness, layout);
+        await stage.ready;
+        const target = { focus: new Vector3(), yawRad: 0, pitchRad: Math.PI / 6, distanceM: Number(CAMERA.distanceMinM) };
+        stage.frameCamera(target, width / height, height);
+        expect(target.distanceM).toBeGreaterThan(CAMERA.distanceMinM);
+        expect(target.distanceM).toBeLessThanOrEqual(CAMERA.distanceMaxM);
+        // Long labels can use the outer margin when the frozen zoom limit is reached.
+        const frameLimit = target.distanceM === CAMERA.distanceMaxM ? 0.9 : 0.75;
+        harness.focus.setViewport(width / height, height);
+        harness.atlas.setViewport(height);
+        harness.focus.setFreeTarget(target);
+        stage.update(0, 0);
+        const camera = harness.focus.camera;
+        for (const structure of stage.structures) {
+          expect(structure.root.position.toArray()).toEqual(structure.definition.position);
+          if (structure.formKind === 'horizon') continue;
+          const bounds = structure.sourceGeometry.boundingBox;
+          if (bounds === null) throw new Error('Expected finite stand-in bounds');
+          const projected: Vector3[] = [];
+          for (const x of [bounds.min.x, bounds.max.x]) for (const y of [bounds.min.y, bounds.max.y]) {
+            for (const z of [bounds.min.z, bounds.max.z]) {
+              const point = new Vector3(x, y, z).applyMatrix4(structure.root.matrixWorld).project(camera);
+              projected.push(point);
+              expect(Math.abs(point.x)).toBeLessThan(frameLimit);
+              expect(Math.abs(point.y)).toBeLessThan(frameLimit);
+              expect(point.z).toBeGreaterThan(-1);
+              expect(point.z).toBeLessThan(1);
+            }
+          }
+          if (structure.formKind === 'slab') {
+            const screenWidth = (Math.max(...projected.map(point => point.x)) - Math.min(...projected.map(point => point.x))) / 2;
+            expect(screenWidth).toBeLessThan(0.15);
+          }
+        }
+        for (const asset of harness.assets) {
+          asset.object.updateWorldMatrix(true, true);
+          asset.mesh.geometry.computeBoundingBox();
+          const bounds = asset.mesh.geometry.boundingBox;
+          if (bounds === null) throw new Error('Expected label bounds');
+          for (const x of [bounds.min.x, bounds.max.x]) for (const y of [bounds.min.y, bounds.max.y]) {
+            const point = new Vector3(x, y, 0).applyMatrix4(asset.mesh.matrixWorld).project(camera);
+            expect(Math.abs(point.x)).toBeLessThan(frameLimit);
+            expect(Math.abs(point.y)).toBeLessThan(frameLimit);
+          }
+          const baseline = new Vector3().applyMatrix4(asset.object.matrixWorld).project(camera);
+          const cap = new Vector3(0, WORLD_CAP_HEIGHT_M.structureTitle, 0).applyMatrix4(asset.object.matrixWorld).project(camera);
+          const pixels = Math.abs(cap.y - baseline.y) * height / 2;
+          expect(pixels).toBeGreaterThanOrEqual(MIN_GLYPH_PX - 0.01);
+          expect(pixels).toBeLessThanOrEqual(20.01);
+        }
+      });
+    }
+  }
+});

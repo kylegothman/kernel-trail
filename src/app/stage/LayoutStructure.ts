@@ -1,7 +1,7 @@
 /** Stand-in forms over layout data. The structures package replaces their art. */
 import { Mesh, Vector2, Vector3 } from 'three/webgpu';
 import type { BufferGeometry, Object3D } from 'three/webgpu';
-import { FOCUS, LAYER, WORLD_CAP_HEIGHT_M } from '@design';
+import { FOCUS, GRID, LAYER, MODULE_PITCH_M, WORLD_CAP_HEIGHT_M } from '@design';
 import type { LayoutAnchor, StructureKind } from '@legs/layout';
 import type { QualityTier } from '@platform';
 import { getMaterial, prepareSemanticGeometry } from '@render';
@@ -26,7 +26,11 @@ export function layoutFormKind(kind: StructureKind): FormKind {
 
 export function formGeometry(kind: FormKind, tier: QualityTier): BufferGeometry {
   switch (kind) {
-    case 'grid_floor': return makeGridFloor();
+    case 'grid_floor': return cachedGeometry('layout.grid-floor.module', () => {
+      // The environment owns the 4000 m ground. An anchor is one layout module.
+      const scale = MODULE_PITCH_M / GRID.planeSizeM;
+      return makeGridFloor().clone().scale(scale, 1, scale);
+    });
     case 'stele': return makeStele();
     case 'slab': return makeSlab();
     case 'page_plate': return makePagePlate();
