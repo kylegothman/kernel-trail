@@ -22,6 +22,7 @@ function rig() {
     setReplacementPolicy: (id) => record('setReplacementPolicy', id),
     setDiskPolicy: (id) => record('setDiskPolicy', id),
     setAllocationStrategy: (s) => record('setAllocationStrategy', s),
+    setDeadlockStrategy: (strategy) => record('setDeadlockStrategy', strategy),
     syscall: (request: SyscallRequest): SyscallResult => {
       record('syscall', request);
       return { ok: true, value: 7 };
@@ -95,6 +96,7 @@ describe('CommandBus', () => {
       setReplacementPolicy: () => undefined,
       setDiskPolicy: () => undefined,
       setAllocationStrategy: () => undefined,
+      setDeadlockStrategy: () => undefined,
       syscall: () => ({ ok: true, value: null }),
     };
     const bus = new CommandBus({ store: r.store, kernel, handlers: { useAbility: () => undefined, interaction: () => undefined, terminal: () => undefined } });
@@ -115,6 +117,11 @@ describe('CommandBus', () => {
     // The variants EVERY_COMMAND does not cover: a scheduler without a quantum, and typed syscall args.
     const bare: Command = { kind: 'set_scheduler', to: 'srtf' };
     expect(commandFromRecord({ tick: tick(1), legId: 'boot_sector', kind: 'set_scheduler', choice: describeChoice(bare), outcome: 'pending', relatedObjective: null })).toEqual(bare);
+    expect(commandFromRecord({ tick: tick(1), legId: 'boot_sector', kind: 'set_scheduler', choice: '[terminal] ' + describeChoice(bare), outcome: 'pending', relatedObjective: null })).toEqual(bare);
+    for (const to of ['ignore', 'detect', 'avoid', 'prevent'] as const) {
+      const deadlock: Command = { kind: 'set_deadlock_strategy', to };
+      expect(commandFromRecord({ tick: tick(1), legId: 'boot_sector', kind: deadlock.kind, choice: describeChoice(deadlock), outcome: 'pending', relatedObjective: null })).toEqual(deadlock);
+    }
     const typed: Command = { kind: 'syscall', request: { name: 'open', pid: 4 as never, args: ['/tmp, a', 1, true] } };
     expect(describeChoice(typed)).toBe('open("/tmp, a", 1, true) pid=4');
     expect(commandFromRecord({ tick: tick(1), legId: 'boot_sector', kind: 'syscall', choice: describeChoice(typed), outcome: 'pending', relatedObjective: null })).toEqual(typed);

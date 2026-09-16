@@ -25,7 +25,7 @@
 import type { DiskSchedulingId, PageReplacementId, SchedulerId } from '@kernel/types';
 import type { DecisionRecord, DifficultyTier, DiscClass, LegId, TravelPolicy } from '@game/types';
 import { describeAlternative } from './phrasing';
-import type { ObservedLeg, ReplayKernel, ReplayOverrides, ReplayRequest } from './types';
+import type { ObservedLeg, ReplayEntry, ReplayKernel, ReplayOverrides, ReplayRequest } from './types';
 
 export type CounterfactualRow = 'starvation' | 'thrashing' | 'deadlock' | 'waiting' | 'faults' | 'seek' | 'clean';
 
@@ -84,6 +84,8 @@ export interface PlannerInput {
   readonly policy: Readonly<TravelPolicy>;
   readonly maxTicks: number;
   readonly thresholds?: PlannerThresholds;
+  /** Live leg-entry data; omitted only by legacy planner callers. */
+  readonly entry?: ReplayEntry;
 }
 
 /**
@@ -119,6 +121,7 @@ export function planCounterfactuals(input: PlannerInput): readonly Counterfactua
       // A policy row replaces the player's choice for the whole leg, so the recorded changes of that kind are dropped.
       overrides: { ...overrides, suppressRecordedPolicyChanges: true },
       maxTicks: input.maxTicks,
+      ...(input.entry === undefined ? {} : { entry: input.entry }),
       ...(configPatch === undefined ? {} : { configPatch }),
     };
     plans.push({ row, label: describeAlternative(request), request, floor });

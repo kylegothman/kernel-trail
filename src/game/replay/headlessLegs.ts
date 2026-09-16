@@ -10,7 +10,7 @@
  * throwing stubs; a leg package registers its factory here in phase 2.
  */
 
-import type { Leg, LegId, LegSetupContext, RunState } from '@game/types';
+import type { Leg, LegId, LegSetupContext, RunState, ProcessSpec } from '@game/types';
 import { asResourceId, type ConvoyMemberId, type Pid, type Rng } from '@kernel/types';
 import type { HeadlessLeg, HeadlessLegFactory, ReplayHooks, ReplayKernel } from './types';
 
@@ -87,23 +87,31 @@ export type ConvoyBindings = Map<ConvoyMemberId, Pid>;
  * through a different road (the syscall table, say) would emit different
  * events and break the identity between a live leg and its replay.
  */
-export function createHeadlessSetupContext(kernel: ReplayKernel, run: RunState, rng: Rng, bindings: ConvoyBindings): LegSetupContext {
+export function createHeadlessSetupContext(
+  kernel: ReplayKernel,
+  run: RunState,
+  rng: Rng,
+  bindings: ConvoyBindings,
+  transform?: (spec: ProcessSpec) => ProcessSpec,
+): LegSetupContext {
   return {
     run,
     rng: { next: () => rng.next(), int: (a, b) => rng.int(a, b) },
-    spawn: (spec) =>
-      kernel.spawn(
+    spawn: (spec) => {
+      const transformed = transform === undefined ? spec : transform(spec);
+      return kernel.spawn(
         {
-          name: spec.name,
-          priority: spec.priority,
-          burst: spec.burst,
-          service: spec.service,
-          arrival: spec.arrival,
-          pages: spec.pages,
-          ...(spec.referenceString === undefined ? {} : { referenceString: spec.referenceString }),
+          name: transformed.name,
+          priority: transformed.priority,
+          burst: transformed.burst,
+          service: transformed.service,
+          arrival: transformed.arrival,
+          pages: transformed.pages,
+          ...(transformed.referenceString === undefined ? {} : { referenceString: transformed.referenceString }),
         },
-        spec.serialFraction === undefined ? {} : { serialFraction: spec.serialFraction },
-      ),
+        transformed.serialFraction === undefined ? {} : { serialFraction: transformed.serialFraction },
+      );
+    },
     bind: (member, pid) => {
       bindings.set(member, pid);
     },
