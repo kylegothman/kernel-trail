@@ -11,12 +11,15 @@
  * the shell can never print a canned response.
  */
 import type { TerminalCommandDef } from '@game/types';
-import type { Errno } from '@kernel/types';
+import type { Errno, Pid } from '@kernel/types';
 import type { ShellContext } from './Shell';
+import { bindFlags, parseInteger, type BoundArgs, type FlagSpec } from './parser';
 
 export type CommandResult =
   | { readonly ok: true; readonly lines: readonly string[] }
   | { readonly ok: false; readonly message: string; readonly topic: string; readonly errno?: Errno };
+
+export type CommandFailure = Extract<CommandResult, { readonly ok: false }>;
 
 /** Enumerable argument kinds a command declares so Tab completion can offer live values. */
 export type CompletionKind =
@@ -48,9 +51,27 @@ export interface ShippedHandler {
 export const ok = (lines: readonly string[]): CommandResult => ({ ok: true, lines });
 
 /** Every error names the man topic that explains it (WP-15 spec 4). */
-export function fail(topic: string, text: string, errno?: Errno): CommandResult {
+export function fail(topic: string, text: string, errno?: Errno): CommandFailure {
   const message = `${text} See man ${topic}.`;
   return errno === undefined ? { ok: false, message, topic } : { ok: false, message, topic, errno };
+}
+
+/** The error every unsupported flag returns (pre-flight F19): an error with a topic, never output. */
+export function unavailable(topic: string, flag: string, reason: string): CommandFailure {
+  return fail(topic, `${flag} is not available in this shell: ${reason}.`);
+}
+
+/** Bind flags or explain the mistake under the command's own man topic. */
+export function bindOrFail(topic: string, argv: readonly string[], spec: FlagSpec): { readonly ok: true; readonly args: BoundArgs } | CommandFailure {
+  const bound = bindFlags(argv, spec);
+  return bound.ok ? bound : fail(topic, `${bound.message}.`);
+}
+
+/** A positional or flag value that must be a process id. */
+export function pidArg(text: string | undefined, topic: string): { readonly ok: true; readonly pid: Pid } | CommandFailure {
+  const value = parseInteger(text);
+  if (value === null || value < 0) return fail(topic, `'${text ?? ''}' is not a process id.`);
+  return { ok: true, pid: value as Pid };
 }
 
 /** The names whose handlers a later leg supplies (scope correction T6). */

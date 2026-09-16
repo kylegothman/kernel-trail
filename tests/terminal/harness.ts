@@ -115,11 +115,11 @@ export function runningProcess(kernel: KernelImpl, name = 'worker', service = 40
   return pid;
 }
 
-/** A process that has exited and waits for its parent (init) to reap it: never, since init only reaps orphans of dead parents. */
+/** A process that has exited and now waits for its parent to reap it. Any admitted process may call exit (WP-11 decision D3). */
 export function makeZombie(kernel: KernelImpl, parent?: Pid): Pid {
   const options = parent === undefined ? { program: instructionProgram([{ kind: 'compute' }]) } : { program: instructionProgram([{ kind: 'compute' }]), parent };
   const pid = kernel.spawn({ name: 'zombie', priority: 1, arrival: 0, burst: 400, service: 400, pages: 0 }, options);
-  runUntil(kernel, () => kernel.process(pid)?.state === 'running', 50);
+  runUntil(kernel, () => kernel.process(pid)?.state !== 'new', 50);
   expect(kernel.syscall({ name: 'exit', pid, args: [0] })).toEqual({ ok: true, value: null });
   expect(kernel.process(pid)?.state).toBe('zombie');
   return pid;
