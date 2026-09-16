@@ -11,7 +11,7 @@ import type { CrossingContext, CrossingOption } from './crossing/options';
 import type { Depot } from './depot/Depot';
 import type { ReclamationResult, ReclamationTrace } from './reclamation/Reclamation';
 import type { VergeLayout } from './reclamation/verge';
-import { createHeadlessSetupContext, registerHeadlessLeg, type ConvoyBindings } from './replay/headlessLegs';
+import { populateHeadless, registerHeadlessLeg, type ConvoyBindings } from './replay/headlessLegs';
 import { planCounterfactuals } from './replay/CounterfactualPlanner';
 import { hashEventLog } from './replay/hash';
 import { phraseCounterfactual, toCodexCounterfactual } from './replay/phrasing';
@@ -28,7 +28,7 @@ import { PACE_TABLE } from './travel/paceRations';
 import { livePolicyBinding } from './travel/policyBinding';
 import { DEPOT_LEGS } from './travel/segments';
 import { paceSpawnTransform } from './travel/workload';
-import { LEG_ORDER, type Epitaph, type Leg, type LegId, type LegOutcome, type LegStage, type RunState, type SaveFile, type StageContext } from './types';
+import { LEG_ORDER, type DecisionRecord, type Epitaph, type Leg, type LegId, type LegOutcome, type LegStage, type RunState, type SaveFile, type StageContext } from './types';
 import type { ReplayWorkerHandle } from './workers/ReplayWorkerHandle';
 import type { LegContent } from '@legs/content';
 
@@ -201,7 +201,7 @@ export class LegRunner {
     if (base === null) { this.skip(leg, 'kernelConfig failed'); return; }
     const kernel = this.deps.createKernel(configured(base, draft), { ...REPLAY_KERNEL_OPTIONS, devBuild: true, checkInvariants: true });
     const bindings: ConvoyBindings = new Map();
-    if (!sandbox.populate(createHeadlessSetupContext(kernel, draft, this.deps.streams.leg.fork(leg.id), bindings, paceSpawnTransform(draft.policy.pace)))) {
+    if (!populateHeadless(leg.id, (ctx) => sandbox.populate(ctx), kernel, draft, this.deps.streams.leg.fork(leg.id), bindings, paceSpawnTransform(draft.policy.pace))) {
       restoreRunStreams(this.deps.streams, before); this.skip(leg, 'populate failed'); return;
     }
     for (const member of draft.convoy) member.pid = member.status === 'derezzed' ? null : bindings.get(member.id) ?? null;
@@ -298,7 +298,9 @@ export class LegRunner {
     if (director.failed && this.rollbackCheckpoint()) return skippedOutcome(leg);
     const before = cloneRunState(this.deps.runStore.get());
     const snapshot = kernel.snapshot();
+    const decisionsBefore = before.decisions.length;
     const raw = sandbox.evaluate({ run: before, kernelSnapshot: snapshot, events: director.allEvents, ticksElapsed: kernel.tick });
+    this.copyEvaluateDecisions(before.decisions.slice(decisionsBefore), this.deps.runStore);
     const resolved = this.effectiveOutcome(leg, raw, before, snapshot.metrics.scheduling.throughput, director.travel.onCredit);
     const pending = this.counterfactual(leg, kernel, director, before);
     const view = buildDebrief({ outcome: raw, run: before, legTicks: kernel.tick, throughputFactor: resolved.factor, dividend: resolved.dividend,
@@ -321,6 +323,20 @@ export class LegRunner {
     this.deps.persist(this.saveInput(null), 'boundary');
     this.installKernel(null);
     return resolved.outcome;
+  }
+
+  /**
+   * WP-L04 ruling 5: a hand-off record a leg appends to `ctx.run.decisions`
+   * inside `evaluate` reaches the run. `evaluate` is handed a copy on the live
+   * path, so the copy is where the record lands and it would otherwise be
+   * dropped; on the headless path `ctx.run` is the store's own root, and the
+   * identity check below is what keeps that case from recording it twice.
+   */
+  private copyEvaluateDecisions(appended: readonly DecisionRecord[], store: Store<RunState>): void {
+    if (appended.length === 0 || store.get().decisions === appended) return;
+    store.mutate((run) => {
+      for (const record of appended) run.decisions.push({ ...record });
+    });
   }
 
   private async counterfactual(leg: Leg, kernel: ReplayKernel, director: RunDirector, run: RunState): Promise<{ readonly text: string; readonly codex: CodexCounterfactual } | null> {
@@ -363,7 +379,12 @@ export class LegRunner {
           if (!sandbox.populate({ ...ctx, run: prepareLegEntry(ctx.run, leg) })) throw new Error(`Headless populate failed: ${leg.id}`);
         },
         evaluate: (ctx) => {
-          const outcome = this.effectiveOutcome(leg, sandbox.evaluate(ctx), ctx.run, ctx.kernelSnapshot.metrics.scheduling.throughput, replayDirector?.travel.onCredit ?? false).outcome;
+          const decisionsBefore = ctx.run.decisions.length;
+          const evaluated = sandbox.evaluate(ctx);
+          const appended = ctx.run.decisions.slice(decisionsBefore);
+          // Only when evaluate was handed a copy; in replay `ctx.run` is the store's root and the push already landed.
+          if (replayStore !== null && replayStore.get() !== ctx.run) this.copyEvaluateDecisions(appended, replayStore);
+          const outcome = this.effectiveOutcome(leg, evaluated, ctx.run, ctx.kernelSnapshot.metrics.scheduling.throughput, replayDirector?.travel.onCredit ?? false).outcome;
           // Replay applies the outcome after this callback. Project it on a copy
           // so the following leg sees the same boundary score without applying
           // resource deltas or awards to the actual store twice (V13).
@@ -391,7 +412,7 @@ export class LegRunner {
         return this.deps.createKernel(configured(config, run), { ...REPLAY_KERNEL_OPTIONS, devBuild: true, checkInvariants: true });
       },
       populate: (kernel, run) => {
-        if (!sandbox.populate(createHeadlessSetupContext(kernel, run, this.deps.streams.leg.fork(leg.id), bindings, paceSpawnTransform(run.policy.pace)))) throw new Error('Checkpoint populate failed.');
+        if (!populateHeadless(leg.id, (ctx) => sandbox.populate(ctx), kernel, run, this.deps.streams.leg.fork(leg.id), bindings, paceSpawnTransform(run.policy.pace))) throw new Error('Checkpoint populate failed.');
         for (const member of run.convoy) member.pid = member.status === 'derezzed' ? null : bindings.get(member.id) ?? null;
       },
     });
@@ -512,7 +533,7 @@ export class LegRunner {
         },
         populate: (kernel) => {
           const run = structuredClone(entry.run);
-          if (!sandbox.populate(createHeadlessSetupContext(kernel, run, this.deps.streams.leg.fork(target.id), bindings, paceSpawnTransform(run.policy.pace)))) throw new Error('Resume populate failed.');
+          if (!populateHeadless(target.id, (ctx) => sandbox.populate(ctx), kernel, run, this.deps.streams.leg.fork(target.id), bindings, paceSpawnTransform(run.policy.pace))) throw new Error('Resume populate failed.');
         },
       });
       if (resumed.kind !== 'ok') throw new Error(resumed.message);
