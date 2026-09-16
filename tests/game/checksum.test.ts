@@ -57,6 +57,12 @@ describe('canonicalise', () => {
     expect(fnv1a64('foobar')).toBe('85944171f73967e8');
   });
 
+  it('known vectors: the standard FNV-1a 64 test vectors', () => {
+    expect(fnv1a64('')).toBe('cbf29ce484222325');
+    expect(fnv1a64('a')).toBe('af63dc4c8601ec8c');
+    expect(fnv1a64('foobar')).toBe('85944171f73967e8');
+  });
+
   it('tamper detected: a hand-edited score fails verification', () => {
     const f = file();
     const edited: SaveFile = { ...f, run: { ...f.run, score: { ...f.run.score, total: f.run.score.total + 5000 } } };
