@@ -6,6 +6,7 @@ import { createBenchmarkHost } from '@render/backend/benchmarkHost';
 import { GeometryLeases, makeSlab } from '@world/forms';
 import { Database } from '@game/save';
 import type { DiscClass, DifficultyTier, SaveFile } from '@game/types';
+import { CARD_CSS } from '@ui/cards/cards.css';
 
 export interface BootContext {
   readonly buildId: string;
@@ -70,6 +71,12 @@ export async function bootBrowser(canvas: HTMLCanvasElement, options: BootOption
     const camera = new PerspectiveCamera(46, view.innerWidth / Math.max(1, view.innerHeight), 0.1, 2000);
     for (let i = 0; i < 12; i++) backend.renderFrame({ scene, camera, alpha: 0, dtSeconds: 1 / 60, elapsedSeconds: i / 60 });
     await db.open();
+    if (doc.getElementById('kt-card-styles') === null) {
+      const style = doc.createElement('style');
+      style.id = 'kt-card-styles';
+      style.textContent = CARD_CSS;
+      doc.head.append(style);
+    }
     doc.body.append(overlay);
   } catch (error) {
     view.removeEventListener('resize', fit);

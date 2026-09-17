@@ -1,5 +1,5 @@
 /** Real browser assembly probe. GPU evidence is collected only on Kyle's machine. */
-import { Mesh } from 'three/webgpu';
+import { InstancedMesh, Mesh } from 'three/webgpu';
 import type { BufferGeometry, Scene } from 'three/webgpu';
 import { bootBrowser } from '../../../src/app/boot';
 import type { BootContext } from '../../../src/app/boot';
@@ -9,9 +9,11 @@ import { CACHE_KEY } from '../../../src/platform';
 import type { LegModule } from '../../../src/legs/content';
 import type { LegLayout } from '../../../src/legs/layout';
 import { layoutStage } from '../../../src/legs/layout';
+import { layout as bootSectorLayout } from '../../../src/legs/boot_sector/stage';
 import { makeGridFloor, makeHorizon, makeSlab, makeStele } from '../../../src/world/forms';
 import { PS_DEF } from '../../../src/terminal/commands/process';
 import { createSyntheticLeg } from '../../game/fixtures/syntheticLeg';
+import { awaitReadback } from './awaitReadback';
 
 const SEED = 77;
 const MEASURED_FRAMES = 120;
@@ -105,6 +107,12 @@ function observeDisposal(geometries: Iterable<BufferGeometry>) {
   return observed;
 }
 
+function errorMessage(value: unknown): string {
+  if (value instanceof Error) return value.stack ?? value.message;
+  if (value !== null && typeof value === 'object' && 'message' in value) return String(value.message);
+  return String(value);
+}
+
 async function initialize(): Promise<void> {
   const canvas = document.querySelector<HTMLCanvasElement>('#stage');
   assert(canvas !== null, 'Boot probe canvas missing');
@@ -115,6 +123,14 @@ async function initialize(): Promise<void> {
   let session: BrowserSession | undefined;
   let clock: ReturnType<typeof fakeClock> | undefined;
   let restoreRender: (() => void) | undefined;
+  let restoreRendererError: (() => void) | undefined;
+  const consoleErrors: string[] = [];
+  const rendererErrors: string[] = [];
+  const originalConsoleError = console.error;
+  console.error = (...values: unknown[]) => {
+    consoleErrors.push(values.map(errorMessage).join(' '));
+    originalConsoleError.apply(console, values);
+  };
   let disposed = false;
   const dispose = (): void => {
     if (disposed) return;
@@ -122,12 +138,29 @@ async function initialize(): Promise<void> {
     try { session?.dispose(); }
     finally {
       try { restoreRender?.(); boot?.dispose(); }
-      finally { clock?.restore(); }
+      finally { restoreRendererError?.(); console.error = originalConsoleError; clock?.restore(); }
     }
   };
   try {
     const context = await bootBrowser(canvas, { forceWebGL, tier: 'high' });
     boot = context;
+    const renderer = context.backend.deviceRenderer;
+    const originalRendererError = renderer.onError;
+    renderer.onError = error => {
+      rendererErrors.push(errorMessage(error));
+      originalRendererError.call(renderer, error);
+    };
+    restoreRendererError = () => { renderer.onError = originalRendererError; };
+    const assertNoRenderErrors = async (): Promise<void> => {
+      // A completed readback gives asynchronous validation errors time to arrive
+      // before disposal can hide them. This uses the same public target as the benchmark.
+      const output = context.backend.postChain?.budget.targets.get('tonemap_output');
+      assert(output !== undefined, 'Boot probe needs its final render target');
+      await awaitReadback(renderer.readRenderTargetPixelsAsync(output, 0, 0, 1, 1), controlled);
+      await yieldBrowser();
+      assert(rendererErrors.length === 0, `Boot renderer errors:\n${rendererErrors.join('\n')}`);
+      assert(consoleErrors.length === 0, `Boot console errors:\n${consoleErrors.join('\n')}`);
+    };
     const backendId = context.backend.id;
     assert(backendId === (forceWebGL ? 'webgl2' : 'webgpu'), 'Boot backend must match the request');
     assert(context.tier === 'high', 'Boot fixture must use high tier');
@@ -137,13 +170,18 @@ async function initialize(): Promise<void> {
     restoreRender = () => { context.backend.renderFrame = render; };
     const controlled = fakeClock(); clock = controlled;
     const opening = moduleFor('boot_sector', 0, {
-      anchors: [{ id: 'boot-page', kind: 'slab', position: [0, 0, 0] }], cameraTargets: ['boot-page'], extras: ['boot-page'],
+      ...bootSectorLayout, extras: bootSectorLayout.anchors.map(anchor => anchor.id),
     });
     const fork = moduleFor('fork_fields', 1, forkLayout);
     const active = await createBrowserSession(context, { kind: 'new', seed: SEED, discClass: 'shell', difficulty: 'operator' }, {
       loaders: { boot_sector: async () => opening, fork_fields: async () => fork },
     });
     session = active;
+    // Real Boot Sector data exercises the same instanced stand-ins as browser play.
+    controlled.step(0);
+    const openingBatch = captured.scene?.getObjectByName('kt.structures.layout-slab-instances.batch');
+    assert(openingBatch instanceof InstancedMesh && openingBatch.count > 8, 'Boot Sector must exercise a live stand-in batch');
+    await assertNoRenderErrors();
     const phase = () => active.runner.phase;
     // The fixture exits its opening leg explicitly; zero-segment legs now wait
     // for a leg_done record or their allowance instead of completing at entry.
@@ -166,6 +204,7 @@ async function initialize(): Promise<void> {
     assert(roots.every(root => root !== undefined), 'Layout must place one structure for every anchor');
     const structures = scene.getObjectByName('kt.structures');
     assert(structures?.children.length === forkLayout.anchors.length, 'Layout structure count must equal its anchors');
+    await assertNoRenderErrors();
 
     let ran = false;
     const api = {
@@ -206,6 +245,7 @@ async function initialize(): Promise<void> {
         button(panel, 'Continue').click(); controlled.step(0);
         assert(context.overlay.querySelector('.kt-panel--crossing') === null, 'Crossing Continue must close the panel');
         assert(phase() === 'travelling', 'Crossing Continue must restore travel');
+        await assertNoRenderErrors();
 
         active.dispose();
         assert(scene.children.length === 0, 'Session disposal must empty its scene');
@@ -221,6 +261,8 @@ async function initialize(): Promise<void> {
           backend: backendId, tier: context.tier, frames: MEASURED_FRAMES, leg: fork.default.id,
           structures: roots.length, hudTitle, ticks: endingTick - startingTick,
           terminal: { command: 'ps', lines: lines.length }, crossing: { opened: true, resolved: true, closed: true },
+          consoleErrors: consoleErrors.length, rendererErrors: rendererErrors.length,
+          openingBatchCount: openingBatch.count,
           geometry: { rendered: observed.size, renderedDisposed: observed.size, sources: sources.size, sourcesDisposed: sources.size },
           sceneEmpty: scene.children.length === 0, loopStopped: true,
         };

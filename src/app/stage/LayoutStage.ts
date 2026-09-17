@@ -1,12 +1,12 @@
 /** A layout's browser stand-ins. The structures package owns the eventual art. */
-import { DynamicDrawUsage, InstancedBufferAttribute, Matrix4, Mesh, Vector3 } from 'three/webgpu';
+import { Box3, DynamicDrawUsage, InstancedBufferAttribute, Matrix4, Mesh, Vector3 } from 'three/webgpu';
 import { LineSegmentsGeometry } from 'three/addons/lines/LineSegmentsGeometry.js';
 import type { BufferGeometry, Object3D } from 'three/webgpu';
 import { DASH, HATCH_ID, LAYER, SEMANTICS, gainFor, linearColor } from '@design';
 import type { LegStage } from '@game/types';
 import { PROFILES } from '@platform';
 import type { LegLayout } from '@legs/layout';
-import { getMaterial } from '@render';
+import { createAmbientLight, createKeyLight, getMaterial } from '@render';
 import type { FocusCameraRig, InstancedBatchDesc, InstancedBatchHandle } from '@render';
 import { ManagedBatch } from '@render/RendererBackend';
 import type { BatchChannel } from '@render/RendererBackend';
@@ -21,6 +21,8 @@ import {
   LayoutStructure, formFocusTarget, formGeometry, layoutFormKind, preparedFormGeometry,
 } from './LayoutStructure';
 import type { FormKind } from './LayoutStructure';
+import type { CameraTarget } from '../input';
+import { fitLayoutCamera, type LayoutLabelBounds } from './framing';
 
 export interface LayoutStage extends LegStage {
   readonly structures: readonly LayoutStructure[];
@@ -28,6 +30,7 @@ export interface LayoutStage extends LegStage {
   readonly instancedKinds: readonly FormKind[];
   readonly ready: Promise<void>;
   readonly disposed: boolean;
+  frameCamera(target: CameraTarget, aspect: number, viewportHeightPx: number): void;
 }
 
 const semantic = SEMANTICS.page_clean;
@@ -186,6 +189,10 @@ export function buildLayoutStage(
   }
   const builder = new StageBuilder(context, services, focus);
   builder.addEnvironment();
+  for (const light of [createAmbientLight(), createKeyLight()]) {
+    light.layers.set(LAYER.LIGHTS);
+    builder.groups.lights.add(light);
+  }
   const instances = new Map<FormKind, LayoutInstances>();
   for (const [kind, count] of counts) {
     if (count <= 8) continue;
@@ -212,9 +219,12 @@ export function buildLayoutStage(
     for (const group of instances.values()) group.dispose();
     if (context.scene.children.length !== 0) throw new Error('Layout disposal left scene children');
   };
+  const labels: LayoutLabelBounds[] = [];
   const ready = Promise.all(structures.filter(structure => structure.needsLabel).map(structure =>
     atlas.place(structure.definition.label ?? structure.id, 'page_clean', 'structureTitle',
-      structure.root, builder.groups.labels, structure.labelOffset),
+      structure.root, builder.groups.labels, structure.labelOffset).then(asset => {
+      labels.push({ anchor: structure.root, offset: structure.labelOffset, bounds: new Box3().setFromObject(asset.object) });
+    }),
   )).then(() => undefined, (error: unknown) => {
     if (disposed) return;
     dispose();
@@ -223,6 +233,9 @@ export function buildLayoutStage(
   return {
     structures, structureCount: structures.length, instancedKinds: Array.from(instances.keys()), ready,
     get disposed() { return disposed; },
+    frameCamera(target, aspect, viewportHeightPx) {
+      if (!disposed) fitLayoutCamera(structures, labels, target, aspect, viewportHeightPx);
+    },
     update(dtSeconds, alpha) {
       if (disposed) return;
       built.update(dtSeconds, alpha);

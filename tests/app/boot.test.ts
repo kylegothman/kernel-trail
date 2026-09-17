@@ -90,6 +90,28 @@ function fixture() {
 }
 
 describe('browser boot', () => {
+  it('installs one card stylesheet per document and resolves styles for every card variant', async () => {
+    for (let boot = 0; boot < 2; boot++) {
+      const f = fixture();
+      const context = await bootBrowser(f.canvas, { detect: f.detect, createBackend: f.createBackend, tier: 'low' });
+      contexts.push(context);
+      const rules = [...document.styleSheets].flatMap(sheet => [...sheet.cssRules]);
+      expect(rules.filter(rule => rule instanceof CSSStyleRule && rule.selectorText === '.kt-card')).toHaveLength(1);
+      expect(document.querySelectorAll('#kt-card-styles')).toHaveLength(1);
+      for (const variant of ['debrief', 'unavailable', 'panic', 'tombstone']) {
+        const card = document.createElement('section');
+        card.className = `kt-card kt-card--${variant}`;
+        context.overlay.append(card);
+        const style = getComputedStyle(card);
+        expect(style.fontFamily).toContain('Jost');
+        expect(style.paddingTop).toBe('16px');
+        expect(style.backgroundColor).not.toBe('transparent');
+        expect(style.color).not.toBe('rgb(0, 0, 0)');
+      }
+      context.dispose();
+    }
+  });
+
   it('uses the requested factories, warms twelve empty frames, and opens its database before returning', async () => {
     const f = fixture();
     const context = await bootBrowser(f.canvas, { detect: f.detect, createBackend: f.createBackend, forceWebGL: true, tier: 'low' });
