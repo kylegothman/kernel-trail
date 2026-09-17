@@ -41,11 +41,12 @@ export function planTargets(cssWidth: number, cssHeight: number, pixelRatio: num
   const specs=specsFor(profile,samples,debug);
   let width=Math.max(1,Math.floor(rawW*factor)),height=Math.max(1,Math.floor(rawH*factor));
   let total=specs.reduce((sum,s)=>sum+bytesFor(s,width,height,caps.hdr),0);
-  if (total > GPU_TARGET_BUDGET_BYTES) {
+  for (let attempt=0; total > GPU_TARGET_BUDGET_BYTES && attempt < 64; attempt++) {
     factor*=Math.sqrt(GPU_TARGET_BUDGET_BYTES/total);
-    width=Math.max(1,Math.floor(rawW*factor));height=Math.max(1,Math.floor(rawH*factor));
+    width=Math.max(1,Math.min(width-1,Math.floor(rawW*factor)));height=Math.max(1,Math.min(height-1,Math.floor(rawH*factor)));
     total=specs.reduce((sum,s)=>sum+bytesFor(s,width,height,caps.hdr),0);
   }
+  if (total > GPU_TARGET_BUDGET_BYTES) throw new Error(`Render target plan ${width}x${height} exceeds memory ceiling after 64 reductions: ${total} > ${GPU_TARGET_BUDGET_BYTES} bytes`);
   return {width,height,samples,hdrFormat:caps.hdr?'rgba16float':'rgba8unorm',totalBytes:total,clamped:factor<1?['Resolution reduced to respect target limits']:[]};
 }
 export class RenderTargetBudget {

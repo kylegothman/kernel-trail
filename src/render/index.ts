@@ -31,7 +31,7 @@ export function createProbeScene(tier:QualityTier='high',slabCount=180,beamCount
   const beamGeometry=new CylinderGeometry(FORM.filament.orbitRadius,FORM.filament.orbitRadius,FORM.cpuColumn.height,profile.beamRadialSegments,1,true);
   const beams=new InstancedMesh(beamGeometry,getMaterial('volumetric-beam','running',tier),beamCount);beams.layers.set(LAYER.BEAMS);beams.frustumCulled=false;beams.name='kt.beams.probe.columns';
   for(let i=0;i<beamCount;i++){matrix.makeTranslation((i-beamCount/2)*MODULE_PITCH_M,FORM.cpuColumn.height/2,0);beams.setMatrixAt(i,matrix);}
-  beams.instanceMatrix.needsUpdate=true;beams.userData['castsReflection']=true;scene.add(beams);
+  beams.instanceMatrix.needsUpdate=true;beams.userData['castsReflection']=true;if(beamCount>0)scene.add(beams);
   const poolGeometry=new PlaneGeometry(FORM.pagePlate.x*2.5,FORM.pagePlate.z*2.5),poolMaterial=createFloorPoolMaterial('page_clean');
   const poolCount=Math.min(slabCount,profile.floorLightPools);
   const pools=new InstancedMesh(poolGeometry,poolMaterial,poolCount);pools.layers.set(LAYER.TERRAIN);pools.name='kt.terrain.probe.pools';
@@ -39,7 +39,7 @@ export function createProbeScene(tier:QualityTier='high',slabCount=180,beamCount
   pools.instanceMatrix.needsUpdate=true;scene.add(pools);
   const proxyMaterial=tier==='medium'?createReflectionProxyMaterial('running'):null;
   const proxy=proxyMaterial?new InstancedMesh(beamGeometry,proxyMaterial,beamCount):null;
-  if(proxy){proxy.instanceMatrix.copy(beams.instanceMatrix);proxy.scale.y=-1;proxy.layers.set(LAYER.TERRAIN);scene.add(proxy);}
+  if(proxy){proxy.instanceMatrix.copy(beams.instanceMatrix);proxy.scale.y=-1;proxy.layers.set(LAYER.TERRAIN);if(beamCount>0)scene.add(proxy);}
   const ambient=createAmbientLight(),key=createKeyLight();ambient.layers.set(LAYER.LIGHTS);key.layers.set(LAYER.LIGHTS);scene.add(ambient,key);
   scene.traverse(o=>{o.updateMatrix();o.matrixAutoUpdate=false;o.castShadow=false;o.receiveShadow=false;});
   const declared={drawCalls:4+(proxy?1:0),triangles:2+slabCount*12+poolCount*2+beamCount*profile.beamRadialSegments*2*(proxy?2:1)};
