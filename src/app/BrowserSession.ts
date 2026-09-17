@@ -173,6 +173,8 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
   const flushUi = (): void => {
     for (const write of writes.splice(0)) { if (!disposed) write(); }
     if (!disposed) for (const panel of panels) panel.flush();
+    const interactions = interactionPanel.element;
+    if (interactions !== null) interactions.hidden = card !== null || stones.size > 0;
   };
   const present = (next: Card): void => {
     card?.dispose(); card = next;
@@ -325,6 +327,10 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
     onShow: () => undefined, onBlur: () => undefined, onFocus: () => undefined,
   });
   const unbindLoss = boot.backend.onDeviceLost(info => panic(info.reason));
+  const renderFailure = (event: Event): void => {
+    if (event instanceof CustomEvent && typeof event.detail === 'string') panic(event.detail);
+  };
+  boot.overlay.addEventListener('kt:render-failure', renderFailure);
   const resize = (): void => {
     const aspect = view.innerWidth / Math.max(1, view.innerHeight);
     focus.setViewport(aspect, view.innerHeight); atlas?.setViewport(view.innerHeight);
@@ -455,6 +461,7 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
       timers.clear();
       unbindLoss(); unbindInput(); unbindVisibility(); unwatchKernel(); unwatchCodex(); unbindSettings();
       view.removeEventListener('resize', resize); view.removeEventListener('pagehide', hide);
+      boot.overlay.removeEventListener('kt:render-failure', renderFailure);
       for (const panel of panels) panel.dispose();
       terminal?.dispose(); terminal = null; card?.dispose(); for (const stone of stones) stone.dispose(); stones.clear();
       codex.dispose(); hud.dispose(); engine.dispose(); clearStage(); leases.dispose(); focus.dispose(); replay.dispose();
