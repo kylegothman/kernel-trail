@@ -90,6 +90,33 @@ function fixture() {
 }
 
 describe('browser boot', () => {
+  it('contains resize failures and rebuilds the last successful size before retrying', async () => {
+    const f = fixture();
+    const context = await bootBrowser(f.canvas, { detect: f.detect, createBackend: f.createBackend, tier: 'low' });
+    contexts.push(context);
+    const lastSize = f.resize.mock.calls[0];
+    const failure = vi.fn(); context.overlay.addEventListener('kt:render-failure', failure);
+    f.resize.mockImplementationOnce(() => { throw new Error('Render target memory ceiling exceeded'); });
+    expect(() => window.dispatchEvent(new Event('resize'))).not.toThrow();
+    expect(f.resize.mock.calls.at(-1)).toEqual(lastSize);
+    expect(f.resize).toHaveBeenCalledTimes(3);
+    expect(context.overlay.querySelector('[role="alert"]')?.textContent).toContain('Keeping the previous render size');
+    expect(failure).not.toHaveBeenCalled();
+    window.dispatchEvent(new Event('resize'));
+    expect(context.overlay.querySelector('.kt-resize-status')).toBeNull();
+  });
+
+  it('reports failed resize recovery without throwing from the window listener', async () => {
+    const f = fixture();
+    const context = await bootBrowser(f.canvas, { detect: f.detect, createBackend: f.createBackend, tier: 'low' });
+    contexts.push(context);
+    const failure = vi.fn(); context.overlay.addEventListener('kt:render-failure', failure);
+    f.resize.mockImplementation(() => { throw new Error('Allocation unavailable'); });
+    expect(() => window.dispatchEvent(new Event('resize'))).not.toThrow();
+    expect(failure).toHaveBeenCalledOnce();
+    expect(context.overlay.querySelector('[role="alert"]')?.textContent).toContain('Rendering could not recover');
+  });
+
   it('installs one card stylesheet per document and resolves styles for every card variant', async () => {
     for (let boot = 0; boot < 2; boot++) {
       const f = fixture();

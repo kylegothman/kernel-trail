@@ -14,6 +14,9 @@ import { makeGridFloor, makeHorizon, makeSlab, makeStele } from '../../../src/wo
 import { PS_DEF } from '../../../src/terminal/commands/process';
 import { createSyntheticLeg } from '../../game/fixtures/syntheticLeg';
 import { awaitReadback } from './awaitReadback';
+import { installGpuValidation } from './validation';
+
+const gpuValidation = installGpuValidation();
 
 const SEED = 77;
 const MEASURED_FRAMES = 120;
@@ -158,6 +161,8 @@ async function initialize(): Promise<void> {
       assert(output !== undefined, 'Boot probe needs its final render target');
       await awaitReadback(renderer.readRenderTargetPixelsAsync(output, 0, 0, 1, 1), controlled);
       await yieldBrowser();
+      await gpuValidation.flush();
+      assert(gpuValidation.snapshot().length === 0, `Boot device validation errors:\n${JSON.stringify(gpuValidation.snapshot())}`);
       assert(rendererErrors.length === 0, `Boot renderer errors:\n${rendererErrors.join('\n')}`);
       assert(consoleErrors.length === 0, `Boot console errors:\n${consoleErrors.join('\n')}`);
     };

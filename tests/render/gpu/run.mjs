@@ -7,6 +7,7 @@ import fs from 'node:fs/promises';
 import { installWebGPUDiagnostics, checkWebGPUEnvironment } from './webgpuDiagnostics.ts';
 import { allocationProbe } from './allocationProbe.ts';
 import { capturePageDiagnostics, formatPageDiagnostics, navigateAndWaitForProbe } from './harness.ts';
+import { runRealApp } from './realApp.mjs';
 
 assert.equal(process.versions.node.split('.')[0], '22', `GPU tests require Node 22; running ${process.version}`);
 const machine = { hostname: os.hostname(), cpu: os.cpus()[0]?.model, platform: os.platform(), release: os.release(), arch: os.arch(), node: process.version };
@@ -316,6 +317,8 @@ try {
       await page.close();
     }
   }
+  const realApp = await runRealApp(browser, `http://127.0.0.1:${address.port}`, webgpuAvailable);
+  results.push(...realApp.results); failures.push(...realApp.failures);
   if (environmentDiagnostics.pageErrors.length) {
     failures.push('WebGPU environment page reported an error');
     console.error(formatPageDiagnostics(environmentDiagnostics));

@@ -199,6 +199,36 @@ function terminalSubmit(overlay: HTMLElement, line: string): void {
 }
 
 describe('browser session assembly', () => {
+  it('makes interactions yield to a debrief and restores them on the next leg', async () => {
+    const f = await fixtureBoot();
+    const bootLeg = moduleFor('boot_sector', 0);
+    const travelLeg = moduleFor('fork_fields', 1);
+    const session = await createBrowserSession(f.boot, { kind: 'new', seed: 42, discClass: 'shell', difficulty: 'novice' }, {
+      loaders: { boot_sector: async () => bootLeg, fork_fields: async () => travelLeg },
+    });
+    sessions.push(session); clock.frames(1);
+    expect(f.boot.overlay.querySelector<HTMLElement>('.kt-panel--interactions')?.hidden).toBe(false);
+    session.runner.exit(); clock.frames(1);
+    const card = f.boot.overlay.querySelector('.kt-card--debrief');
+    if (card === null) throw new Error('Expected a debrief');
+    expect(f.boot.overlay.querySelector<HTMLElement>('.kt-panel--interactions')?.hidden).toBe(true);
+    buttonIn(card, 'Continue').click();
+    await vi.waitFor(() => { clock.frames(1); expect(session.runner.currentLeg?.id).toBe('fork_fields'); });
+    clock.frames(1);
+    expect(f.boot.overlay.querySelector('.kt-card--debrief')).toBeNull();
+    expect(f.boot.overlay.querySelector<HTMLElement>('.kt-panel--interactions')?.hidden).toBe(false);
+  });
+
+  it('stops the session and shows a panic card when resize recovery fails', async () => {
+    const f = await startTravel();
+    f.boot.overlay.dispatchEvent(new CustomEvent('kt:render-failure', { detail: 'Resize recovery failed' }));
+    clock.frames(1);
+    expect(f.boot.overlay.querySelector('.kt-card--panic')?.textContent).toContain('Resize recovery failed');
+    const tick = f.session.runner.kernel?.tick;
+    clock.frames(120);
+    expect(f.session.runner.kernel?.tick).toBe(tick);
+  });
+
   it('builds one visible structure per anchor and advances the kernel over 120 real host frames', async () => {
     const f = await startTravel();
     const before = f.session.runner.kernel?.tick ?? 0;

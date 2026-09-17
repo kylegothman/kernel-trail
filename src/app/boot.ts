@@ -59,14 +59,42 @@ export async function bootBrowser(canvas: HTMLCanvasElement, options: BootOption
     leases.dispose();
     throw error;
   }
-  const fit = (): void => backend.resize(view.innerWidth, view.innerHeight, view.devicePixelRatio || 1);
+  let lastFit: [number, number, number] = [view.innerWidth, view.innerHeight, view.devicePixelRatio || 1];
+  const fit = (): void => {
+    const next: [number, number, number] = [view.innerWidth, view.innerHeight, view.devicePixelRatio || 1];
+    backend.resize(...next);
+    lastFit = next;
+  };
   const db = new Database();
   const overlay = doc.createElement('div');
   overlay.id = 'overlay';
   Object.assign(overlay.style, { position: 'absolute', inset: '0', pointerEvents: 'none', overflow: 'hidden' });
+  let resizeNotice: HTMLElement | null = null;
+  const resize = (): void => {
+    try {
+      fit(); resizeNotice?.remove(); resizeNotice = null;
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : String(error);
+      let message = `Resize failed: ${reason}. Keeping the previous render size. Try a smaller window.`;
+      try {
+        // A failed resize may already have cleared the post graph. Rebuild the
+        // last successful size instead of leaving a partially allocated graph.
+        backend.resize(...lastFit);
+      } catch (recovery) {
+        message = `Rendering could not recover after resize: ${recovery instanceof Error ? recovery.message : String(recovery)}`;
+        overlay.dispatchEvent(new CustomEvent('kt:render-failure', { detail: message }));
+      }
+      resizeNotice ??= doc.createElement('p');
+      resizeNotice.className = 'kt-card kt-resize-status';
+      resizeNotice.setAttribute('role', 'alert');
+      resizeNotice.textContent = message;
+      Object.assign(resizeNotice.style, { position: 'absolute', bottom: '24px', left: '25%', maxWidth: '50%', zIndex: '10' });
+      overlay.append(resizeNotice);
+    }
+  };
   try {
     fit();
-    view.addEventListener('resize', fit);
+    view.addEventListener('resize', resize);
     const scene = new Scene();
     const camera = new PerspectiveCamera(46, view.innerWidth / Math.max(1, view.innerHeight), 0.1, 2000);
     for (let i = 0; i < 12; i++) backend.renderFrame({ scene, camera, alpha: 0, dtSeconds: 1 / 60, elapsedSeconds: i / 60 });
@@ -79,7 +107,7 @@ export async function bootBrowser(canvas: HTMLCanvasElement, options: BootOption
     }
     doc.body.append(overlay);
   } catch (error) {
-    view.removeEventListener('resize', fit);
+    view.removeEventListener('resize', resize);
     db.close();
     backend.dispose();
     leases.dispose();
@@ -93,7 +121,7 @@ export async function bootBrowser(canvas: HTMLCanvasElement, options: BootOption
       disposed = true;
       overlay.remove();
       db.close();
-      view.removeEventListener('resize', fit);
+      view.removeEventListener('resize', resize);
       backend.dispose();
       leases.dispose();
     },
