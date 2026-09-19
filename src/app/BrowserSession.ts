@@ -1,17 +1,18 @@
 /** Browser assembly only. Layout forms and decision panels are replaceable stand-ins. */
 import { Scene, Vector3 } from 'three/webgpu';
 import { CAMERA } from '@design';
-import { asTick, createKernel, createRng } from '@kernel/index';
+import { asTick, createKernel, createRng, type KernelEvent } from '@kernel/index';
 import { CommandBus } from '@game/CommandBus';
-import { LegRunner, type LegEvent } from '@game/LegRunner';
+import { LegRunner, type LegEvent, type LegPhase } from '@game/LegRunner';
 import { createRunStore, createTelemetryStore } from '@game/runStore';
 import { initialRunState } from '@game/replay/runReplay';
 import { createRunStreams, restoreRunStreams } from '@game/replay/types';
+import { hashEventLog } from '@game/replay/hash';
 import { ReplayWorkerHandle } from '@game/workers/ReplayWorkerHandle';
 import { SaveService, bindSettings, readCodexProfile, writeCodexProfile } from '@game/persist/SaveService';
 import { createTerminalHost } from '@game/terminalHost';
 import type { RunSummary } from '@game/save';
-import { LEG_ORDER, type LegId } from '@game/types';
+import { LEG_ORDER, type LegId, type RunState } from '@game/types';
 import { LEG_LOADERS } from '@legs/registry';
 import { validateContent, type LegModule } from '@legs/content';
 import { sharedEpitaphSource } from '@legs/epitaphs';
@@ -64,7 +65,29 @@ import type { DeferredPanel } from './panels/panel';
 export interface BrowserSession {
   readonly loop: GameLoop;
   readonly runner: LegRunner;
+  /** WP-23 section 1: present in a development build only; a production build never constructs it. */
+  readonly debug?: KernelTrailDebug;
   dispose(): void;
+}
+/**
+ * WP-23 section 1: the read-only surface `src/main.ts` attaches at
+ * `globalThis.__kernelTrailDebug` under `import.meta.env.DEV`. It reads and
+ * never writes. `logHash` is `hashEventLog` over a tap that mirrors
+ * `createRunHost`'s (subscribe on `onKernelChanged`, dedupe by `seq` per
+ * kernel), so a browser hash and a harness hash for the same seed compare by
+ * construction. `legHashes` is the runner's own per-leg hash, which a resumed
+ * leg carries whole because the director snapshot holds the leg's events.
+ */
+export interface KernelTrailDebug {
+  readonly buildId: string;
+  legId(): LegId | null;
+  tick(): number;
+  phase(): LegPhase | null;
+  /** hashEventLog over every kernel event the session has routed since the run began. */
+  logHash(): string;
+  /** Per-leg hashes in order, for legs that have completed. */
+  legHashes(): readonly { legId: LegId; hash: string; ticks: number }[];
+  run(): Readonly<RunState>;
 }
 export interface SessionOptions {
   readonly loaders?: Readonly<Partial<Record<LegId, () => Promise<LegModule>>>>;
@@ -445,7 +468,7 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
       reclamationPanel.open(layout);
     } else reclamationPanel.close();
   }
-  const session: BrowserSession = { loop, runner,
+  const session: BrowserSession & { debug?: KernelTrailDebug } = { loop, runner,
     dispose() {
       if (disposed) return;
       transitioning = true;
@@ -467,6 +490,38 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
       codex.dispose(); hud.dispose(); engine.dispose(); clearStage(); leases.dispose(); focus.dispose(); replay.dispose();
     },
   };
+  if (import.meta.env.DEV) {
+    const routed: KernelEvent[] = [];
+    const completed: { legId: LegId; hash: string; ticks: number }[] = [];
+    let seenHashes = runner.replayRecord.legEventHashes.length;
+    let untap: (() => void) | null = null;
+    let tapped: LegId | null = null;
+    runner.onKernelChanged(kernel => {
+      untap?.(); untap = null;
+      if (kernel === null) {
+        const hashes = runner.replayRecord.legEventHashes;
+        const hash = hashes[hashes.length - 1];
+        if (tapped !== null && hashes.length > seenHashes && hash !== undefined) completed.push({ legId: tapped, hash, ticks: runner.ticksElapsed });
+        seenHashes = hashes.length; tapped = null;
+        return;
+      }
+      tapped = runner.currentLeg?.id ?? null;
+      const seen = new Set<number>();
+      untap = kernel.events.onAny(event => {
+        if (seen.has(event.seq)) return;
+        seen.add(event.seq); routed.push(event);
+      });
+    });
+    session.debug = {
+      buildId: boot.buildId,
+      legId: () => runner.currentLeg?.id ?? null,
+      tick: () => runner.kernel?.tick ?? runner.ticksElapsed,
+      phase: () => (runner.currentLeg === null ? null : runner.phase),
+      logHash: () => hashEventLog(routed),
+      legHashes: () => completed.map(entry => ({ ...entry })),
+      run: () => runStore.get(),
+    };
+  }
   try {
     if (start.kind === 'resume') {
       for (const id of LEG_ORDER.slice(0, start.file.run.legIndex + 1)) register(await load(id));
