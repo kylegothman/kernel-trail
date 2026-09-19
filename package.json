@@ -12,6 +12,7 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:gpu": "node tests/render/gpu/run.mjs",
+    "test:browser": "node tests/render/gpu/run.mjs --ci",
     "test:determinism": "vitest run tests/kernel/determinism.test.ts",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit",

@@ -10,10 +10,32 @@ import { capturePageDiagnostics, formatPageDiagnostics, navigateAndWaitForProbe 
 import { runRealApp } from './realApp.mjs';
 
 assert.equal(process.versions.node.split('.')[0], '22', `GPU tests require Node 22; running ${process.version}`);
+
+/**
+ * WP-23 section 2: the one place a platform-specific launch flag lives. macOS
+ * without --ci keeps the WebGPU-over-Metal launch that npm run test:gpu is the
+ * evidence for. Everywhere else, and under --ci anywhere, Chromium runs its
+ * software rasteriser over WebGL2 and WebGPU is not requested; the preflight
+ * reports it unavailable and the runner takes its forced-WebGL2 path.
+ */
+export function launchArguments(platform, ci) {
+  if (platform === 'darwin' && !ci) return ['--enable-unsafe-webgpu', '--enable-features=WebGPU', '--use-angle=metal'];
+  return ['--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'];
+}
+
+const ci = process.argv.includes('--ci');
+/** Under --ci every timeout in this runner is four times longer; nothing asserted changes. */
+const scale = ci ? 4 : 1;
+const BUILD_DIR = join(os.tmpdir(), 'kt-wp12-gpu-build');
+const RESULTS_PATH = join(os.tmpdir(), 'kt-wp12-gpu-results.json');
+const artifactPath = (name) => join(os.tmpdir(), name);
 const machine = { hostname: os.hostname(), cpu: os.cpus()[0]?.model, platform: os.platform(), release: os.release(), arch: os.arch(), node: process.version };
 console.log('GPU test machine:', JSON.stringify(machine));
+console.log(`GPU test mode: ${ci ? 'ci (software rasteriser, timeouts x4)' : 'local'}; results ${RESULTS_PATH}`);
+// The workflow uploads the results file from this path rather than guessing the runner's temp directory.
+if (process.env.GITHUB_OUTPUT !== undefined) await fs.appendFile(process.env.GITHUB_OUTPUT, `results=${RESULTS_PATH}\n`);
 await build({ plugins: [allocationProbe], build: {
-  outDir: '/private/tmp/kt-wp12-gpu-build', emptyOutDir: true,
+  outDir: BUILD_DIR, emptyOutDir: true,
   rolldownOptions: { input: [resolve('tests/render/gpu/probe.html'),resolve('tests/render/gpu/focus.html'),resolve('tests/render/gpu/derezz.html'),resolve('tests/render/gpu/audio.html'),resolve('tests/render/gpu/hud.html'),resolve('tests/render/gpu/replay.html'),resolve('tests/render/gpu/boot.html')] },
 } });
 if (process.argv.includes('--build-only')) process.exit(0);
@@ -30,7 +52,7 @@ try {
   await server.listen();
   const address = server.httpServer.address();
   if (!address || typeof address === 'string') throw new Error('No server address');
-  browser = await chromium.launch({ channel: 'chromium', headless: !headed, args: ['--enable-unsafe-webgpu', '--enable-features=WebGPU', '--use-angle=metal'] });
+  browser = await chromium.launch({ channel: 'chromium', headless: !headed, args: launchArguments(os.platform(), ci) });
   console.log('Chromium:', browser.version());
   environmentPage = await browser.newPage();
   environmentDiagnostics = capturePageDiagnostics(environmentPage);
@@ -41,13 +63,14 @@ try {
     const environment = await Promise.race([
       environmentPage.evaluate(checkWebGPUEnvironment),
       environmentDiagnostics.firstPageError.then(error => { throw error; }),
-      new Promise((_, reject) => { environmentTimer = setTimeout(() => reject(new Error('GPU environment preflight timed out after 60 seconds')), 60000); }),
+      new Promise((_, reject) => { environmentTimer = setTimeout(() => reject(new Error(`GPU environment preflight timed out after ${60 * scale} seconds`)), 60_000 * scale); }),
     ]).finally(() => clearTimeout(environmentTimer));
     console.log('WebGPU environment:', JSON.stringify(environment));
     results.push({ environment });
     webgpuAvailable = environment.status === 'available';
     if (environment.status === 'no-adapter') {
-      console.log(headed ? 'No WebGPU adapter is available in headed Chromium.' : 'No WebGPU adapter is available in headless Chromium.');
+      if (ci || os.platform() !== 'darwin') console.log('WebGPU was not exercised: this launch requests the software rasteriser over WebGL2 and no WebGPU adapter is expected.');
+      else console.log(headed ? 'No WebGPU adapter is available in headed Chromium.' : 'No WebGPU adapter is available in headless Chromium.');
       console.log('Recording an environment limitation; running forced-WebGL2 separately. WebGPU results require a headed rerun.');
     } else if (!webgpuAvailable) failures.push('WebGPU preflight device lost before any renderer loaded');
   } catch (error) {
@@ -89,7 +112,7 @@ try {
         assert.deepEqual(recovery, { attempts: [true], outcome: 'recovered_same', backend: 'webgl2' });
         results.push({ path, recovery });
       }
-      await page.screenshot({ path: `/private/tmp/kt-wp12-${force ? 'webgl' : 'webgpu'}.png` });
+      await page.screenshot({ path: artifactPath(`kt-wp12-${force ? 'webgl' : 'webgpu'}.png`) });
       assert.equal(diagnostics.pageErrors.length, 0, 'Page errors during GPU assertions');
       assert.deepEqual(diagnostics.messages.filter(message => message.startsWith('[console.error]')), []);
       await page.evaluate(() => globalThis.__kernelTrailProbe.api.dispose());
@@ -107,14 +130,14 @@ try {
     const diagnostics=capturePageDiagnostics(page);
     await page.addInitScript(installWebGPUDiagnostics);
     try {
-      await page.exposeFunction('__wp13Capture',async phase=>{assert(['front','occluded','released'].includes(phase));await page.screenshot({path:`/private/tmp/kt-${path}-${phase}.png`});});
+      await page.exposeFunction('__wp13Capture',async phase=>{assert(['front','occluded','released'].includes(phase));await page.screenshot({path:artifactPath(`kt-${path}-${phase}.png`)});});
       console.log(`Starting ${path}`);
       await navigateAndWaitForProbe(page,`http://127.0.0.1:${address.port}/tests/render/gpu/focus.html?tier=${tier}${force?'&webgl':''}`,diagnostics);
       const info=await page.evaluate(()=>globalThis.__kernelTrailProbe.api.info());
       assert.equal(info.backend,force?'webgl2':'webgpu');
       const result=await page.evaluate(()=>globalThis.__kernelTrailProbe.api.run());
       console.log(`${path}:`,JSON.stringify(result));results.push({path,result});
-      await page.screenshot({path:`/private/tmp/kt-${path}.png`});
+      await page.screenshot({path:artifactPath(`kt-${path}.png`)});
       assert.equal(diagnostics.pageErrors.length,0,'WP-13 page errors');
       assert.deepEqual(diagnostics.messages.filter(message=>message.startsWith('[console.error]')),[]);
       await page.evaluate(()=>globalThis.__kernelTrailProbe.api.dispose());
@@ -155,8 +178,8 @@ try {
     const audioDiagnostics = capturePageDiagnostics(audioPage);
     try {
       console.log('Starting audio probe; waiting for readiness');
-      await audioPage.goto(`http://127.0.0.1:${address.port}/tests/render/gpu/audio.html`, { waitUntil: 'domcontentloaded', timeout: 60_000 });
-      await audioPage.waitForFunction(() => globalThis.__kernelTrailAudioProbe?.status === 'ready' || globalThis.__kernelTrailAudioProbe?.status === 'failed', undefined, { timeout: 60_000 });
+      await audioPage.goto(`http://127.0.0.1:${address.port}/tests/render/gpu/audio.html`, { waitUntil: 'domcontentloaded', timeout: 60_000 * scale });
+      await audioPage.waitForFunction(() => globalThis.__kernelTrailAudioProbe?.status === 'ready' || globalThis.__kernelTrailAudioProbe?.status === 'failed', undefined, { timeout: 60_000 * scale });
       const boot = await audioPage.evaluate(() => globalThis.__kernelTrailAudioProbe);
       if (boot.status === 'failed') throw new Error(`Audio probe failed to initialise: ${boot.error?.message}\n${boot.error?.stack}`);
       const before = await audioPage.evaluate(() => globalThis.__kernelTrailAudioProbe.api.info());
@@ -165,7 +188,7 @@ try {
       const droppedBefore = await audioPage.evaluate(() => globalThis.__kernelTrailAudioProbe.api.poke());
       assert.equal(droppedBefore, 1, 'a cue before the gesture is dropped and counted');
       await audioPage.click('#unlock');
-      await audioPage.waitForFunction(() => globalThis.__kernelTrailAudioProbe.api.info().state === 'running', undefined, { timeout: 10_000 });
+      await audioPage.waitForFunction(() => globalThis.__kernelTrailAudioProbe.api.info().state === 'running', undefined, { timeout: 10_000 * scale });
       const after = await audioPage.evaluate(() => globalThis.__kernelTrailAudioProbe.api.info());
       console.log('Audio context after gesture:', JSON.stringify(after));
       assert.equal(after.constructions, 1);
@@ -273,12 +296,12 @@ try {
       await Promise.race([
         (async () => {
           await page.goto(`http://127.0.0.1:${address.port}/tests/render/gpu/boot.html${force ? '?webgl' : ''}`, {
-            waitUntil: 'domcontentloaded', timeout: 60_000,
+            waitUntil: 'domcontentloaded', timeout: 60_000 * scale,
           });
           await page.waitForFunction(() => {
             const probe = globalThis.__kernelTrailProbe;
             return probe?.status === 'failed' || (probe?.status === 'ready' && typeof probe.api?.info === 'function');
-          }, undefined, { polling: 50, timeout: 60_000 });
+          }, undefined, { polling: 50, timeout: 60_000 * scale });
           const failure = await page.evaluate(() => {
             const probe = globalThis.__kernelTrailProbe;
             return probe?.status === 'failed' ? probe.error : null;
@@ -326,7 +349,8 @@ try {
   const environmentLosses = await environmentPage.evaluate(() => globalThis.__kernelTrailDeviceLosses ?? []).catch(() => []);
   if(environmentLosses.length){console.error('Preflight device loss:',JSON.stringify(environmentLosses));failures.push('The preflight device lost its instance before cleanup');}
   // Loss reasons are streamed by the installed monitor; retain those messages in the result.
-  await fs.writeFile('/private/tmp/kt-wp12-gpu-results.json', JSON.stringify({ machine, browser: browser.version(), headed, webgpuAvailable, results, failures, environmentMessages: environmentDiagnostics.messages, environmentLosses }, null, 2));
+  await fs.writeFile(RESULTS_PATH, JSON.stringify({ machine, browser: browser.version(), ci, headed, webgpuAvailable, results, failures, environmentMessages: environmentDiagnostics.messages, environmentLosses }, null, 2));
+  console.log(`Results written to ${RESULTS_PATH}`);
   if (failures.length) throw new Error(`GPU run failed:
 ${failures.join('\n')}`);
   console.log(webgpuAvailable ? `GPU tests passed: ${browser.version()}` : 'Forced-WebGL2 tests passed; WebGPU was unavailable and remains unvalidated.');
