@@ -36,6 +36,14 @@ export const LOOKAHEAD_SECONDS = 0.12;
 export const SCHEDULE_INTERVAL_MS = 25;
 /** A step this far behind `now` is skipped rather than fired late; a late burst of sixteenths is worse than a gap. */
 export const LATE_STEP_TOLERANCE_SECONDS = 0.03;
+/**
+ * A release ends this long before the next onset on its grid, never exactly
+ * on it: a ramp that ends at the very time the next note cancels from is
+ * dropped by the platform, which clicks, and a voice whose release ends a
+ * floating-point hair after the onset is still busy when the note asks for
+ * it, which drops the note.
+ */
+export const RELEASE_GAP_SECONDS = 0.001;
 
 export type MutableVoiceParams = { -readonly [K in keyof VoiceParams]?: VoiceParams[K] };
 
@@ -114,6 +122,8 @@ export class Sequencer {
   private readonly padLevels = new Map<Voice, number>();
   /** Panic keeps the pad it cut into; the section's own pad notes are then not scheduled. */
   private skipPad = false;
+  /** `start` chose its section; the hook is asked from the next bar line on, as after any switch. */
+  private skipFirstHook = false;
   private disposed = false;
 
   constructor(private readonly host: SequencerHost) {
@@ -168,6 +178,7 @@ export class Sequencer {
     this.stopAt = Number.POSITIVE_INFINITY;
     this.trim.gain.cancelScheduledValues(at);
     this.enter(section, at, keepPad);
+    this.skipFirstHook = true;
     return 'ok';
   }
 
@@ -202,6 +213,7 @@ export class Sequencer {
     this.muted.clear();
     this.padLevels.clear();
     this.skipPad = false;
+    this.skipFirstHook = false;
     this.stopAt = Number.POSITIVE_INFINITY;
   }
 
@@ -276,11 +288,21 @@ export class Sequencer {
 
   /* ---- internals --------------------------------------------------- */
 
-  /** Called at the first step of a bar with the bar line's time. False when the hook ended the music. */
+  /**
+   * Called at the first step of a bar with the bar line's time. The hook is
+   * asked once per bar line from the second bar of a section on, and at its
+   * end; the line that chose a section is never asked again for its bar
+   * zero. False when the hook ended the music.
+   */
   private beginBar(time: number): boolean {
     const a = this.arrangement;
     const section = this.section;
     if (a === null || section === null) return false;
+    if (this.skipFirstHook) {
+      this.skipFirstHook = false;
+      this.stats.bars += 1;
+      return true;
+    }
     const ended = this.barIndex >= section.bars;
     const info: BarInfo = { section: section.id, barInSection: this.barIndex, bars: section.bars, loopStart: section.loopStart, time };
     const decision = this.onBar === null ? null : this.onBar(info);
@@ -381,20 +403,21 @@ export class Sequencer {
       // The pad: the drone applies no envelope of its own, so the sequencer drives its level.
       voice.start(onset, params);
       const gain = params.gain ?? 0.3;
+      const end = onset + seconds - RELEASE_GAP_SECONDS;
       const attack = Math.min(Math.max(0.005, adsr.attack * scale), seconds / 2);
       const release = Math.min(Math.max(0.005, adsr.release * scale), seconds / 2);
       const level = voice.level;
       level.cancelScheduledValues(onset);
       level.setValueAtTime(MIN_EXP_TARGET, onset);
       level.linearRampToValueAtTime(gain, onset + attack);
-      level.setValueAtTime(gain, onset + seconds - release);
-      level.linearRampToValueAtTime(MIN_EXP_TARGET, onset + seconds);
-      voice.finishAt = onset + seconds;
+      level.setValueAtTime(gain, end - release);
+      level.linearRampToValueAtTime(MIN_EXP_TARGET, end);
+      voice.finishAt = end;
       this.padLevels.set(voice, gain);
       if (section.padDetuneCents !== 0) voice.setDetune(section.padDetuneCents, onset, Math.max(0.01, sectionSeconds(a, section.id) - (onset - this.anchor)));
     } else {
       // A one-shot whose release ends inside the note, so the next note on this voice starts from silence.
-      params.hold = Math.max(0, seconds - (adsr.attack + adsr.decay + adsr.release) * scale);
+      params.hold = Math.max(0, seconds - RELEASE_GAP_SECONDS - (adsr.attack + adsr.decay + adsr.release) * scale);
       voice.start(onset, params);
     }
     this.stats.notes += 1;

@@ -21,7 +21,7 @@ import {
   type Arrangement, type Note, type PartId, type Section, type SectionId,
 } from '../../src/audio/score/Arrangement';
 import {
-  LATE_STEP_TOLERANCE_SECONDS, LOOKAHEAD_SECONDS, SCHEDULE_INTERVAL_MS, Sequencer,
+  LATE_STEP_TOLERANCE_SECONDS, LOOKAHEAD_SECONDS, RELEASE_GAP_SECONDS, SCHEDULE_INTERVAL_MS, Sequencer,
   type BarInfo, type SequencerHost, type Voicing,
 } from '../../src/audio/score/Sequencer';
 import { FakeContext, type FakeNode, type FakeParam } from './fakeContext';
@@ -198,12 +198,13 @@ describe('sequencer', () => {
     const total = (8 + 16 + 8 + 8) * bar;
     run(rig, 0, total + 0.5);
     const entry = infos.filter((i) => i.section === 'entry');
-    expect(entry.map((i) => i.barInSection)).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8]);
-    expect(entry[8]?.time).toBeCloseTo(8 * bar, 9);
+    // The hook is asked once per bar line from a section's second bar on, and at its end; never for a bar zero,
+    // whether `start` chose the section or the hook did.
+    expect(entry.map((i) => i.barInSection)).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(entry[7]?.time).toBeCloseTo(8 * bar, 9);
     const crossing = infos.filter((i) => i.section === 'crossing');
-    // The hook is asked once per bar line: the line that chose the crossing is not asked again for its bar zero,
-    // so the first pass reads 1 to 15, then the end-of-section question at 16, then the loop resumes from bar
-    // eight and the next question is bar nine.
+    // So the crossing's first pass reads 1 to 15, then the end-of-section question at 16, then the loop resumes
+    // from bar eight and the next question is bar nine.
     expect(crossing.slice(0, 16).map((i) => i.barInSection)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
     expect(crossing.slice(16, 24).map((i) => i.barInSection)).toEqual([9, 10, 11, 12, 13, 14, 15, 16]);
     expect(crossing[15]?.time).toBeCloseTo((8 + 16) * bar, 9);
@@ -325,7 +326,14 @@ describe('sequencer', () => {
         expect(previous?.time ?? 0).toBeLessThanOrEqual(e.time + 1e-9);
       }
     }
-    for (const v of rig.voices()) if (v instanceof DroneVoice && v.busy) expect(v.finishAt - v.startedAt).toBeCloseTo(4 * barSeconds(a), 9);
+    for (const v of rig.voices()) if (v instanceof DroneVoice && v.busy) expect(v.finishAt - v.startedAt).toBeCloseTo(4 * barSeconds(a) - RELEASE_GAP_SECONDS, 9);
+    // Every one-shot is free strictly before the onset that follows it on the grid, never exactly on it.
+    for (const v of rig.voices()) {
+      if (v instanceof DroneVoice || v instanceof ImpactVoice || v.finishAt === Number.POSITIVE_INFINITY) continue;
+      const step = stepSeconds(a);
+      const remainder = ((v.finishAt / step) % 1 + 1) % 1;
+      expect(Math.min(remainder, 1 - remainder) * step).toBeGreaterThanOrEqual(RELEASE_GAP_SECONDS - 1e-9);
+    }
   });
 
   it('budget: a dense travel section never has more voices sounding than the pool holds', () => {
@@ -434,8 +442,8 @@ describe('sequencer', () => {
     const h = bassOf(halved);
     expect(f).toBeDefined();
     expect(h).toBeDefined();
-    expect(f!.finishAt - f!.startedAt).toBeCloseTo(2 * stepSeconds(a), 9);
-    expect(h!.finishAt - h!.startedAt).toBeCloseTo(2 * stepSeconds(a), 9);
+    expect(f!.finishAt - f!.startedAt).toBeCloseTo(2 * stepSeconds(a) - RELEASE_GAP_SECONDS, 9);
+    expect(h!.finishAt - h!.startedAt).toBeCloseTo(2 * stepSeconds(a) - RELEASE_GAP_SECONDS, 9);
   });
 });
 
