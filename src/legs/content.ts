@@ -74,6 +74,14 @@ export interface LegContent {
   readonly layout: LegLayout;
   /** Programs for the processes `populate` spawns, and the kernel state they read. */
   readonly workload?: LegWorkload;
+  /**
+   * WP-24 section 3: argument options for a verb whose anchor string carries
+   * one after the colon (`anchor.disc_plinth:blocks`), keyed by
+   * InteractionDef.id. The interactions panel renders a select and dispatches
+   * the chosen anchor. L07's split ids need nothing; L00 declares nothing yet
+   * because its two panels are its UI.
+   */
+  readonly arguments?: Readonly<Record<string, readonly { readonly anchor: string; readonly label: string }[]>>;
 }
 
 export interface LegModule {
@@ -143,8 +151,9 @@ const list = (items: readonly string[]): string => `[${items.join(', ')}]`;
  * target; a codex entry whose `unlock` names an objective the leg does not
  * declare; a terminal handler for a name outside `LEG_DEFERRED_COMMANDS`; and
  * a layout whose anchor set is not the interaction anchors plus its extras;
- * and a workload program keyed by a name `populate` never spawns, which would
- * never run (WP-L04 ruling 1).
+ * a workload program keyed by a name `populate` never spawns, which would
+ * never run (WP-L04 ruling 1); and an `arguments` entry for an interaction
+ * the leg does not declare, or one with no options (WP-24 section 3).
  */
 export function validateContent(leg: Leg, content: LegContent): readonly string[] {
   const problems: string[] = [];
@@ -178,6 +187,11 @@ export function validateContent(leg: Leg, content: LegContent): readonly string[
     if ((def.cost.integrity ?? 0) > 0 && (entry === undefined || entry.target === null)) {
       problems.push(`interaction ${def.id}: costs ${def.cost.integrity} integrity and names no target Program`);
     }
+  }
+
+  for (const [id, choices] of Object.entries(content.arguments ?? {})) {
+    if (!interactionIds.has(id)) problems.push(`arguments ${id}: the leg declares no InteractionDef with that id`);
+    if (choices.length === 0) problems.push(`arguments ${id}: an empty option list would render a select with nothing to choose`);
   }
 
   const objectiveIds = new Set(leg.objectives.map((objective) => objective.id));

@@ -23,11 +23,18 @@ export class InteractionPanel extends DeferredPanel {
   private leg: Leg | null = null;
   private content: LegContent | null = null;
   private message = '';
+  /** WP-24 section 2: while set, only these verbs render and the crossing, depot and reclamation launchers are withheld. */
+  private only: ReadonlySet<string> | null = null;
+  /** The argument anchor chosen per verb, kept across re-renders. */
+  private readonly chosen = new Map<string, string>();
   private readonly controls: { readonly button: HTMLButtonElement; readonly enabled: () => boolean }[] = [];
 
   constructor(private readonly config: InteractionPanelOptions) { super(config, 'interactions', 'Anchors'); }
 
-  open(leg: Leg, content: LegContent): void { this.leg = leg; this.content = content; this.message = ''; this.show(); }
+  open(leg: Leg, content: LegContent): void { this.leg = leg; this.content = content; this.message = ''; this.chosen.clear(); this.show(); }
+
+  /** Show only these verbs, or every verb and launcher again with null. The Boot Sector driver uses it for beat 4. */
+  restrict(ids: readonly string[] | null): void { this.only = ids === null ? null : new Set(ids); this.invalidate(); }
 
   private act(action: () => void): void {
     try { action(); this.message = ''; } catch (error) { this.message = messageOf(error); }
@@ -45,24 +52,40 @@ export class InteractionPanel extends DeferredPanel {
     const { document: doc } = this.config;
     this.controls.length = 0; shell.body.replaceChildren(); shell.footer.replaceChildren();
     if (this.message !== '') shell.body.append(paragraph(doc, this.message, 'kt-panel-error'));
+    const only = this.only;
     const groups = new Map<string, readonly InteractionDef[]>();
-    for (const def of leg.interactions) groups.set(def.anchor, [...(groups.get(def.anchor) ?? []), def]);
+    for (const def of leg.interactions) if (only === null || only.has(def.id)) groups.set(def.anchor, [...(groups.get(def.anchor) ?? []), def]);
     for (const [anchor, defs] of groups) {
       const section = doc.createElement('section'); section.setAttribute('data-anchor', anchor);
       const heading = doc.createElement('h3'); heading.textContent = anchor; section.append(heading);
       for (const def of defs) {
-        const row = doc.createElement('div'); row.className = 'kt-panel-row';
+        const row = doc.createElement('div'); row.className = 'kt-panel-row'; row.setAttribute('data-interaction', def.id);
+        // WP-24 section 3: a verb whose companion declares argument options renders a select and dispatches the chosen anchor.
+        const choices = content.arguments?.[def.id];
+        let select: HTMLSelectElement | null = null;
+        if (choices !== undefined && choices.length > 0) {
+          select = doc.createElement('select'); select.setAttribute('aria-label', `${def.label} argument`);
+          for (const choice of choices) { const option = doc.createElement('option'); option.value = choice.anchor; option.textContent = choice.label; select.append(option); }
+          const stored = this.chosen.get(def.id);
+          select.value = choices.some(choice => choice.anchor === stored) ? stored ?? '' : choices[0]?.anchor ?? '';
+          const current = select;
+          current.addEventListener('change', () => { this.chosen.set(def.id, current.value); });
+        }
         const action = button(doc, def.label, () => this.act(() => {
-          if (!this.config.bus.dispatch({ kind: 'interaction', id: def.id, anchor: def.anchor }, { source: 'world', legId: leg.id })) {
+          const anchor = select === null ? def.anchor : select.value;
+          if (!this.config.bus.dispatch({ kind: 'interaction', id: def.id, anchor }, { source: 'world', legId: leg.id })) {
             throw new Error('Command queue full. Try again after the next tick.');
           }
         }));
-        row.append(action, paragraph(doc, def.description), paragraph(doc, `Cost: ${resourcesText(def.cost)}`));
+        row.append(action);
+        if (select !== null) row.append(select);
+        row.append(paragraph(doc, def.description), paragraph(doc, `Cost: ${resourcesText(def.cost)}`));
         this.controls.push({ button: action, enabled: () => this.travelling() && this.available(def) });
         section.append(row);
       }
       shell.body.append(section);
     }
+    if (only !== null) return;
     const crossings = doc.createElement('section'); const crossingsHeading = doc.createElement('h3');
     crossingsHeading.textContent = 'Crossings'; crossings.append(crossingsHeading);
     for (const def of content.crossings) {
