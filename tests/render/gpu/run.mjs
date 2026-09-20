@@ -217,11 +217,17 @@ try {
       const after = await audioPage.evaluate(() => globalThis.__kernelTrailAudioProbe.api.info());
       console.log('Audio context after gesture:', JSON.stringify(after));
       assert.equal(after.constructions, 1);
+      // WP-23: the context must run at the buffers' rate (DEFAULT_SAMPLE_RATE, 48000); the Ubuntu runner opens
+      // audio at 44100 Hz and the graph never built until the factory pinned the rate.
+      assert.equal(after.sampleRate, after.bufferRate, `the context rate ${after.sampleRate} must equal the buffer rate ${after.bufferRate}`);
+      assert.equal(after.sampleRate, 48000, 'DEFAULT_SAMPLE_RATE');
+      assert.equal(after.failureReason, null, 'the engine reports no failure after the gesture');
       const run = await audioPage.evaluate(() => globalThis.__kernelTrailAudioProbe.api.run(2));
       console.log('Audio two-second run:', JSON.stringify(run));
       assert.equal(run.state, 'running', 'the context must stay running through the run');
       assert.equal(run.consumerErrors, 0, 'the consumer must not record an error');
       assert(run.cuesPlayed > 50, 'the run must play cues');
+      assert.equal(run.cuesDropped, droppedBefore, `no cue is dropped after the gesture; ${run.cuesDropped - droppedBefore} were`);
       assert(run.voicesPeak <= 64, 'the high-tier voice cap');
       const timing = await audioPage.evaluate(() => globalThis.__kernelTrailAudioProbe.api.timing());
       console.log('generateBuffers timing (browser):', JSON.stringify(timing));
@@ -231,6 +237,7 @@ try {
         cost[tier] = await audioPage.evaluate(t => globalThis.__kernelTrailAudioProbe.api.cost(t), tier);
         console.log(`Audio pool cost ${tier}:`, JSON.stringify(cost[tier]));
         assert(cost[tier].peakSample > 0, `${tier}: the offline render must produce signal`);
+        assert.equal(cost[tier].cuesDropped, 0, `${tier}: no cue dropped over the offline context`);
         // A DynamicsCompressorNode is not a brick wall: Chrome applies makeup gain
         // past the threshold and the mandated 3 ms attack passes a transient's
         // first samples, so a 500-cue-per-second burst overshoots by a fraction of

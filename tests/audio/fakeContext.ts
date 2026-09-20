@@ -263,8 +263,16 @@ export class FakeWaveShaper extends FakeNode implements WaveShaperLike {
 }
 
 export class FakeConvolver extends FakeNode implements ConvolverLike {
-  buffer: BufferLike | null = null;
+  private impulse: BufferLike | null = null;
   normalize = true;
+  get buffer(): BufferLike | null { return this.impulse; }
+  /** Chrome's rule, which WP-23 found the hard way: a convolver refuses an impulse at another rate. */
+  set buffer(value: BufferLike | null) {
+    if (value !== null && value.sampleRate !== this.ctx.sampleRate) {
+      throw new Error(`NotSupportedError: The buffer sample rate of ${value.sampleRate} does not match the context rate of ${this.ctx.sampleRate} Hz.`);
+    }
+    this.impulse = value;
+  }
 }
 
 export class FakeDelay extends FakeNode implements DelayLike {

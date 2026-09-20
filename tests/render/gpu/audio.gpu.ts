@@ -80,7 +80,7 @@ function initializeProbe(): void {
   const api = {
     info() {
       const ctx = engine.adapter.context;
-      return { state: engine.state, failureReason: engine.adapter.failureReason, sampleRate: ctx?.sampleRate ?? null, constructions: engine.adapter.contextConstructions, droppedBeforeGesture: engine.bank.stats.dropped };
+      return { state: engine.state, failureReason: engine.adapter.failureReason, sampleRate: ctx?.sampleRate ?? null, bufferRate: buffers.sampleRate, constructions: engine.adapter.contextConstructions, droppedBeforeGesture: engine.bank.stats.dropped };
     },
     /** Drop one cue before the gesture, so the autoplay counter is exercised. */
     poke() {
@@ -138,7 +138,7 @@ function initializeProbe(): void {
       return {
         tier, voices: VOICE_BUDGET[tier], renderedSeconds: rendered.length / SAMPLE_RATE, wallMs, quanta,
         msPerQuantum: wallMs / quanta, quantumMs: (QUANTUM / SAMPLE_RATE) * 1000, realtimeFraction: wallMs / (seconds * 1000),
-        peakSample: peak, cuesPlayed: stats.cuesPlayed, voicesPeak: stats.voicesPeak,
+        peakSample: peak, cuesPlayed: stats.cuesPlayed, cuesDropped: stats.cuesDropped, voicesPeak: stats.voicesPeak,
       };
     },
     dispose() {

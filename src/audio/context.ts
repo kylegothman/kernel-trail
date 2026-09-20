@@ -9,6 +9,7 @@
  * `adaptPlatformContext` below is the compile-time proof that a real
  * `AudioContext` satisfies them, checked against lib.dom.d.ts by `tsc`.
  */
+import { DEFAULT_SAMPLE_RATE } from './buffers';
 
 /** The automation surface of an `AudioParam`. Every method mirrors lib.dom.d.ts. */
 export interface ParamLike {
@@ -144,7 +145,10 @@ export function platformContextFactory(): AudioContextLike {
   if (typeof AudioContext === 'undefined') {
     throw new Error('AudioContext is not available in this environment');
   }
-  return adaptPlatformContext(new AudioContext({ latencyHint: 'interactive' }));
+  // WP-23: the Ubuntu CI runner opens audio at 44100 Hz, the buffer set is baked at DEFAULT_SAMPLE_RATE, and
+  // Chrome refuses a convolver impulse whose rate differs from the context's, so the graph never built and the
+  // game was silent on every 44100 Hz device. Pinning the context rate makes the browser resample instead.
+  return adaptPlatformContext(new AudioContext({ latencyHint: 'interactive', sampleRate: DEFAULT_SAMPLE_RATE }));
 }
 
 /** Package section 2: the engine's view of the context lifecycle. */
@@ -255,6 +259,15 @@ export class AudioAdapter {
     this.reason = reason;
     this.ctx = null;
     this.set('failed');
+  }
+
+  /**
+   * WP-23: a graph-build failure is quiet by design and stays quiet, but it
+   * is recorded here so `failureReason` says why the engine is silent. The
+   * state is untouched; the context is fine, the graph over it is not.
+   */
+  recordFailure(reason: string): void {
+    this.reason = reason;
   }
 
   private syncState(): void {

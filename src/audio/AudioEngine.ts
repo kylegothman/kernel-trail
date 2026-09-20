@@ -333,9 +333,12 @@ export class AudioEngine implements VoiceHost, SoundHost, ConsumerHost {
       score.start(now);
       this.scoreInstance = score;
       this.applySettings(this.settingsStore.get());
-    } catch {
+    } catch (error) {
       // Package section 2: audio failure is quiet. Tear down whatever was
-      // built and leave the adapter to report the reason.
+      // built and record the reason on the adapter, which is where the
+      // diagnostics read it; WP-23 found a build failing on every 44100 Hz
+      // device with the adapter reporting running over silence and no reason.
+      this.adapter.recordFailure(`build: ${error instanceof Error ? `${error.name}: ${error.message}` : String(error)}`);
       this.scoreInstance = null;
       this.allocatorInstance?.dispose();
       this.allocatorInstance = null;
