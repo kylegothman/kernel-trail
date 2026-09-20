@@ -29,6 +29,8 @@ const scale = ci ? 4 : 1;
 const BUILD_DIR = join(os.tmpdir(), 'kt-wp12-gpu-build');
 const RESULTS_PATH = join(os.tmpdir(), 'kt-wp12-gpu-results.json');
 const artifactPath = (name) => join(os.tmpdir(), name);
+/** Every fixture URL carries scale=4 under --ci; in-page deadlines read it through fixtureTimeScale(). */
+const fixtureUrl = (url) => (ci ? `${url}${url.includes('?') ? '&' : '?'}scale=${scale}` : url);
 const machine = { hostname: os.hostname(), cpu: os.cpus()[0]?.model, platform: os.platform(), release: os.release(), arch: os.arch(), node: process.version };
 console.log('GPU test machine:', JSON.stringify(machine));
 console.log(`GPU test mode: ${ci ? 'ci (software rasteriser, timeouts x4)' : 'local'}; results ${RESULTS_PATH}`);
@@ -85,7 +87,7 @@ try {
     await page.addInitScript(installWebGPUDiagnostics);
     try {
       console.log(`Starting ${path} probe; waiting for explicit readiness`);
-      await navigateAndWaitForProbe(page, `http://127.0.0.1:${address.port}/tests/render/gpu/probe.html${force ? '?webgl' : ''}`, diagnostics);
+      await navigateAndWaitForProbe(page, fixtureUrl(`http://127.0.0.1:${address.port}/tests/render/gpu/probe.html${force ? '?webgl' : ''}`), diagnostics);
       const info = await page.evaluate(() => globalThis.__kernelTrailProbe.api.info());
       console.log('Probe ready:', JSON.stringify(info));
       results.push({ path, info });
@@ -132,7 +134,7 @@ try {
     try {
       await page.exposeFunction('__wp13Capture',async phase=>{assert(['front','occluded','released'].includes(phase));await page.screenshot({path:artifactPath(`kt-${path}-${phase}.png`)});});
       console.log(`Starting ${path}`);
-      await navigateAndWaitForProbe(page,`http://127.0.0.1:${address.port}/tests/render/gpu/focus.html?tier=${tier}${force?'&webgl':''}`,diagnostics);
+      await navigateAndWaitForProbe(page,fixtureUrl(`http://127.0.0.1:${address.port}/tests/render/gpu/focus.html?tier=${tier}${force?'&webgl':''}`),diagnostics);
       const info=await page.evaluate(()=>globalThis.__kernelTrailProbe.api.info());
       assert.equal(info.backend,force?'webgl2':'webgpu');
       const result=await page.evaluate(()=>globalThis.__kernelTrailProbe.api.run());
@@ -153,7 +155,7 @@ try {
     await page.addInitScript(installWebGPUDiagnostics);
     try {
       console.log(`Starting ${path}`);
-      await navigateAndWaitForProbe(page, `http://127.0.0.1:${address.port}/tests/render/gpu/derezz.html?tier=${tier}${force ? '&webgl' : ''}`, diagnostics);
+      await navigateAndWaitForProbe(page, fixtureUrl(`http://127.0.0.1:${address.port}/tests/render/gpu/derezz.html?tier=${tier}${force ? '&webgl' : ''}`), diagnostics);
       const info = await page.evaluate(() => globalThis.__kernelTrailProbe.api.info());
       assert.equal(info.backend, force ? 'webgl2' : 'webgpu');
       const result = await page.evaluate(() => globalThis.__kernelTrailProbe.api.run());
@@ -178,7 +180,7 @@ try {
     const audioDiagnostics = capturePageDiagnostics(audioPage);
     try {
       console.log('Starting audio probe; waiting for readiness');
-      await audioPage.goto(`http://127.0.0.1:${address.port}/tests/render/gpu/audio.html`, { waitUntil: 'domcontentloaded', timeout: 60_000 * scale });
+      await audioPage.goto(fixtureUrl(`http://127.0.0.1:${address.port}/tests/render/gpu/audio.html`), { waitUntil: 'domcontentloaded', timeout: 60_000 * scale });
       await audioPage.waitForFunction(() => globalThis.__kernelTrailAudioProbe?.status === 'ready' || globalThis.__kernelTrailAudioProbe?.status === 'failed', undefined, { timeout: 60_000 * scale });
       const boot = await audioPage.evaluate(() => globalThis.__kernelTrailAudioProbe);
       if (boot.status === 'failed') throw new Error(`Audio probe failed to initialise: ${boot.error?.message}\n${boot.error?.stack}`);
@@ -236,7 +238,7 @@ try {
     const diagnostics = capturePageDiagnostics(page);
     try {
       console.log(`Starting ${path}`);
-      await navigateAndWaitForProbe(page, `http://127.0.0.1:${address.port}/tests/render/gpu/hud.html`, diagnostics);
+      await navigateAndWaitForProbe(page, fixtureUrl(`http://127.0.0.1:${address.port}/tests/render/gpu/hud.html`), diagnostics);
       const result = await page.evaluate(() => globalThis.__kernelTrailProbe.api.run());
       console.log(`${path}: coverage ${(result.coverage * 100).toFixed(2)}% of 1440x900`, JSON.stringify(result));
       results.push({ path, result });
@@ -262,7 +264,7 @@ try {
     const diagnostics = capturePageDiagnostics(page);
     try {
       console.log(`Starting ${path}`);
-      await navigateAndWaitForProbe(page, `http://127.0.0.1:${address.port}/tests/render/gpu/replay.html`, diagnostics);
+      await navigateAndWaitForProbe(page, fixtureUrl(`http://127.0.0.1:${address.port}/tests/render/gpu/replay.html`), diagnostics);
       const result = await page.evaluate(() => globalThis.__kernelTrailProbe.api.run());
       console.log(`${path}:`, JSON.stringify(result));
       results.push({ path, result });
@@ -295,7 +297,7 @@ try {
       // The fixture controls RAF, so readiness polling uses a real timer.
       await Promise.race([
         (async () => {
-          await page.goto(`http://127.0.0.1:${address.port}/tests/render/gpu/boot.html${force ? '?webgl' : ''}`, {
+          await page.goto(fixtureUrl(`http://127.0.0.1:${address.port}/tests/render/gpu/boot.html${force ? '?webgl' : ''}`), {
             waitUntil: 'domcontentloaded', timeout: 60_000 * scale,
           });
           await page.waitForFunction(() => {
