@@ -14,6 +14,7 @@ import { compareTiers, GOLDEN_DIR, goldenFiles, readGolden, tiersOf, type Golden
 import { remainderHashAfter } from './harness/LegHarness';
 import { loadShippedSet, skipLine } from './harness/loadLeg';
 import { fixtureStatus, owedFixtures } from './harness/stubFixtures';
+import { readBalanceLedger } from '../../tools/golden/balance';
 
 const shipped = await loadShippedSet();
 const fixturesByLeg = new Map<string, LegFixtureModule | null>();
@@ -49,6 +50,14 @@ describe('golden playthroughs', () => {
       const files = goldenFiles(id, path);
       if (existsSync(files.fingerprint) !== existsSync(files.summary)) throw new Error(`${id} ${path}: one tier is present without the other`);
       if (existsSync(files.fingerprint)) expect(readGolden(id, path)).not.toBeNull();
+    }
+  });
+
+  it('every recorded golden has a row in tests/golden/balance.json (WP-23 section 3)', () => {
+    const ledger = readBalanceLedger();
+    for (const id of LEG_ORDER) for (const path of ['good', 'bad'] as const) {
+      if (readGolden(id, path) === null) continue;
+      expect(ledger?.[id]?.[path], `${id} ${path}: a golden is recorded without a balance row; run npm run golden:record -- --leg ${id} --path ${path} --force or npm run golden:balance`).toBeDefined();
     }
   });
 
