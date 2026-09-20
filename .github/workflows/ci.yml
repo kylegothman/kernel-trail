@@ -57,3 +57,29 @@ jobs:
             echo "the shipped bundle exceeds the 6MB ceiling. Check what was added, or raise the ceiling deliberately."
             exit 1
           fi
+
+  # WP-23 section 2: the renderer fixtures and the browser playthrough under
+  # Chromium's software rasteriser over WebGL2. WebGPU is not exercised here;
+  # npm run test:gpu on a Mac stays the WebGPU evidence. The runner appends
+  # the results path it used to $GITHUB_OUTPUT, so the upload takes that path
+  # rather than a guess at runner.temp, and runs on success and failure.
+  browser:
+    name: renderer and playthrough (WebGL2, software)
+    needs: gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - id: browser
+        run: npm run test:browser
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: browser-results
+          path: ${{ steps.browser.outputs.results }}
