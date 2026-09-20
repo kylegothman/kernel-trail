@@ -9,6 +9,7 @@ import { DEPOT_LEGS } from '@game/travel/segments';
 import type { InteractionDef, Leg, RunState } from '@game/types';
 import type { LegContent } from '@legs/content';
 import { DeferredPanel, button, messageOf, paragraph, resourcesText, type PanelOptions, type PanelShell } from './panel';
+import { RefusalLines, refusalElement, refusalFor, type OutcomeSource } from './RefusalLine';
 
 export interface InteractionPanelOptions extends PanelOptions {
   readonly runner: Pick<LegRunner, 'phase' | 'openCrossing' | 'openDepot' | 'openReclamation'>;
@@ -17,6 +18,10 @@ export interface InteractionPanelOptions extends PanelOptions {
   readonly crossing: (def: CrossingDef, context: CrossingContext) => void;
   readonly depot: (depot: Depot) => void;
   readonly reclamation: (layout: VergeLayout) => void;
+  /** WP-24 section 4: the bus's drained outcomes, so a refused verb shows its line. */
+  readonly outcomes?: OutcomeSource;
+  /** Wall clock in milliseconds for the refusal line's two seconds; performance.now by default. */
+  readonly clock?: () => number;
 }
 
 export class InteractionPanel extends DeferredPanel {
@@ -28,8 +33,21 @@ export class InteractionPanel extends DeferredPanel {
   /** The argument anchor chosen per verb, kept across re-renders. */
   private readonly chosen = new Map<string, string>();
   private readonly controls: { readonly button: HTMLButtonElement; readonly enabled: () => boolean }[] = [];
+  private readonly refusals = new RefusalLines();
+  private readonly unwatchOutcomes: () => void;
 
-  constructor(private readonly config: InteractionPanelOptions) { super(config, 'interactions', 'Anchors'); }
+  constructor(private readonly config: InteractionPanelOptions) {
+    super(config, 'interactions', 'Anchors');
+    this.unwatchOutcomes = config.outcomes?.onOutcomes(outcomes => {
+      const run = config.run();
+      for (const outcome of outcomes) {
+        const refusal = refusalFor(outcome, run);
+        if (refusal !== null) { this.refusals.show(refusal, this.now()); this.invalidate(); }
+      }
+    }) ?? (() => undefined);
+  }
+
+  private now(): number { return this.config.clock?.() ?? performance.now(); }
 
   open(leg: Leg, content: LegContent): void { this.leg = leg; this.content = content; this.message = ''; this.chosen.clear(); this.show(); }
 
@@ -80,6 +98,8 @@ export class InteractionPanel extends DeferredPanel {
         row.append(action);
         if (select !== null) row.append(select);
         row.append(paragraph(doc, def.description), paragraph(doc, `Cost: ${resourcesText(def.cost)}`));
+        const refusal = this.refusals.text(def.id);
+        if (refusal !== null) row.append(refusalElement(doc, refusal));
         this.controls.push({ button: action, enabled: () => this.travelling() && this.available(def) });
         section.append(row);
       }
@@ -107,10 +127,13 @@ export class InteractionPanel extends DeferredPanel {
   }
 
   override flush(): void {
+    if (this.refusals.size > 0 && this.refusals.expire(this.now())) this.invalidate();
     super.flush();
     if (!this.isOpen) return;
     for (const control of this.controls) {
       const disabled = !control.enabled(); if (control.button.disabled !== disabled) control.button.disabled = disabled;
     }
   }
+
+  override dispose(): void { this.unwatchOutcomes(); super.dispose(); }
 }

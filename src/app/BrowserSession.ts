@@ -2,7 +2,7 @@
 import { Scene, Vector3 } from 'three/webgpu';
 import { CAMERA } from '@design';
 import { asTick, createKernel, createRng, type KernelEvent } from '@kernel/index';
-import { CommandBus } from '@game/CommandBus';
+import { ObservedBus } from './panels/RefusalLine';
 import { LegRunner, type LegEvent, type LegPhase } from '@game/LegRunner';
 import { createRunStore, createTelemetryStore } from '@game/runStore';
 import { initialRunState } from '@game/replay/runReplay';
@@ -113,7 +113,8 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
     if (kernel === null || kernel === undefined) throw new Error('No active kernel.');
     return kernel;
   };
-  const bus = new CommandBus({ store: runStore, kernel: {
+  // WP-24 section 4: the bus publishes every drain so a refused verb can show its line.
+  const bus = new ObservedBus({ store: runStore, kernel: {
     setScheduler: (id, params) => currentKernel().setScheduler(id, params),
     setReplacementPolicy: id => currentKernel().setReplacementPolicy(id),
     setDiskPolicy: id => currentKernel().setDiskPolicy(id),
@@ -288,7 +289,7 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
   const depotPanel = new DepotPanel({ document: doc, overlay: boot.overlay, runner, run: () => runStore.get(), hold });
   const reclamationPanel = new ReclamationPanel({ document: doc, overlay: boot.overlay, runner, hold });
   const codexPanel = new CodexPanel({ document: doc, overlay: boot.overlay, codex, registry, hold });
-  const interactionPanel = new InteractionPanel({ document: doc, overlay: boot.overlay, runner, bus, run: () => runStore.get(),
+  const interactionPanel = new InteractionPanel({ document: doc, overlay: boot.overlay, runner, bus, run: () => runStore.get(), outcomes: bus, clock: () => performance.now(),
     crossing: (def, context) => crossingPanel.open(def, context), depot: depot => depotPanel.open(depot), reclamation: layout => reclamationPanel.open(layout) });
   panels.push(interactionPanel, crossingPanel, depotPanel, reclamationPanel, codexPanel);
   let worldAggregates: FrameAggregates | null = null;

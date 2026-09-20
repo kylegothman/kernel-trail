@@ -6,6 +6,10 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { InteractionPanel } from '@app/panels/InteractionPanel';
+import { DECLINED_LINE, ObservedBus, REFUSAL_LINE_MS, refusalFor, type OutcomeSource } from '@app/panels/RefusalLine';
+import { asTick } from '@kernel/types';
+import type { CommandOutcome } from '@game/CommandBus';
+import { DIRECT_REACH_LINE } from '@legs/boot_sector/copy';
 import { initialRunState } from '@game/replay/runReplay';
 import type { Leg } from '@game/types';
 import { validateContent, type LegContent } from '@legs/content';
@@ -83,5 +87,74 @@ describe('LegContent.arguments', () => {
     panel.restrict(null); panel.flush();
     expect(overlay.querySelectorAll('[data-interaction]')).toHaveLength(2);
     expect(overlay.textContent).toContain('Open depot');
+  });
+});
+
+describe('the refusal line (section 4)', () => {
+  it('ObservedBus publishes each non-empty drain after applying it', () => {
+    const run = initialRunState(30, 'shell', 'operator');
+    const store = { get: () => run, mutate: (recipe: (draft: typeof run) => void) => recipe(run) };
+    const bus = new ObservedBus({ store: store as never, kernel: {} as never, handlers: { useAbility: vi.fn(), interaction: vi.fn(), terminal: vi.fn() },
+      admit: cmd => cmd.kind === 'interaction' && cmd.id === 'no' ? { ok: false, reason: 'This interaction is unavailable.' } : { ok: true } });
+    const seen: CommandOutcome[][] = [];
+    const unwatch = bus.onOutcomes(outcomes => seen.push([...outcomes]));
+    expect(bus.drain(asTick(0))).toEqual([]);
+    expect(seen).toEqual([]);
+    bus.dispatch({ kind: 'interaction', id: 'no', anchor: 'a' }, { source: 'world', legId: 'boot_sector' });
+    bus.dispatch({ kind: 'interaction', id: 'yes', anchor: 'a' }, { source: 'world', legId: 'boot_sector' });
+    const outcomes = bus.drain(asTick(3));
+    expect(seen).toEqual([outcomes]);
+    expect(outcomes.map(outcome => outcome.refused)).toEqual(['This interaction is unavailable.', null]);
+    expect(run.decisions.map(record => record.outcome)).toEqual(['costly', 'pending']);
+    unwatch();
+    bus.dispatch({ kind: 'interaction', id: 'yes', anchor: 'a' }, { source: 'world', legId: 'boot_sector' });
+    bus.drain(asTick(4));
+    expect(seen).toHaveLength(1);
+  });
+
+  it("resolves the director's reason, the Boot Sector's two lines from the leg's data, and Declined. for the rest", () => {
+    const run = initialRunState(30, 'shell', 'operator');
+    const outcome = (id: string, refused: string | null, index: number, legId: 'boot_sector' | 'quantum_pass' = 'boot_sector'): CommandOutcome =>
+      ({ command: { kind: 'interaction', id, anchor: 'a' }, origin: { source: 'world', legId }, at: asTick(0), decisionIndex: index, syscall: null, refused });
+    expect(refusalFor(outcome('x', 'Insufficient resources for this interaction.', 0), run)).toEqual({ id: 'x', text: 'Insufficient resources for this interaction.' });
+    run.decisions.push(
+      { tick: asTick(0), legId: 'boot_sector', kind: 'interaction', choice: 'boot.direct_reach @ anchor.block_stack', outcome: 'costly', relatedObjective: null },
+      { tick: asTick(0), legId: 'boot_sector', kind: 'interaction', choice: 'boot.trap_purchase @ anchor.win.quota', outcome: 'costly', relatedObjective: null },
+      { tick: asTick(0), legId: 'quantum_pass', kind: 'interaction', choice: 'pass.tune @ anchor.scheduler', outcome: 'costly', relatedObjective: null },
+      { tick: asTick(0), legId: 'boot_sector', kind: 'interaction', choice: 'boot.inspect_program @ anchor.plate', outcome: 'good', relatedObjective: null },
+    );
+    expect(refusalFor(outcome('boot.direct_reach', null, 0), run)).toEqual({ id: 'boot.direct_reach', text: DIRECT_REACH_LINE });
+    expect(DIRECT_REACH_LINE).toBe('EPERM. man EPERM.');
+    // A bare submission at the quota window in user mode is EPERM by the leg's own reducer.
+    expect(refusalFor(outcome('boot.trap_purchase', null, 1), run)).toEqual({ id: 'boot.trap_purchase', text: 'EPERM. man EPERM.' });
+    expect(refusalFor(outcome('pass.tune', null, 2, 'quantum_pass'), run)).toEqual({ id: 'pass.tune', text: DECLINED_LINE });
+    expect(refusalFor(outcome('boot.inspect_program', null, 3), run)).toBeNull();
+    expect(refusalFor({ ...outcome('x', null, 0), command: { kind: 'set_pace', to: 'steady' } }, run)).toBeNull();
+  });
+
+  it('the panel shows the line under the verb for two seconds of wall time, then it is gone', () => {
+    const { leg, content } = legWithGate();
+    const run = initialRunState(30, 'shell', 'operator');
+    let listener: ((outcomes: readonly CommandOutcome[]) => void) | null = null;
+    const outcomes: OutcomeSource = { onOutcomes: l => { listener = l; return () => { listener = null; }; } };
+    let now = 1000;
+    const runner = { phase: 'travelling' as const, openCrossing: vi.fn(), openDepot: vi.fn(), openReclamation: vi.fn() };
+    const panel = new InteractionPanel({ document, overlay, runner: runner as never, bus: { dispatch: vi.fn(() => true) }, run: () => run, outcomes, clock: () => now,
+      crossing: vi.fn(), depot: vi.fn(), reclamation: vi.fn() });
+    cleanups.push(() => panel.dispose());
+    panel.open(leg, content); panel.flush();
+    run.decisions.push({ tick: asTick(0), legId: 'boot_sector', kind: 'interaction', choice: 'boot.direct_reach @ anchor.block_stack', outcome: 'costly', relatedObjective: null });
+    listener!([{ command: { kind: 'interaction', id: 'boot.direct_reach', anchor: 'anchor.block_stack' }, origin: { source: 'world', legId: 'boot_sector' }, at: asTick(0), decisionIndex: 0, syscall: null, refused: null }]);
+    expect(overlay.querySelector('.kt-refusal')).toBeNull();
+    panel.flush();
+    const row = overlay.querySelector('[data-interaction="boot.direct_reach"]');
+    expect(row?.querySelector('.kt-refusal')?.textContent).toBe('EPERM. man EPERM.');
+    expect(overlay.querySelectorAll('.kt-refusal')).toHaveLength(1);
+    now += REFUSAL_LINE_MS - 1; panel.flush();
+    expect(overlay.querySelector('.kt-refusal')).not.toBeNull();
+    now += 1; panel.flush();
+    expect(overlay.querySelector('.kt-refusal')).toBeNull();
+    panel.dispose();
+    expect(listener).toBeNull();
   });
 });
