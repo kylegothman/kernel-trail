@@ -11,14 +11,17 @@ import type { BusId, Voice, VoiceKind } from './voices/Voice';
 export const VOICE_BUDGET: Readonly<Record<QualityTier, number>> = { low: 16, medium: 32, high: 64 };
 
 /**
- * How the budget is split across the five kinds. Four drones and one noise
- * voice are the score's five layers at every tier; the rest is the world's.
- * Each row sums to the tier's budget, asserted by test.
+ * How the budget is split across the kinds. Four drones and one noise voice
+ * are WP-16's five layers at every tier; the rest is the world's. WP-25's
+ * chord, kick and lead kinds enter here at zero: they take their slots when
+ * the layers go, in the conductor commit, so the totals never move and the
+ * layers are never stolen from underneath. Each row sums to the tier's
+ * budget, asserted by test.
  */
 export const POOL_SPLIT: Readonly<Record<QualityTier, Readonly<Record<VoiceKind, number>>>> = {
-  low: { drone: 4, noise: 3, tone: 5, impact: 2, granular: 2 },
-  medium: { drone: 4, noise: 6, tone: 11, impact: 5, granular: 6 },
-  high: { drone: 4, noise: 12, tone: 24, impact: 10, granular: 14 },
+  low: { drone: 4, noise: 3, tone: 5, impact: 2, granular: 2, chord: 0, kick: 0, lead: 0 },
+  medium: { drone: 4, noise: 6, tone: 11, impact: 5, granular: 6, chord: 0, kick: 0, lead: 0 },
+  high: { drone: 4, noise: 12, tone: 24, impact: 10, granular: 14, chord: 0, kick: 0, lead: 0 },
 };
 
 export interface AllocatorStats {

@@ -16,12 +16,16 @@ import { AudioAdapter, type AudioContextFactory, type AudioContextLike, type Aud
 import { generateBuffers, type AudioBufferSet } from './buffers';
 import { MasterGraph, uploadBuffers } from './graph';
 import { POOL_SPLIT, VOICE_BUDGET, VoiceAllocator } from './VoiceBudget';
-import type { BusId, UploadedBuffers, Voice, VoiceHost, VoiceKind } from './voices/Voice';
+import { VOICE_KINDS, type BusId, type UploadedBuffers, type Voice, type VoiceHost, type VoiceKind } from './voices/Voice';
 import { ToneVoice } from './voices/ToneVoice';
 import { NoiseVoice } from './voices/NoiseVoice';
 import { ImpactVoice } from './voices/ImpactVoice';
 import { DroneVoice } from './voices/DroneVoice';
 import { GranularVoice } from './voices/GranularVoice';
+import { ChordVoice } from './voices/ChordVoice';
+import { KickVoice } from './voices/KickVoice';
+import { LeadVoice } from './voices/LeadVoice';
+import { Sidechain, SIDECHAIN_DEPTH } from './synth/sidechain';
 import { Score } from './score/Score';
 import { LoadModel, type LoadThresholds } from './score/loadModel';
 import { DEFAULT_ROOT_MIDI } from './synth/tuning';
@@ -76,6 +80,7 @@ export class AudioEngine implements VoiceHost, SoundHost, ConsumerHost {
   readonly bufferSet: AudioBufferSet;
   private graph: MasterGraph | null = null;
   private allocatorInstance: VoiceAllocator | null = null;
+  private sidechainInstance: Sidechain | null = null;
   private scoreInstance: Score | null = null;
   private uploaded: UploadedBuffers | null = null;
   private granularVoices: GranularVoice[] = [];
@@ -146,6 +151,11 @@ export class AudioEngine implements VoiceHost, SoundHost, ConsumerHost {
 
   get allocator(): VoiceAllocator | null {
     return this.allocatorInstance;
+  }
+
+  /** WP-25 section 3: the ducking envelope the kick triggers. Built with the graph. */
+  get sidechain(): Sidechain | null {
+    return this.sidechainInstance;
   }
 
   get score(): Score | null {
@@ -293,6 +303,7 @@ export class AudioEngine implements VoiceHost, SoundHost, ConsumerHost {
     this.graph?.dispose();
     this.scoreInstance = null;
     this.allocatorInstance = null;
+    this.sidechainInstance = null;
     this.graph = null;
     this.uploaded = null;
     this.granularVoices = [];
@@ -317,10 +328,10 @@ export class AudioEngine implements VoiceHost, SoundHost, ConsumerHost {
       this.graph = graph;
       const allocator = new VoiceAllocator(VOICE_BUDGET[this.tier]);
       this.allocatorInstance = allocator;
+      this.sidechainInstance = new Sidechain(SIDECHAIN_DEPTH[this.tier], () => this.envelope);
       const split = POOL_SPLIT[this.tier];
       const now = ctx.currentTime;
-      const kinds: readonly VoiceKind[] = ['drone', 'noise', 'tone', 'impact', 'granular'];
-      for (const kind of kinds) {
+      for (const kind of VOICE_KINDS) {
         for (let i = 0; i < split[kind]; i++) {
           const voice = this.makeVoice(kind);
           voice.warmUp(now);
@@ -342,6 +353,7 @@ export class AudioEngine implements VoiceHost, SoundHost, ConsumerHost {
       this.scoreInstance = null;
       this.allocatorInstance?.dispose();
       this.allocatorInstance = null;
+      this.sidechainInstance = null;
       this.graph?.dispose();
       this.graph = null;
       this.uploaded = null;
@@ -355,8 +367,17 @@ export class AudioEngine implements VoiceHost, SoundHost, ConsumerHost {
       case 'impact': return new ImpactVoice(this);
       case 'drone': return new DroneVoice(this);
       case 'granular': return new GranularVoice(this);
+      case 'chord': return new ChordVoice(this, this.requireSidechain());
+      case 'kick': return new KickVoice(this, this.requireSidechain());
+      case 'lead': return new LeadVoice(this);
       default: return assertNeverKind(kind);
     }
+  }
+
+  private requireSidechain(): Sidechain {
+    const sidechain = this.sidechainInstance;
+    if (sidechain === null) throw new Error('audio: side-chain not built');
+    return sidechain;
   }
 }
 

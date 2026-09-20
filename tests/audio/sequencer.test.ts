@@ -8,8 +8,14 @@ import type { Voice, VoiceHost } from '../../src/audio/voices/Voice';
 import { ToneVoice } from '../../src/audio/voices/ToneVoice';
 import { DroneVoice } from '../../src/audio/voices/DroneVoice';
 import { ImpactVoice, IMPACT_PRESETS } from '../../src/audio/voices/ImpactVoice';
-import { MIN_EXP_TARGET } from '../../src/audio/synth/constants';
+import { DEREZZ_DUCK_MS, MIN_EXP_TARGET } from '../../src/audio/synth/constants';
 import { midiToHz } from '../../src/audio/synth/tuning';
+import { Sidechain, SIDECHAIN, SIDECHAIN_DEPTH } from '../../src/audio/synth/sidechain';
+import { VOICE_KINDS } from '../../src/audio/voices/Voice';
+import { ChordVoice, CHORD_ADSR } from '../../src/audio/voices/ChordVoice';
+import { KickVoice, KICK, kickDuration } from '../../src/audio/voices/KickVoice';
+import { LeadVoice, VOWEL_PATH, formantsAt } from '../../src/audio/voices/LeadVoice';
+import type { QualityTier } from '@platform/quality';
 import {
   CROSSING_LOOP_START, SECTION_BARS, STEPS_PER_BAR, barSeconds, cutoffHz, emptyParts, stepSeconds,
   type Arrangement, type Note, type PartId, type Section, type SectionId,
@@ -430,5 +436,202 @@ describe('sequencer', () => {
     expect(h).toBeDefined();
     expect(f!.finishAt - f!.startedAt).toBeCloseTo(2 * stepSeconds(a), 9);
     expect(h!.finishAt - h!.startedAt).toBeCloseTo(2 * stepSeconds(a), 9);
+  });
+});
+
+/* ------------------------------------------------------------------ */
+/* The section 3 voices and the side-chain, played the way the         */
+/* sequencer plays them                                                 */
+/* ------------------------------------------------------------------ */
+
+const TIERS: readonly QualityTier[] = ['low', 'medium', 'high'];
+
+interface VoicePool {
+  readonly fake: FakeContext;
+  readonly sidechain: Sidechain;
+  readonly chord: ChordVoice;
+  readonly kick: KickVoice;
+  readonly lead: LeadVoice;
+  readonly pad: DroneVoice;
+  readonly bus: FakeNode;
+  setScale(scale: number): void;
+}
+
+function makeVoices(tier: QualityTier = 'medium', envelopeScale = 1): VoicePool {
+  const fake = new FakeContext();
+  const buffers = uploadBuffers(fake, generateBuffers(SEED), 'low');
+  const bus = fake.createGain();
+  let scale = envelopeScale;
+  const host: VoiceHost = { ctx: fake, buffers, busInput: () => bus, get envelopeScale() { return scale; }, mono: false, rng: createRng(SEED, 'audio').fork('runtime') };
+  const sidechain = new Sidechain(SIDECHAIN_DEPTH[tier], () => scale);
+  const chord = new ChordVoice(host, sidechain);
+  const kick = new KickVoice(host, sidechain);
+  const lead = new LeadVoice(host);
+  const pad = new DroneVoice(host);
+  sidechain.register(pad.gate);
+  for (const v of [chord, kick, lead, pad]) { v.warmUp(0); v.bus = 'score'; }
+  return { fake, sidechain, chord, kick, lead, pad, bus, setScale: (next) => { scale = next; } };
+}
+
+const param = (p: unknown): FakeParam => p as FakeParam;
+
+describe('score voices', () => {
+  it('three kinds: chord, kick and lead are voices of their own kinds, all in VOICE_KINDS', () => {
+    const p = makeVoices();
+    expect(p.chord.kind).toBe('chord');
+    expect(p.kick.kind).toBe('kick');
+    expect(p.lead.kind).toBe('lead');
+    for (const kind of ['chord', 'kick', 'lead'] as const) expect(VOICE_KINDS).toContain(kind);
+    expect(p.sidechain.size).toBe(2);
+  });
+
+  it('side-chain: a kick dips every registered param to 1 - depth in 5 ms and recovers over 180 ms, depth per tier', () => {
+    expect(SIDECHAIN).toEqual({ attackSeconds: 0.005, releaseSeconds: 0.18 });
+    expect(SIDECHAIN_DEPTH).toEqual({ low: 0.5, medium: 0.6, high: 0.7 });
+    for (const tier of TIERS) {
+      const p = makeVoices(tier);
+      const depth = SIDECHAIN_DEPTH[tier];
+      p.pad.start(0.5, { hz: 110, gain: 0.3, layer: true });
+      p.kick.start(1, { gain: 0.9, layer: true });
+      expect(p.sidechain.stats.triggers).toBe(1);
+      for (const target of [param(p.chord.duckParam), param(p.pad.gate)]) {
+        const events = [...target.events].filter((e) => e.time >= 1).sort((a, b) => a.time - b.time);
+        expect(events.map((e) => [e.kind, Math.round(e.value * 1e6) / 1e6, Math.round(e.time * 1e6) / 1e6])).toEqual([
+          ['set', 1, 1], ['linear', Math.round((1 - depth) * 1e6) / 1e6, 1.005], ['exp', 1, 1.185],
+        ]);
+        expect(target.valueAt(1.005), tier).toBeCloseTo(1 - depth, 6);
+        expect(target.valueAt(1.09), tier).toBeGreaterThan(1 - depth);
+        expect(target.valueAt(1.09), tier).toBeLessThan(1);
+        expect(target.valueAt(1.185), tier).toBeCloseTo(1, 6);
+      }
+      // The kick's own output is never ducked.
+      expect(param(p.kick.level).events.some((e) => e.kind === 'linear' && Math.abs(e.value - (1 - depth)) < 1e-9)).toBe(false);
+    }
+  });
+
+  it('derezz duck: every registered param falls to silence over 400 ms and holds; kicks are ignored until restore', () => {
+    const p = makeVoices('high');
+    p.sidechain.duck(2);
+    expect(p.sidechain.isDucked).toBe(true);
+    const duck = param(p.chord.duckParam);
+    expect(duck.valueAt(2)).toBeCloseTo(1, 6);
+    expect(duck.valueAt(2 + DEREZZ_DUCK_MS / 2000)).toBeCloseTo(0.5, 2);
+    expect(duck.valueAt(2 + DEREZZ_DUCK_MS / 1000)).toBeCloseTo(MIN_EXP_TARGET, 6);
+    expect(duck.valueAt(5)).toBeCloseTo(MIN_EXP_TARGET, 6);
+    const triggers = p.sidechain.stats.triggers;
+    p.kick.start(3, { gain: 0.9, layer: true });
+    expect(p.sidechain.stats.triggers).toBe(triggers);
+    expect(duck.valueAt(3.005)).toBeCloseTo(MIN_EXP_TARGET, 6);
+    p.sidechain.restore(6, 0.05);
+    expect(p.sidechain.isDucked).toBe(false);
+    expect(duck.valueAt(6.05)).toBeCloseTo(1, 6);
+    p.sidechain.restore(7);
+    expect(duck.valueAt(7)).toBeCloseTo(1, 6);
+    p.kick.start(8, { gain: 0.9, layer: true });
+    expect(p.sidechain.stats.triggers).toBe(triggers + 1);
+  });
+
+  it('kick: a sine drop from 150 to 46 Hz in 55 ms with a click, finished within 300 ms', () => {
+    const p = makeVoices();
+    p.kick.start(1, { gain: 0.9, layer: true });
+    const body = param(p.kick.bodyFrequency);
+    expect(body.events.map((e) => [e.kind, e.value, Math.round(e.time * 1e6) / 1e6])).toEqual([['set', KICK.startHz, 1], ['exp', KICK.endHz, 1.055]]);
+    expect(body.valueAt(1.02)).toBeGreaterThan(KICK.endHz);
+    expect(body.valueAt(1.02)).toBeLessThan(KICK.startHz);
+    expect(p.kick.finishAt - p.kick.startedAt).toBeCloseTo(kickDuration(1), 9);
+    expect(p.kick.finishAt - p.kick.startedAt).toBeLessThan(0.3);
+    const click = p.fake.params.find((q) => q.name === 'gain' && q.events.some((e) => e.kind === 'linear' && e.value === KICK.clickLevel));
+    expect(click).toBeDefined();
+    expect(click?.events.find((e) => e.kind === 'exp')?.time).toBeCloseTo(1 + KICK.clickSeconds, 9);
+    const filter = p.fake.nodes.find((n) => n.kind === 'biquad' && n.params.some((q) => q.name === 'frequency' && q.value === KICK.clickHz));
+    expect(filter).toBeDefined();
+    expect(param(p.kick.level).valueAt(1.1)).toBeCloseTo(0.9, 6);
+    expect(param(p.kick.level).valueAt(p.kick.finishAt + 0.002)).toBeCloseTo(MIN_EXP_TARGET, 6);
+  });
+
+  it('chord: the filter takes the cutoff and sweeps across the note, the duck gain sits before the output, and the hold fits', () => {
+    const p = makeVoices();
+    p.chord.start(2, { hz: 220, gain: 0.3, filterHz: 800, filterEndHz: 3000, q: 3, hold: 1, adsr: CHORD_ADSR, layer: true });
+    const filter = param(p.chord.filterParam);
+    const sounding = (CHORD_ADSR.attack + CHORD_ADSR.decay) + 1;
+    expect(filter.events.map((e) => [e.kind, e.value, Math.round(e.time * 1e6) / 1e6])).toEqual([['set', 800, 2], ['exp', 3000, Math.round((2 + sounding) * 1e6) / 1e6]]);
+    expect(p.chord.finishAt).toBeCloseTo(2 + sounding + CHORD_ADSR.release, 9);
+    const duckNode = param(p.chord.duckParam).owner;
+    const outNode = param(p.chord.level).owner;
+    expect(duckNode.connections.has(outNode)).toBe(true);
+    expect(p.fake.nodes.some((n) => n.kind === 'biquad' && n.connections.has(duckNode))).toBe(true);
+    const saws = p.fake.nodes.filter((n) => n.kind === 'oscillator' && (n as unknown as { type: string }).type === 'sawtooth' && [...n.connections].some((c) => c instanceof Object && (c as FakeNode).kind === 'biquad' && (c as FakeNode).connections.has(duckNode)));
+    expect(saws.length).toBe(2);
+    p.chord.start(5, { hz: 110, gain: 0.3, filterHz: 500, layer: true });
+    expect(p.chord.finishAt).toBe(Number.POSITIVE_INFINITY);
+    expect(filter.events.at(-1)).toMatchObject({ kind: 'set', value: 500, time: 5 });
+  });
+
+  it('lead: two band-pass formants at vowel frequencies swept across the note, and a glide from the voice\'s last pitch', () => {
+    expect(VOWEL_PATH.length).toBe(5);
+    expect(formantsAt(0)).toEqual([300, 870]);
+    expect(formantsAt(1)).toEqual([270, 2290]);
+    expect(formantsAt(0.5)).toEqual([730, 1090]);
+    expect(formantsAt(0.125)).toEqual([435, 855]);
+    const p = makeVoices();
+    expect(p.lead.lastPitchHz).toBe(0);
+    p.lead.start(1, { hz: 440, gain: 0.3, vowel: 0, vowelEnd: 0.5, hold: 0.5, layer: true });
+    const [f1, f2] = p.lead.formantParams.map((q) => param(q));
+    const sounding = 1 + (0.03 + 0.1) + 0.5;
+    expect(f1?.events.map((e) => [e.kind, e.value, Math.round(e.time * 1e6) / 1e6])).toEqual([['set', 300, 1], ['exp', 730, Math.round(sounding * 1e6) / 1e6]]);
+    expect(f2?.events.map((e) => [e.kind, e.value, Math.round(e.time * 1e6) / 1e6])).toEqual([['set', 870, 1], ['exp', 1090, Math.round(sounding * 1e6) / 1e6]]);
+    expect(p.lead.lastPitchHz).toBe(440);
+    const pitches = p.fake.params.filter((q) => q.name === 'frequency' && q.owner.kind === 'oscillator' && q.events.length > 0);
+    expect(pitches.length).toBe(2);
+    for (const q of pitches) expect(q.events.at(-1)).toMatchObject({ kind: 'set', value: 440, time: 1 });
+    p.lead.start(2, { hz: 660, gain: 0.3, glideSeconds: 0.1, hold: 0.2, layer: true });
+    for (const q of pitches) {
+      const tail = q.events.filter((e) => e.time >= 2).map((e) => [e.kind, e.value, Math.round(e.time * 1e6) / 1e6]);
+      expect(tail).toEqual([['set', 440, 2], ['exp', 660, 2.1]]);
+    }
+    const bandpasses = p.fake.nodes.filter((n) => n.kind === 'biquad' && (n as unknown as { type: string }).type === 'bandpass');
+    const lowpasses = p.fake.nodes.filter((n) => n.kind === 'biquad' && (n as unknown as { type: string }).type === 'lowpass');
+    // Two formants and the dry body; the chord's low-pass is the other one in this pool.
+    expect(bandpasses.length).toBeGreaterThanOrEqual(2);
+    expect(lowpasses.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('release: each voice returns to its baseline after 1,000 start and stop cycles, constructs nothing after warm-up, and dispose releases every node', () => {
+    const p = makeVoices();
+    const cases: [Voice, () => void][] = [
+      [p.chord, () => p.chord.start(0, { hz: 220, gain: 0.3, layer: true })],
+      [p.kick, () => p.kick.start(0, { gain: 0.9, layer: true })],
+      [p.lead, () => p.lead.start(0, { hz: 440, gain: 0.3, layer: true })],
+    ];
+    for (const [voice, start] of cases) {
+      start();
+      voice.stop(0.001);
+      const baseline = p.fake.liveNodeCount;
+      const constructions = p.fake.nodeConstructions;
+      for (let i = 0; i < 1000; i++) {
+        start();
+        voice.stop(0.5);
+      }
+      expect(p.fake.liveNodeCount, voice.kind).toBe(baseline);
+      expect(p.fake.nodeConstructions, voice.kind).toBe(constructions);
+    }
+    for (const [voice] of cases) voice.dispose();
+    p.pad.dispose();
+    // The stand-in bus never connected onward, so nothing in the pool is live once the voices let go.
+    expect(p.fake.liveNodeCount).toBe(0);
+    for (const node of p.fake.nodes) expect(node.released, node.kind).toBe(true);
+    expect(p.fake.nodes.filter((n) => n.kind === 'oscillator' || n.kind === 'bufferSource').every((n) => n.started === 1)).toBe(true);
+  });
+
+  it('reduced motion: halves the side-chain times and the kick decay', () => {
+    const p = makeVoices('medium', 0.5);
+    p.kick.start(1, { gain: 0.9, layer: true });
+    const duck = param(p.chord.duckParam);
+    expect(duck.events.map((e) => Math.round(e.time * 1e6) / 1e6)).toEqual([1, 1.0025, 1.0925]);
+    expect(p.kick.finishAt - 1).toBeCloseTo(kickDuration(0.5), 9);
+    expect(param(p.kick.bodyFrequency).events.at(-1)?.time).toBeCloseTo(1.0275, 9);
+    p.setScale(1);
+    p.kick.start(2, { gain: 0.9, layer: true });
+    expect(duck.events.filter((e) => e.time >= 2).map((e) => Math.round(e.time * 1e6) / 1e6)).toEqual([2, 2.005, 2.185]);
   });
 });
