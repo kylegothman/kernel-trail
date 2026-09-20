@@ -16,10 +16,10 @@
  * swaps the primitive and never enables inheritance, and ends by sitting down
  * to wait at the ford it should have blocked on. SABLE dies inside that wait.
  *
- * The entering ledger is the analytical curve of narrative 5.5 for the shell
- * at operator, as `tests/game/economyCurve.test.ts` computes it: 1328 cycles
- * at the Narrows, with quota, blocks and bandwidth at the starting ledger.
- * Quantum Pass replaces it with its golden closing ledger when that lands.
+ * The entering ledger is Quantum Pass's golden closing ledger, as the
+ * comment beside the constant says; until WP-23 it was the analytical curve
+ * of narrative 5.5 (1328 cycles), and the balance ledger's continuity test
+ * caught the difference on its first run.
  */
 import { FIXTURE_SEED, type LegFixture } from '../harness/fixtureContract';
 import type { DecisionScript, ScriptStep } from '../harness/decisionScript';
@@ -29,7 +29,8 @@ import { GUARDED_REGION } from '@legs/the_narrows/ledger';
 import { OBJECTIVE_IDS } from '@legs/the_narrows/objectives';
 import { CODEX_IDS } from '@legs/the_narrows/copy';
 
-const ENTERING = { cycles: 1328, quota: 900, blocks: 120, bandwidth: 60 };
+/** Quantum Pass's good-path golden closing ledger, tests/golden/balance.json quantum_pass.good.closingLedger, re-sourced by WP-23 from the narrative 5.5 curve (1328 cycles) once the balance ledger's continuity test found the two apart. */
+const ENTERING = { cycles: 1439.2, quota: 725, blocks: 120, bandwidth: 72 };
 
 /** The smallest region containing every access to the far post, as the player would type it. */
 const MARK = `lock --mark ${GUARDED_REGION.first} ${GUARDED_REGION.last}`;
