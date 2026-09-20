@@ -58,4 +58,6 @@ export interface CodexProfileState {
   readonly seen: readonly string[];
   readonly demonstrated: readonly string[];
   readonly firstSeen: Readonly<Record<string, { runId: string; legId: LegId }>>;
+  /** WP-24 section 2: the flag src/legs/boot_sector/onboarding.ts names; set once a Boot Sector debrief opens with its leg_done record present. */
+  readonly bootSectorCompleted?: boolean;
 }

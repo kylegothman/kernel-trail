@@ -13,6 +13,7 @@ import { SaveService, bindSettings, readCodexProfile, writeCodexProfile } from '
 import { createTerminalHost } from '@game/terminalHost';
 import type { RunSummary } from '@game/save';
 import { LEG_ORDER, type LegId, type RunState } from '@game/types';
+import { ZERO_SEGMENT_TICK_ALLOWANCE, legDone } from '@game/RunDirector';
 import { LEG_LOADERS } from '@legs/registry';
 import { validateContent, type LegModule } from '@legs/content';
 import { sharedEpitaphSource } from '@legs/epitaphs';
@@ -60,6 +61,9 @@ import { CrossingPanel } from './panels/CrossingPanel';
 import { DepotPanel } from './panels/DepotPanel';
 import { ReclamationPanel } from './panels/ReclamationPanel';
 import { CodexPanel } from './panels/CodexPanel';
+import { RequisitionPanel } from './panels/RequisitionPanel';
+import { GatePanel } from './panels/GatePanel';
+import { BootSectorDriver, layoutCarriesBeats } from './onboarding/BootSectorDriver';
 import { InteractionPanel } from './panels/InteractionPanel';
 import type { DeferredPanel } from './panels/panel';
 
@@ -91,6 +95,10 @@ export interface KernelTrailDebug {
   /** Per-leg hashes in order, for legs that have completed. */
   legHashes(): readonly { legId: LegId; hash: string; ticks: number }[];
   run(): Readonly<RunState>;
+  /** WP-24 section 6 (pre-flight ruling 9.10): where a stage anchor sits on screen in CSS pixels, or null when there is no stage, no such anchor, or it is behind the camera. */
+  anchorOnScreen(id: string): { readonly x: number; readonly y: number } | null;
+  /** The tutorial beat in progress, or null when no driver is mounted or it has finished. */
+  beat(): string | null;
 }
 export interface SessionOptions {
   readonly loaders?: Readonly<Partial<Record<LegId, () => Promise<LegModule>>>>;
@@ -184,6 +192,8 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
   let pacing: Pacing;
   let emergencyFrame = 0;
   let card: Card | null = null;
+  let driver: BootSectorDriver | null = null;
+  let bootSectorCompleted = profile.bootSectorCompleted === true;
   const stones = new Set<Card>();
   const timers = new Set<ReturnType<typeof setTimeout>>();
   const writes: (() => void)[] = [];
@@ -193,12 +203,15 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
   const loaders = options.loaders ?? LEG_LOADERS;
   let epitaphs = sharedEpitaphSource([]);
   let profileWrites: Promise<void> = Promise.resolve();
-  const unwatchCodex = codex.onUnlock(() => {
-    const snapshot = codex.profile();
+  // WP-24 section 2: Codex.profile() rebuilds the profile without the Boot Sector flag, so the session merges it into every write.
+  const writeProfile = (): void => {
+    const snapshot = { ...codex.profile(), ...(bootSectorCompleted ? { bootSectorCompleted: true } : {}) };
     profileWrites = profileWrites.then(() => writeCodexProfile(boot.db, snapshot, new Date().toISOString())).catch(error => panic(describe(error)));
-  });
+  };
+  const unwatchCodex = codex.onUnlock(writeProfile);
   const commit = (write: () => void): void => { if (!disposed) writes.push(write); };
   const flushUi = (): void => {
+    if (!disposed) driver?.update(performance.now());
     for (const write of writes.splice(0)) { if (!disposed) write(); }
     if (!disposed) for (const panel of panels) panel.flush();
     const interactions = interactionPanel.element;
@@ -242,6 +255,8 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
       case 'leg_unavailable': unavailable(event.legId, event.index, event.reason); break;
       case 'panic': panic(event.message); break;
       case 'debrief':
+        // WP-24 section 2: a Boot Sector debrief with its leg_done record present completes the tutorial for this profile.
+        if (runner.currentLeg?.id === 'boot_sector' && legDone(runStore.get(), 'boot_sector') && !bootSectorCompleted) { bootSectorCompleted = true; writeProfile(); }
         commit(() => {
           const next = createDebriefCard(doc, event.view.card, event.view.counterfactual);
           addAction(next.el, 'Continue', () => { void advance(); }); present(next, 'debrief');
@@ -289,9 +304,12 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
   const depotPanel = new DepotPanel({ document: doc, overlay: boot.overlay, runner, run: () => runStore.get(), hold });
   const reclamationPanel = new ReclamationPanel({ document: doc, overlay: boot.overlay, runner, hold });
   const codexPanel = new CodexPanel({ document: doc, overlay: boot.overlay, codex, registry, hold });
+  // WP-24 section 3: the Boot Sector's two panels; the driver opens them, and a skipped tutorial reaches them from the anchors panel's rows.
+  const requisitionPanel = new RequisitionPanel({ document: doc, overlay: boot.overlay, bus, run: () => runStore.get(), outcomes: bus, clock: () => performance.now(), hold });
+  const gatePanel = new GatePanel({ document: doc, overlay: boot.overlay, bus, run: () => runStore.get(), hold });
   const interactionPanel = new InteractionPanel({ document: doc, overlay: boot.overlay, runner, bus, run: () => runStore.get(), outcomes: bus, clock: () => performance.now(),
     crossing: (def, context) => crossingPanel.open(def, context), depot: depot => depotPanel.open(depot), reclamation: layout => reclamationPanel.open(layout) });
-  panels.push(interactionPanel, crossingPanel, depotPanel, reclamationPanel, codexPanel);
+  panels.push(interactionPanel, crossingPanel, depotPanel, reclamationPanel, codexPanel, requisitionPanel, gatePanel);
   let worldAggregates: FrameAggregates | null = null;
   let audioAggregates: FrameAggregates | null = null;
   const hooks = browserFrameHooks({ boot, runner, scene, focus, target, state: frame, stage: () => stage, effects, pool, engine, hud, terminal: () => terminal,
@@ -346,9 +364,15 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
         dispatch: (request, at) => transitioning || panicked || disposed
           ? { ok: false, message: 'The session is not accepting commands.' }
           : sink.dispatch(request, at),
-      }, () => runStore.get()), { document: doc, handlers });
+      }, () => runStore.get()), { document: doc, handlers, prompt: '> ' });
       next.shell.registerAll(leg.terminalCommands);
-      next.shell.onCommand((name, argv) => codex.signal({ kind: 'command', name, argv }));
+      next.shell.onCommand((name, argv) => {
+        codex.signal({ kind: 'command', name, argv });
+        // WP-24 pre-flight ruling 9.3: the line is a decision. Applied synchronously at the current tick as the terminal's
+        // other writes are, so a leg's reducer (the Boot Sector's manInvocations) sees it where the harness records it.
+        if (transitioning || panicked || disposed || runner.kernel !== kernel) return;
+        bus.apply({ kind: 'terminal', line: [name, ...argv].join(' ') }, { source: 'terminal', legId: leg.id }, kernel.tick);
+      });
       next.element.style.pointerEvents = 'auto'; boot.overlay.append(next.element); terminal = next;
     });
     engine.setConvoyPids(runStore.get().convoy.flatMap(member => member.pid === null ? [] : [member.pid]));
@@ -420,6 +444,31 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
     pool.dispose(); effects.disposeAll();
     if (scene.children.length !== 0) throw new Error('Previous stage did not empty the scene.');
   }
+  /** A profile that has completed the Boot Sector is offered Skip tutorial once at entry; true when taken. */
+  function offerSkip(): Promise<boolean> {
+    return new Promise(resolve => {
+      commit(() => {
+        const el = doc.createElement('section'); el.className = 'kt-card kt-card--tutorial'; el.setAttribute('role', 'region'); el.setAttribute('aria-label', 'Tutorial');
+        const line = doc.createElement('p'); line.textContent = 'This profile has completed the Boot Sector.'; el.append(line);
+        let chosen = false;
+        const choose = (skip: boolean): void => { if (chosen) return; chosen = true; commit(() => { card?.dispose(); card = null; }); resolve(skip); };
+        addAction(el, 'Skip tutorial', () => choose(true));
+        addAction(el, 'Play tutorial', () => choose(false));
+        present({ el, dispose: () => el.remove() }, 'tutorial');
+      });
+    });
+  }
+  function mountDriver(): void {
+    if (stage === null || disposed) return;
+    const layoutStage = stage;
+    driver = new BootSectorDriver({
+      document: doc, canvas: boot.canvas, run: () => runStore.get(), structures: () => layoutStage.structures,
+      sceneObject: name => scene.getObjectByName(name) ?? null, focus, hud, pacing, terminal: () => terminal,
+      interactions: interactionPanel, requisition: requisitionPanel, gate: gatePanel, clock: () => performance.now(),
+    });
+    // The two panels are the tutorial's UI; the anchors panel shows the same verbs only when the tutorial is skipped.
+    interactionPanel.restrict([]);
+  }
   async function showLayout(module: LegModule): Promise<void> {
     if (disposed) return;
     const post = boot.backend.postChain;
@@ -446,8 +495,10 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
     try {
       suppressLegEvents = true;
       try { if (runner.kernel !== null) runner.exit(); } finally { suppressLegEvents = false; }
+      driver?.dispose(); driver = null;
       clearStage();
-      interactionPanel.close(); crossingPanel.close(); depotPanel.close(); reclamationPanel.close();
+      interactionPanel.restrict(null);
+      interactionPanel.close(); crossingPanel.close(); depotPanel.close(); reclamationPanel.close(); requisitionPanel.close(); gatePanel.close();
       commit(() => { card?.dispose(); card = null; });
       index = to;
       const id = LEG_ORDER[index];
@@ -463,10 +514,27 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
       try { module = await load(id); } catch (error) { unavailable(id, index, describe(error)); return; }
       if (disposed) return;
       register(module); epitaphs = sharedEpitaphSource(module.content.epitaphs);
-      runner.enter(module.default, { maxTicks: MAX_TICKS, stageContext: { quality: boot.tier, run: runStore.get() } }, r => r.applyContent(module.content));
-      if (runner.kernel !== null && !panicked) await showLayout(module);
+      // WP-24 section 2: a new profile entering the Boot Sector gets the eight beats and cannot skip them; a profile that has
+      // completed it is offered Skip tutorial once, and the session is not held up by the offer: the leg is entered on the choice.
+      // The driver mounts only on the real Boot Sector's layout (pre-flight ruling 9.5).
+      const bootable = id === 'boot_sector' && start.kind === 'new' && layoutCarriesBeats(module.content.layout.anchors.map(anchor => anchor.id));
+      if (bootable && bootSectorCompleted) { void offerSkip().then(skip => enterLoaded(module, !skip)); return; }
+      await enterLoaded(module, bootable);
     } catch (error) { panic(describe(error)); }
     finally { transitioning = false; releaseEntering(); }
+  }
+  /** Enter a loaded leg; with `tutorial` the browser passes no allowance and mounts the driver once the stage is ready (pre-flight ruling 9.1). */
+  async function enterLoaded(module: LegModule, tutorial: boolean): Promise<void> {
+    if (disposed || panicked) return;
+    const wasTransitioning = transitioning;
+    transitioning = true;
+    const release = wasTransitioning ? () => undefined : pacing.hold('entering');
+    try {
+      runner.enter(module.default, { maxTicks: MAX_TICKS, stageContext: { quality: boot.tier, run: runStore.get() }, zeroSegmentAllowance: tutorial ? null : ZERO_SEGMENT_TICK_ALLOWANCE }, r => r.applyContent(module.content));
+      if (runner.kernel !== null && !panicked) await showLayout(module);
+      if (tutorial && runner.kernel !== null && !panicked && !disposed) mountDriver();
+    } catch (error) { panic(describe(error)); }
+    finally { if (!wasTransitioning) transitioning = false; release(); }
   }
   function restoreDecisionPanels(module: LegModule): void {
     const phase = runner.phase;
@@ -491,6 +559,7 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
       suppressLegEvents = true;
       // Approved runner teardown path. Suppress teardown cards while exit releases its stage.
       if (runner.kernel !== null) runner.exit();
+      driver?.dispose(); driver = null;
       loop.stop();
       try { boot.backend.renderFrame({ scene, camera, alpha: 0, dtSeconds: 0, elapsedSeconds: frame.elapsedSeconds }); } catch { /* Teardown can follow device loss. */ }
       for (const write of writes.splice(0)) write();
@@ -536,6 +605,14 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
       logHash: () => hashEventLog(routed),
       legHashes: () => completed.map(entry => ({ ...entry })),
       run: () => runStore.get(),
+      anchorOnScreen: id => {
+        const structure = stage?.structures.find(candidate => candidate.id === id);
+        if (structure === undefined) return null;
+        const point = structure.root.getWorldPosition(new Vector3()).project(focus.camera);
+        if (point.z > 1) return null;
+        return { x: (point.x + 1) / 2 * view.innerWidth, y: (1 - point.y) / 2 * view.innerHeight };
+      },
+      beat: () => (driver === null || driver.done ? null : driver.beatId),
     };
   }
   try {

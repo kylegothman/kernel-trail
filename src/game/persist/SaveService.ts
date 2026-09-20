@@ -192,6 +192,9 @@ export async function bindSettings<T>(
 /* Codex profile                                                       */
 /* ------------------------------------------------------------------ */
 
+/** The settings key `CodexProfileState.bootSectorCompleted` persists under (WP-24 section 2). */
+export const BOOT_SECTOR_COMPLETED_KEY = 'codex.bootSectorCompleted';
+
 /** One record per entry (pre-flight ruling 6.4); `seq` keeps the first-encounter order. */
 export interface CodexRecord {
   readonly entryId: string;
@@ -207,10 +210,13 @@ export async function readCodexProfile(db: Database): Promise<CodexProfileState>
   records.sort((a, b) => a.seq - b.seq || (a.entryId < b.entryId ? -1 : a.entryId > b.entryId ? 1 : 0));
   const firstSeen: Record<string, { runId: string; legId: LegId }> = {};
   for (const r of records) firstSeen[r.entryId] = { runId: r.runId, legId: r.legId };
+  // WP-24 section 2 (pre-flight ruling 9.2): the one profile flag that is not a codex entry rides in the settings store.
+  const bootSectorCompleted = await readSetting<boolean>(db, BOOT_SECTOR_COMPLETED_KEY);
   return {
     seen: records.map((r) => r.entryId),
     demonstrated: records.filter((r) => r.demonstrated).map((r) => r.entryId),
     firstSeen,
+    ...(bootSectorCompleted === true ? { bootSectorCompleted: true } : {}),
   };
 }
 
@@ -231,4 +237,5 @@ export async function writeCodexProfile(db: Database, profile: CodexProfileState
     };
     await db.put('codex', record);
   }
+  if (profile.bootSectorCompleted === true) await writeSetting(db, BOOT_SECTOR_COMPLETED_KEY, true);
 }

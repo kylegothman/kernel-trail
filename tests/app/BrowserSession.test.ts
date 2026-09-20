@@ -10,7 +10,7 @@ import { AudioEngine } from '@audio/AudioEngine';
 import { AudioAdapter } from '@audio/context';
 import { CommandBus } from '@game/CommandBus';
 import { DB_NAME, Database } from '@game/save';
-import { readCodexProfile } from '@game/persist/SaveService';
+import { BOOT_SECTOR_COMPLETED_KEY, readCodexProfile, writeSetting } from '@game/persist/SaveService';
 import { LEG_ORDER, type LegId, type SaveFile } from '@game/types';
 import { isEnvelope } from '@game/workers/protocol';
 import type { LegContent, LegModule } from '@legs/content';
@@ -350,8 +350,12 @@ describe('browser session assembly', () => {
       requested.push(module.default.id); return module;
     };
     const f = await fixtureBoot();
+    // WP-24: a profile that has completed the Boot Sector takes Skip tutorial, the passive route this case was written against.
+    await writeSetting(f.boot.db, BOOT_SECTOR_COMPLETED_KEY, true);
     const session = await createBrowserSession(f.boot, { kind: 'new', seed: 42, discClass: 'shell', difficulty: 'novice' }, { loaders });
-    sessions.push(session); session.pacing.setRate(TICK_HZ); clock.frames(4);
+    sessions.push(session); session.pacing.setRate(TICK_HZ); clock.frames(1);
+    buttonIn(f.boot.overlay, 'Skip tutorial').click();
+    await vi.waitFor(() => expect(session.runner.kernel).not.toBeNull()); clock.frames(4);
     const scene = f.rendered.at(-1);
     if (scene === undefined) throw new Error('No authored layout rendered');
     const assertLayout = (module: LegModule, slabCount: number, steleCount?: number) => {

@@ -23,6 +23,7 @@ import { SILENT_SOUNDS, type UiSounds } from '../sounds';
 import { HUD_CSS } from './hud.css';
 import { HUD_ACTIVE, HUD_ACTIVE_HOLD_MS, HUD_FOCUSED, HUD_REST, type HudRegionId } from './layout';
 import { el, setText } from './dom';
+import { HUD_KERNEL_NAME } from './structures';
 import { createLegRail, legRailEq, legRailProps, type LegRailProps } from './regions/LegRail';
 import { createPolicyChips, policyChipsEq, policyChipsProps, type PolicyChipsProps } from './regions/PolicyChips';
 import { createMeters, metersEq, metersProps, type MetersProps } from './regions/Meters';
@@ -198,6 +199,16 @@ export class Hud implements EventConsumer {
     if (derived === null) return;
     const alert = composeAlert(derived, this.clock());
     if (this.alertModel.push(alert)) this.sounds.alertAppear();
+    this.queueAlerts();
+  }
+
+  /**
+   * WP-24 section 2 (pre-flight ruling 9.7): one line in the leg's voice
+   * through the alert model, so the stack's cap and TTL apply and no
+   * structure suffix is appended. The Boot Sector driver's hints use it.
+   */
+  note(text: string): void {
+    if (this.alertModel.push({ severity: 'info', text, structure: HUD_KERNEL_NAME, createdAtMs: this.clock() })) this.sounds.alertAppear();
     this.queueAlerts();
   }
 
