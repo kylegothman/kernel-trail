@@ -361,6 +361,11 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
   };
   view.addEventListener('resize', resize);
   const hide = (): void => { if (!disposed && runner.kernel !== null) runner.saveProvisional(); };
+  // WP-23 found in a real browser that Chromium begins a navigation after beforeunload and force-closes
+  // the old document's IndexedDB connections at pagehide, so a provisional save issued there is aborted
+  // before it commits and Continue then resumes silently from the leg's boundary save; the save is issued
+  // at beforeunload, where it lands, and pagehide stays as the fallback for the paths where it does not fire.
+  view.addEventListener('beforeunload', hide);
   view.addEventListener('pagehide', hide);
   commit(() => {
     hud.element.style.pointerEvents = 'auto';
@@ -483,7 +488,7 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
       for (const timer of timers) clearTimeout(timer);
       timers.clear();
       unbindLoss(); unbindInput(); unbindVisibility(); unwatchKernel(); unwatchCodex(); unbindSettings();
-      view.removeEventListener('resize', resize); view.removeEventListener('pagehide', hide);
+      view.removeEventListener('resize', resize); view.removeEventListener('beforeunload', hide); view.removeEventListener('pagehide', hide);
       boot.overlay.removeEventListener('kt:render-failure', renderFailure);
       for (const panel of panels) panel.dispose();
       terminal?.dispose(); terminal = null; card?.dispose(); for (const stone of stones) stone.dispose(); stones.clear();
