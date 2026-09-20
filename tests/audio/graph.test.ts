@@ -3,7 +3,8 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { stripComments } from '../kernel/sourceScan';
 import { AudioEngine } from '../../src/audio/AudioEngine';
-import { AudioAdapter } from '../../src/audio/context';
+import { AudioAdapter, platformContextFactory } from '../../src/audio/context';
+import { DEFAULT_SAMPLE_RATE } from '../../src/audio/buffers';
 import { BUS_IDS } from '../../src/audio/voices/Voice';
 import { LIMITER, IMPULSE_SECONDS } from '../../src/audio/synth/constants';
 import { FakeContext, FakeNode, type FakeNodeKind } from './fakeContext';
@@ -213,5 +214,48 @@ describe('graph', () => {
     expect(adapter.state).toBe('failed');
     adapter.unlock();
     expect(adapter.contextConstructions).toBe(1);
+  });
+});
+
+/**
+ * WP-23: the Ubuntu CI runner opens audio at 44100 Hz. The buffer set is
+ * baked at DEFAULT_SAMPLE_RATE and Chrome refuses a convolver impulse at
+ * another rate, so the graph never built and every cue was dropped with
+ * the adapter reporting running and no reason. Two things keep that fixed:
+ * the platform factory pins the context to the buffers' rate, and a build
+ * failure is recorded on the adapter so silence has a reason.
+ */
+describe('sample rate (WP-23)', () => {
+  it('the platform factory asks the browser for a context at the buffer rate', () => {
+    const requested: unknown[] = [];
+    class RecordingContext {
+      readonly sampleRate: number;
+      readonly state = 'running';
+      readonly destination = {};
+      onstatechange = null;
+      constructor(options: { sampleRate?: number }) { requested.push(options); this.sampleRate = options.sampleRate ?? 44100; }
+    }
+    const previous = (globalThis as { AudioContext?: unknown }).AudioContext;
+    (globalThis as { AudioContext?: unknown }).AudioContext = RecordingContext;
+    try {
+      const context = platformContextFactory();
+      expect(requested).toEqual([{ latencyHint: 'interactive', sampleRate: DEFAULT_SAMPLE_RATE }]);
+      expect(context.sampleRate).toBe(DEFAULT_SAMPLE_RATE);
+    } finally {
+      if (previous === undefined) delete (globalThis as { AudioContext?: unknown }).AudioContext;
+      else (globalThis as { AudioContext?: unknown }).AudioContext = previous;
+    }
+  });
+
+  it('builds the graph at the pinned rate with no failure, and at 44100 records why it did not', () => {
+    const pinned = makeRig('high', { contextFactory: () => new FakeContext({ sampleRate: DEFAULT_SAMPLE_RATE }) });
+    expect(pinned.engine.ready).toBe(true);
+    expect(pinned.engine.adapter.failureReason).toBeNull();
+    pinned.engine.dispose();
+    const mismatched = makeRig('high', { contextFactory: () => new FakeContext({ sampleRate: 44100 }) });
+    expect(mismatched.engine.ready).toBe(false);
+    expect(mismatched.engine.state).toBe('running');
+    expect(mismatched.engine.adapter.failureReason).toMatch(/^build: .*44100/);
+    mismatched.engine.dispose();
   });
 });

@@ -13,7 +13,7 @@ import { layout as bootSectorLayout } from '../../../src/legs/boot_sector/stage'
 import { makeGridFloor, makeHorizon, makeSlab, makeStele } from '../../../src/world/forms';
 import { PS_DEF } from '../../../src/terminal/commands/process';
 import { createSyntheticLeg } from '../../game/fixtures/syntheticLeg';
-import { awaitReadback } from './awaitReadback';
+import { awaitReadback, fixtureTimeScale } from './awaitReadback';
 import { installGpuValidation } from './validation';
 
 const gpuValidation = installGpuValidation();
@@ -84,9 +84,12 @@ function fakeClock() {
 const yieldBrowser = (): Promise<void> => new Promise(resolve => setTimeout(resolve, 0));
 
 async function until(clock: ReturnType<typeof fakeClock>, predicate: () => boolean, message: string): Promise<void> {
-  const deadline = Date.now() + 10_000;
+  const started = Date.now();
+  const scale = fixtureTimeScale();
+  const deadline = started + 10_000 * scale;
   while (!predicate()) {
-    assert(Date.now() < deadline, message);
+    // The seconds waited and the scale in effect, so a slow rasteriser and a real readiness failure read differently.
+    assert(Date.now() < deadline, `${message} within ${((Date.now() - started) / 1000).toFixed(1)} s (scale ${scale})`);
     clock.step(0);
     await yieldBrowser();
   }

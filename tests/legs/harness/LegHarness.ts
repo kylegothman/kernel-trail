@@ -109,6 +109,10 @@ export interface HarnessResult {
   readonly entry: ReplayEntry | null;
   /** True when the leg was on the emergency preemption credit at exit. */
   readonly onCredit: boolean;
+  /** WP-23 section 3: the dividend the debrief reported, 0 when the leg produced no debrief. */
+  readonly dividend: number;
+  /** WP-23 section 3: `metrics.scheduling.throughput` read from the kernel immediately before exit. */
+  readonly throughput: number;
 }
 
 const describe = (error: unknown): string => (error instanceof Error ? error.message : String(error));
@@ -128,11 +132,13 @@ export interface Collectors {
   readonly runnerFailures: string[];
   readonly notes: string[];
   readonly crossings: CrossingResult[];
+  /** One entry per debrief event, in order (WP-23 section 3). */
+  readonly dividends: number[];
   stageCalls: number;
 }
 
 export function createCollectors(): Collectors {
-  return { log: [], panics: [], legFailures: [], runnerFailures: [], notes: [], crossings: [], stageCalls: 0 };
+  return { log: [], panics: [], legFailures: [], runnerFailures: [], notes: [], crossings: [], dividends: [], stageCalls: 0 };
 }
 
 export class HarnessSession {
@@ -194,6 +200,7 @@ export class HarnessSession {
       throughputTarget: () => this.throughputTarget,
       onLegEvent: (event: LegEvent) => {
         if (event.kind === 'panic') this.collectors.panics.push(`tick ${event.tick}: ${event.message}`);
+        if (event.kind === 'debrief') this.collectors.dividends.push(event.view.dividend);
       },
       codexSignal: () => undefined,
       onDerezz: () => undefined,
@@ -323,7 +330,7 @@ export function runLegInSession(session: HarnessSession, leg: Leg, opts: Harness
   const start = {
     log: collectors.log.length, panics: collectors.panics.length, legFailures: collectors.legFailures.length,
     runnerFailures: collectors.runnerFailures.length, notes: collectors.notes.length, crossings: collectors.crossings.length,
-    stageCalls: collectors.stageCalls,
+    dividends: collectors.dividends.length, stageCalls: collectors.stageCalls,
   };
   const ledgerBefore = { ...session.store.get().resources };
   const wallStart = performance.now();
@@ -412,6 +419,7 @@ export function runLegInSession(session: HarnessSession, leg: Leg, opts: Harness
   }
   const ticks = current.runner.ticksElapsed;
   const onCredit = current.runner.director?.travel.onCredit ?? false;
+  const throughput = current.runner.kernel?.invariantState().metrics.scheduling.throughput ?? 0;
   let outcome: LegOutcome;
   try {
     outcome = current.runner.exit();
@@ -453,6 +461,8 @@ export function runLegInSession(session: HarnessSession, leg: Leg, opts: Harness
     stageCalls: collectors.stageCalls - start.stageCalls,
     entry,
     onCredit,
+    dividend: collectors.dividends.slice(start.dividends).at(-1) ?? 0,
+    throughput,
   };
   return { result, session: current };
 }

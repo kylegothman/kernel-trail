@@ -11,12 +11,20 @@
  * change and is reviewed as one. `golden:update` is `golden:record --force`.
  * `UPDATE_GOLDEN` is never read: recording is a human action. Each leg's
  * closing ledger is printed for the next leg's fixture to copy.
+ *
+ * WP-23 section 3: the balance row is written in the same call as the
+ * fingerprint, so a golden never lands without its ledger row. A fixture
+ * loaded from disk must carry a comment immediately above its entering
+ * ledger constant or the record is refused; injected fixtures (the harness
+ * test's synthetic leg) have no source file and write no row.
  */
 import { pathToFileURL } from 'node:url';
 import { LEG_ORDER, type Leg, type LegId, type ResourceLedger } from '@game/types';
+import type { LegContent } from '@legs/content';
 import { checkFixtureRun, isWarning, loadFixtures, runFixture, validateFixture, type LegFixtureModule } from '../../tests/legs/harness/fixtureContract';
 import { GOLDEN_DIR, goldenFiles, readGolden, tiersOf, writeGolden, type GoldenPath, type GoldenTiers } from '../../tests/legs/harness/goldenLog';
 import { tryLoadLegForTest } from '../../tests/legs/harness/loadLeg';
+import { balanceFileFor, enteringSourceOf, pathRowOf, rowFragmentOf, writeBalanceRow } from './balance';
 
 export interface RecordRequest {
   readonly legId: LegId;
@@ -37,10 +45,12 @@ export type RecordOutcome =
 export async function recordGolden(request: RecordRequest): Promise<RecordOutcome> {
   const dir = request.dir ?? GOLDEN_DIR;
   let leg = request.leg;
+  let loaded: { readonly content: LegContent } | null = null;
   if (leg === undefined) {
-    const loaded = await tryLoadLegForTest(request.legId);
-    if (!loaded.shipped) return { status: 'unshipped', reason: loaded.reason };
-    leg = loaded.leg;
+    const result = await tryLoadLegForTest(request.legId);
+    if (!result.shipped) return { status: 'unshipped', reason: result.reason };
+    leg = result.leg;
+    loaded = result;
   }
   const fixtures = request.fixtures ?? (await loadFixtures(request.legId));
   if (fixtures === null) return { status: 'no_fixture', reason: `tests/legs/${request.legId}/fixtures.ts does not exist` };
@@ -48,6 +58,14 @@ export async function recordGolden(request: RecordRequest): Promise<RecordOutcom
   const findings = validateFixture(fixture, leg);
   const errors = findings.filter((problem) => !isWarning(problem));
   if (errors.length > 0) return { status: 'invalid', problems: errors };
+  let enteringSource: string | null = null;
+  if (request.fixtures === undefined) {
+    try {
+      enteringSource = enteringSourceOf(request.legId);
+    } catch (error) {
+      return { status: 'invalid', problems: [error instanceof Error ? error.message : String(error)] };
+    }
+  }
   const result = await runFixture(fixture, leg);
   const runProblems = checkFixtureRun(fixture, result, leg);
   if (runProblems.length > 0) return { status: 'invalid', problems: runProblems };
@@ -56,6 +74,10 @@ export async function recordGolden(request: RecordRequest): Promise<RecordOutcom
   const warnings = findings.filter(isWarning);
   if (previous !== null && request.force !== true) return { status: 'refused', previous, next, warnings };
   writeGolden(request.legId, request.path, next, dir);
+  if (enteringSource !== null && loaded !== null) {
+    const fragment = rowFragmentOf(fixture, loaded.content, enteringSource);
+    writeBalanceRow(balanceFileFor(dir), request.legId, request.path, fragment, pathRowOf(result, fragment.throughputTarget.value));
+  } else warnings.push('balance row not written: the fixtures were injected rather than loaded from tests/legs');
   return { status: 'written', previous, next, ledger: result.ledgerAfter, warnings };
 }
 
@@ -70,6 +92,7 @@ export function describeRecord(request: RecordRequest, outcome: RecordOutcome): 
       if (outcome.previous !== null) lines.push(`${label}: old hash ${outcome.previous.fingerprint.hash}  new hash ${outcome.next.fingerprint.hash} (forced; review this as a behaviour change)`);
       else lines.push(`${label}: hash ${outcome.next.fingerprint.hash} ticks=${outcome.next.fingerprint.ticks} events=${outcome.next.fingerprint.events}`);
       lines.push(`${label}: closing ledger ${ledgerLine(outcome.ledger)} (the next leg's enteringLedger)`);
+      if (request.fixtures === undefined) lines.push(`${label}: balance row written to ${balanceFileFor(request.dir ?? GOLDEN_DIR)}`);
       lines.push(...outcome.warnings.map((warning) => `${label}: ${warning}`));
       return lines;
     }

@@ -19,6 +19,7 @@ import { FIXTURE_SEED } from '../harness/fixtureContract';
 import type { DecisionScript } from '../harness/decisionScript';
 import type { OutcomeExpectation } from '../harness/expectOutcome';
 
+/** The entering ledger is analytical, not a golden: leg 6 has not shipped. It is the curve of narrative 5.5 as tests/game/economyCurve.test.ts computes it, which puts the shell at operator into the Yards with 1022 cycles (scope correction section 9). */
 const ENTERING_LEDGER = { cycles: 1022, quota: 900, blocks: 120, bandwidth: 60 } as const;
 
 /**
