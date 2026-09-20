@@ -1,0 +1,164 @@
+{
+  "boot_sector": {
+    "throughputTarget": {
+      "value": 0.1,
+      "provisional": true
+    },
+    "good": {
+      "ticks": 12,
+      "objectivesMet": 6,
+      "casualties": [],
+      "closingLedger": {
+        "cycles": 1184,
+        "quota": 940,
+        "blocks": 160,
+        "bandwidth": 86
+      },
+      "dividend": 0,
+      "throughputFactor": 0.6
+    },
+    "bad": {
+      "ticks": 12,
+      "objectivesMet": 0,
+      "casualties": [],
+      "closingLedger": {
+        "cycles": 3376,
+        "quota": 0,
+        "blocks": 120,
+        "bandwidth": 36
+      },
+      "dividend": 0,
+      "throughputFactor": 0.6
+    },
+    "enteringLedger": {
+      "cycles": 1600,
+      "quota": 900,
+      "blocks": 120,
+      "bandwidth": 60
+    },
+    "enteringSource": "Shell at operator, narrative bible 5.2."
+  },
+  "quantum_pass": {
+    "throughputTarget": {
+      "value": 0.1,
+      "provisional": true
+    },
+    "good": {
+      "ticks": 70,
+      "objectivesMet": 7,
+      "casualties": [],
+      "closingLedger": {
+        "cycles": 1439.2,
+        "quota": 725,
+        "blocks": 120,
+        "bandwidth": 72
+      },
+      "dividend": 109.19999999999999,
+      "throughputFactor": 1.4
+    },
+    "bad": {
+      "ticks": 70,
+      "objectivesMet": 0,
+      "casualties": [
+        "sable"
+      ],
+      "closingLedger": {
+        "cycles": 1535.2,
+        "quota": 742,
+        "blocks": 120,
+        "bandwidth": 78
+      },
+      "dividend": 109.19999999999999,
+      "throughputFactor": 1.4
+    },
+    "enteringLedger": {
+      "cycles": 1425,
+      "quota": 900,
+      "blocks": 120,
+      "bandwidth": 60
+    },
+    "enteringSource": "Scope correction section 9. The Boot Sector, the Fork Fields and the Weave have not shipped, so this is the analytical curve of narrative 5.5 rather than a predecessor's golden closing ledger: `startingLedger('shell', 'operator')` is 1600 cycles, and the three earlier legs after the Boot Sector leave 1425. Quota, blocks and bandwidth stay at the starting ledger, and the runner refills bandwidth at entry in any case. Replace all four with the Weave's closing ledger when it lands."
+  },
+  "the_narrows": {
+    "throughputTarget": {
+      "value": 0.1,
+      "provisional": true
+    },
+    "good": {
+      "ticks": 108,
+      "objectivesMet": 6,
+      "casualties": [],
+      "closingLedger": {
+        "cycles": 1317.1000000000001,
+        "quota": 485,
+        "blocks": 120,
+        "bandwidth": 56
+      },
+      "dividend": 50.4,
+      "throughputFactor": 0.6
+    },
+    "bad": {
+      "ticks": 123,
+      "objectivesMet": 0,
+      "casualties": [
+        "sable"
+      ],
+      "closingLedger": {
+        "cycles": 1535.3,
+        "quota": 450,
+        "blocks": 120,
+        "bandwidth": 96
+      },
+      "dividend": 117.6,
+      "throughputFactor": 1.4
+    },
+    "enteringLedger": {
+      "cycles": 1439.2,
+      "quota": 725,
+      "blocks": 120,
+      "bandwidth": 72
+    },
+    "enteringSource": "Quantum Pass's good-path golden closing ledger, tests/golden/balance.json quantum_pass.good.closingLedger, re-sourced by WP-23 from the narrative 5.5 curve (1328 cycles) once the balance ledger's continuity test found the two apart."
+  },
+  "allocation_yards": {
+    "throughputTarget": {
+      "value": 0.1,
+      "provisional": true
+    },
+    "good": {
+      "ticks": 85,
+      "objectivesMet": 7,
+      "casualties": [],
+      "closingLedger": {
+        "cycles": 876.3,
+        "quota": 757.5,
+        "blocks": 168,
+        "bandwidth": 46
+      },
+      "dividend": 142.79999999999998,
+      "throughputFactor": 1.4
+    },
+    "bad": {
+      "ticks": 85,
+      "objectivesMet": 0,
+      "casualties": [
+        "vesper"
+      ],
+      "closingLedger": {
+        "cycles": 805.3,
+        "quota": 755,
+        "blocks": 168,
+        "bandwidth": 60
+      },
+      "dividend": 142.79999999999998,
+      "throughputFactor": 1.4
+    },
+    "enteringLedger": {
+      "cycles": 1022,
+      "quota": 900,
+      "blocks": 120,
+      "bandwidth": 60
+    },
+    "enteringSource": "The entering ledger is analytical, not a golden: leg 6 has not shipped. It is the curve of narrative 5.5 as tests/game/economyCurve.test.ts computes it, which puts the shell at operator into the Yards with 1022 cycles (scope correction section 9)."
+  }
+}

@@ -21,7 +21,8 @@
     "test:goldens": "vitest run tests/legs/goldens.test.ts",
     "test:journey": "vitest run tests/legs/journey.test.ts",
     "golden:record": "tsx tools/golden/record.ts",
-    "golden:explain": "tsx tools/golden/explain.ts"
+    "golden:explain": "tsx tools/golden/explain.ts",
+    "golden:balance": "tsx tools/golden/balance.ts"
   },
   "dependencies": {
     "@fontsource/jetbrains-mono": "5.3.0",
