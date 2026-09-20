@@ -8,6 +8,7 @@ import { installWebGPUDiagnostics, checkWebGPUEnvironment } from './webgpuDiagno
 import { allocationProbe } from './allocationProbe.ts';
 import { capturePageDiagnostics, formatPageDiagnostics, navigateAndWaitForProbe } from './harness.ts';
 import { runRealApp } from './realApp.mjs';
+import { prepareExpectations, runPlaythrough } from '../../e2e/playthrough.mjs';
 
 assert.equal(process.versions.node.split('.')[0], '22', `GPU tests require Node 22; running ${process.version}`);
 
@@ -42,6 +43,12 @@ await build({ plugins: [allocationProbe], build: {
 } });
 if (process.argv.includes('--build-only')) process.exit(0);
 
+// WP-23 section 1: the playthrough's harness hashes come from this process before the browser launches.
+const playthroughExpectations = await prepareExpectations();
+// vite's build() above sets NODE_ENV=production for the process and the dev server created next derives
+// import.meta.env.DEV from it, so until WP-23 every page this runner served had DEV false through a dev
+// server. The playthrough needs the DEV-only debug seam, and a dev server should serve a development build.
+process.env.NODE_ENV = 'development';
 const server = await createServer({ plugins: [allocationProbe], optimizeDeps: { noDiscovery: true, include: [] }, server: { host: '127.0.0.1', port: 0 } });
 let browser;
 const results = [];
@@ -344,6 +351,8 @@ try {
   }
   const realApp = await runRealApp(browser, `http://127.0.0.1:${address.port}`, webgpuAvailable);
   results.push(...realApp.results); failures.push(...realApp.failures);
+  const playthrough = await runPlaythrough(browser, `http://127.0.0.1:${address.port}`, webgpuAvailable, playthroughExpectations, { scale });
+  results.push(...playthrough.results); failures.push(...playthrough.failures);
   if (environmentDiagnostics.pageErrors.length) {
     failures.push('WebGPU environment page reported an error');
     console.error(formatPageDiagnostics(environmentDiagnostics));

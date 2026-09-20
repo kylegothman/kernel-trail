@@ -26,9 +26,7 @@ export async function runRealApp(browser, baseUrl, webgpuAvailable) {
           await page.locator('select[name="quality"]').selectOption(quality);
           await page.evaluate(value => globalThis.__kernelTrailGpuValidation.setPhase(`boot-sector:${value}`), quality);
           await page.getByRole('button', { name: 'New run', exact: true }).click();
-          await page.waitForFunction(() => document.querySelector('.kt-title-screen') === null &&
-            document.querySelector('.kt-tl')?.textContent?.includes('The Boot Sector') &&
-            document.querySelector('.kt-panel--interactions') !== null, undefined, { timeout: 60_000 });
+          await waitForLegRail(page, 'The Boot Sector', 60_000);
           await settleFrames(page, 120);
           await page.evaluate(value => globalThis.__kernelTrailGpuValidation.setPhase(`resize:${value}`), quality);
           await page.setViewportSize({ width: 1200, height: 1533 });
@@ -58,7 +56,14 @@ export async function runRealApp(browser, baseUrl, webgpuAvailable) {
   return { results, failures };
 }
 
-async function settleFrames(page, count) {
+/** The title screen has gone, the leg rail names the leg and the interaction panel is mounted (WP-23 section 1 reuses this). */
+export async function waitForLegRail(page, title, timeout) {
+  await page.waitForFunction(expected => document.querySelector('.kt-title-screen') === null &&
+    document.querySelector('.kt-tl')?.textContent?.includes(expected) &&
+    document.querySelector('.kt-panel--interactions') !== null, title, { timeout });
+}
+
+export async function settleFrames(page, count) {
   await page.evaluate(async count => {
             let timer;
             try {
