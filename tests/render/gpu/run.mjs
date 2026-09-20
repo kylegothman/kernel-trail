@@ -24,7 +24,22 @@ export function launchArguments(platform, ci) {
   return ['--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader', '--ignore-gpu-blocklist'];
 }
 
+/**
+ * WP-23 section 2, ruled after the first Ubuntu run: what CI asserts, in one
+ * place. Under --ci the renderer fixtures run at the low and medium tiers;
+ * the high tier is Mac evidence through npm run test:gpu. The high-tier
+ * assertions are draw-call, triangle, memory and recovery budgets that do not
+ * depend on the rasteriser's speed, and the runner's SwiftShader took over
+ * three hundred seconds a case at high tier against a few on an M3. Medium
+ * stays because that is where the gap opened and because a run that never
+ * sees a multisampled rgba16float chain cannot catch that class of bug.
+ */
+export function fixtureTiers(ci) {
+  return ci ? ['low', 'medium'] : ['low', 'medium', 'high'];
+}
+
 const ci = process.argv.includes('--ci');
+const tiers = fixtureTiers(ci);
 /** Under --ci every timeout in this runner is four times longer; nothing asserted changes. */
 const scale = ci ? 4 : 1;
 const BUILD_DIR = join(os.tmpdir(), 'kt-wp12-gpu-build');
@@ -35,6 +50,7 @@ const fixtureUrl = (url) => (ci ? `${url}${url.includes('?') ? '&' : '?'}scale=$
 const machine = { hostname: os.hostname(), cpu: os.cpus()[0]?.model, platform: os.platform(), release: os.release(), arch: os.arch(), node: process.version };
 console.log('GPU test machine:', JSON.stringify(machine));
 console.log(`GPU test mode: ${ci ? 'ci (software rasteriser, timeouts x4)' : 'local'}; results ${RESULTS_PATH}`);
+console.log(`GPU fixture tiers: ${tiers.join(', ')}${ci ? '; the high tier is Mac evidence through npm run test:gpu and is not exercised under --ci' : ''}`);
 // The workflow uploads the results file from this path rather than guessing the runner's temp directory.
 if (process.env.GITHUB_OUTPUT !== undefined) await fs.appendFile(process.env.GITHUB_OUTPUT, `results=${RESULTS_PATH}\n`);
 await build({ plugins: [allocationProbe], build: {
@@ -99,7 +115,7 @@ try {
       console.log('Probe ready:', JSON.stringify(info));
       results.push({ path, info });
       assert.equal(info.backend, force ? 'webgl2' : 'webgpu', `${path} must exercise the requested backend`);
-      for (const [tier, calls, triangles] of [['low', 220, 180000], ['medium', 450, 450000], ['high', 900, 1100000]]) {
+      for (const [tier, calls, triangles] of [['low', 220, 180000], ['medium', 450, 450000], ['high', 900, 1100000]].filter(([tier]) => tiers.includes(tier))) {
         const stats = await page.evaluate(t => globalThis.__kernelTrailProbe.api.tier(t), tier);
         console.log(`${path} ${tier}:`, JSON.stringify({ stats, budgets: { drawCalls: calls, triangles, targetMemoryBytes: 210 * 1024 * 1024 } }));
         assert(stats.drawCalls <= calls, `${path}/${tier}: draw-call budget`);
@@ -121,7 +137,7 @@ try {
         assert.deepEqual(recovery, { attempts: [true], outcome: 'recovered_same', backend: 'webgl2' });
         results.push({ path, recovery });
       }
-      await page.screenshot({ path: artifactPath(`kt-wp12-${force ? 'webgl' : 'webgpu'}.png`) });
+      await page.screenshot({ path: artifactPath(`kt-wp12-${force ? 'webgl' : 'webgpu'}.png`), timeout: 30_000 * scale });
       assert.equal(diagnostics.pageErrors.length, 0, 'Page errors during GPU assertions');
       assert.deepEqual(diagnostics.messages.filter(message => message.startsWith('[console.error]')), []);
       await page.evaluate(() => globalThis.__kernelTrailProbe.api.dispose());
@@ -133,20 +149,20 @@ try {
       await page.close();
     }
   }
-  for (const force of webgpuAvailable ? [false, true] : [true]) for(const tier of ['low','medium','high']) {
+  for (const force of webgpuAvailable ? [false, true] : [true]) for(const tier of tiers) {
     const path=`wp13-${force?'webgl2':'webgpu'}-${tier}`;
     const page=await browser.newPage({viewport:{width:1440,height:900}});
     const diagnostics=capturePageDiagnostics(page);
     await page.addInitScript(installWebGPUDiagnostics);
     try {
-      await page.exposeFunction('__wp13Capture',async phase=>{assert(['front','occluded','released'].includes(phase));await page.screenshot({path:artifactPath(`kt-${path}-${phase}.png`)});});
+      await page.exposeFunction('__wp13Capture',async phase=>{assert(['front','occluded','released'].includes(phase));await page.screenshot({path:artifactPath(`kt-${path}-${phase}.png`),timeout:30_000*scale});});
       console.log(`Starting ${path}`);
       await navigateAndWaitForProbe(page,fixtureUrl(`http://127.0.0.1:${address.port}/tests/render/gpu/focus.html?tier=${tier}${force?'&webgl':''}`),diagnostics);
       const info=await page.evaluate(()=>globalThis.__kernelTrailProbe.api.info());
       assert.equal(info.backend,force?'webgl2':'webgpu');
       const result=await page.evaluate(()=>globalThis.__kernelTrailProbe.api.run());
       console.log(`${path}:`,JSON.stringify(result));results.push({path,result});
-      await page.screenshot({path:artifactPath(`kt-${path}.png`)});
+      await page.screenshot({path:artifactPath(`kt-${path}.png`),timeout:30_000*scale});
       assert.equal(diagnostics.pageErrors.length,0,'WP-13 page errors');
       assert.deepEqual(diagnostics.messages.filter(message=>message.startsWith('[console.error]')),[]);
       await page.evaluate(()=>globalThis.__kernelTrailProbe.api.dispose());
@@ -155,7 +171,7 @@ try {
       console.error(formatPageDiagnostics(diagnostics));failures.push(`${path}: ${error.stack||String(error)}`);
     } finally {await page.close();}
   }
-  for (const force of webgpuAvailable ? [false, true] : [true]) for (const tier of ['low', 'medium', 'high']) {
+  for (const force of webgpuAvailable ? [false, true] : [true]) for (const tier of tiers) {
     const path = `wp14-derezz-${force ? 'webgl2' : 'webgpu'}-${tier}`;
     const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
     const diagnostics = capturePageDiagnostics(page);
@@ -250,7 +266,7 @@ try {
       console.log(`${path}: coverage ${(result.coverage * 100).toFixed(2)}% of 1440x900`, JSON.stringify(result));
       results.push({ path, result });
       assert.ok(result.coverage < 0.11, `${path}: coverage ${(result.coverage * 100).toFixed(2)}% exceeds 11%`);
-      await page.screenshot({ path: join(os.tmpdir(), `kt-${path}.png`) });
+      await page.screenshot({ path: join(os.tmpdir(), `kt-${path}.png`), timeout: 30_000 * scale });
       assert.equal(diagnostics.pageErrors.length, 0, 'WP-17 HUD page errors');
       assert.deepEqual(diagnostics.messages.filter(message => message.startsWith('[console.error]')), []);
       await page.evaluate(() => globalThis.__kernelTrailProbe.api.dispose());
@@ -294,7 +310,8 @@ try {
     } finally { await page.close(); }
   }
   // WP-22 boots the production session on each backend at high tier.
-  for (const force of webgpuAvailable ? [false, true] : [true]) {
+  if (!tiers.includes('high')) console.log('Skipping wp22-boot: it runs at the high tier, which is Mac evidence under --ci');
+  for (const force of tiers.includes('high') ? (webgpuAvailable ? [false, true] : [true]) : []) {
     const path = `wp22-boot-${force ? 'webgl2' : 'webgpu'}-high`;
     const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
     const diagnostics = capturePageDiagnostics(page);
@@ -349,7 +366,7 @@ try {
       await page.close();
     }
   }
-  const realApp = await runRealApp(browser, `http://127.0.0.1:${address.port}`, webgpuAvailable);
+  const realApp = await runRealApp(browser, `http://127.0.0.1:${address.port}`, webgpuAvailable, { scale, tiers });
   results.push(...realApp.results); failures.push(...realApp.failures);
   const playthrough = await runPlaythrough(browser, `http://127.0.0.1:${address.port}`, webgpuAvailable, playthroughExpectations, { scale });
   results.push(...playthrough.results); failures.push(...playthrough.failures);
