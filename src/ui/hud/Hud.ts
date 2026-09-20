@@ -22,7 +22,7 @@ import { DomBatch } from '../DomBatch';
 import { SILENT_SOUNDS, type UiSounds } from '../sounds';
 import { HUD_CSS } from './hud.css';
 import { HUD_ACTIVE, HUD_ACTIVE_HOLD_MS, HUD_FOCUSED, HUD_REST, type HudRegionId } from './layout';
-import { el } from './dom';
+import { el, setText } from './dom';
 import { createLegRail, legRailEq, legRailProps, type LegRailProps } from './regions/LegRail';
 import { createPolicyChips, policyChipsEq, policyChipsProps, type PolicyChipsProps } from './regions/PolicyChips';
 import { createMeters, metersEq, metersProps, type MetersProps } from './regions/Meters';
@@ -83,6 +83,8 @@ export class Hud implements EventConsumer {
   private readonly unsubscribes: (() => void)[] = [];
   private readonly alertStack;
   private readonly focusHint;
+  private readonly paceRow: HTMLElement;
+  private paceLabel = '';
   private hover: string | null = null;
   private focusMode: FocusMode = 'free';
   private visibility: HudVisibility = 'visible';
@@ -114,7 +116,12 @@ export class Hud implements EventConsumer {
     const topRight = el(doc, 'div', 'kt-cell kt-tr');
     const policyChips = createPolicyChips(doc);
     const meters = createMeters(doc);
-    topRight.append(policyChips.el, meters.el);
+    // WP-24 section 1: the pace indicator, one row under the tick counter in the
+    // top-right cell (pre-flight ruling 7a). The centre column stays empty per
+    // visual bible 11.3; the cell's bound in layout.ts carries the extra row.
+    this.paceRow = el(doc, 'div', 'kt-row kt-pace');
+    this.paceRow.setAttribute('aria-label', 'Pace');
+    topRight.append(policyChips.el, this.paceRow, meters.el);
     const convoyPips = createConvoyPips(doc);
     const ledger = createResourceLedgerView(doc);
     const alertStack = createAlertStack(doc);
@@ -225,6 +232,20 @@ export class Hud implements EventConsumer {
   }
 
   /* ---- host inputs -------------------------------------------------- */
+
+  /** WP-24 section 1: the pace indicator's text, `2x` or `paused (crossing)`. A changed label flashes the cell. */
+  setPace(label: string): void {
+    if (label === this.paceLabel) return;
+    this.paceLabel = label;
+    this.batch.write(() => {
+      if (setText(this.paceRow, label)) this.flash('policyChips');
+    });
+  }
+
+  /** The pace indicator's element, for the host and the tests. */
+  get pace(): HTMLElement {
+    return this.paceRow;
+  }
 
   /** The anchor under the cursor, or null. Drives the focus hint. */
   setHover(anchorId: string | null): void {

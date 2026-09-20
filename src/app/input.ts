@@ -3,7 +3,7 @@ import { Vector3 } from 'three/webgpu';
 import { CAMERA } from '@design';
 import type { FocusCameraRig } from '@render';
 import type { Terminal } from '@terminal/Terminal';
-import type { GameLoop } from './loop';
+import { PLAYER_TIME_SCALES, ticksPerSecondOf, type Pacing } from './pacing';
 import type { LayoutStructure } from './stage/LayoutStructure';
 
 export interface CameraTarget {
@@ -16,14 +16,14 @@ export interface CameraTarget {
 export function installInput(options: {
   readonly document: Document;
   readonly canvas: HTMLCanvasElement;
-  readonly loop: GameLoop;
+  /** WP-24 section 1: Space toggles the `player` hold; the brackets step through PLAYER_TIME_SCALES. */
+  readonly pacing: Pacing;
   readonly focus: FocusCameraRig;
   readonly target: CameraTarget;
   readonly structures: () => readonly LayoutStructure[];
   readonly terminal: () => Terminal | null;
   readonly toggleCodex: () => void;
   readonly commit: (write: () => void) => void;
-  readonly paused: (paused: boolean) => void;
   readonly controlsBlocked?: () => boolean;
 }): () => void {
   const position = new Vector3();
@@ -32,10 +32,20 @@ export function installInput(options: {
     return active !== null && (options.terminal()?.element.contains(active) === true ||
       active.matches('input, textarea, select, [contenteditable="true"]'));
   };
-  const scale = (value: number): void => {
+  const rates = PLAYER_TIME_SCALES.map(ticksPerSecondOf);
+  let releasePlayer: (() => void) | null = null;
+  const togglePause = (): void => {
     if (options.controlsBlocked?.() === true) return;
-    options.loop.setTimeScale(value);
-    options.paused(value === 0);
+    if (releasePlayer === null) releasePlayer = options.pacing.hold('player');
+    else { releasePlayer(); releasePlayer = null; }
+  };
+  /** The index of the rate the player last chose, whatever holds are stacked on it; the default is the middle scale. */
+  let chosen = 1;
+  const step = (direction: 1 | -1): void => {
+    if (options.controlsBlocked?.() === true) return;
+    chosen = Math.max(0, Math.min(rates.length - 1, chosen + direction));
+    const rate = rates[chosen];
+    if (rate !== undefined) options.pacing.setRate(rate);
   };
   const key = (event: KeyboardEvent): void => {
     if (editable() || event.repeat || event.altKey || event.ctrlKey || event.metaKey) return;
@@ -56,9 +66,9 @@ export function installInput(options: {
         }
         break;
       }
-      case 'Space': scale(options.loop.currentTimeScale === 0 ? 1 : 0); break;
-      case 'BracketRight': scale(Math.min(3, Math.max(1, options.loop.currentTimeScale + 1))); break;
-      case 'BracketLeft': scale(Math.max(1, options.loop.currentTimeScale - 1)); break;
+      case 'Space': togglePause(); break;
+      case 'BracketRight': step(1); break;
+      case 'BracketLeft': step(-1); break;
       default: return;
     }
     event.preventDefault();
@@ -92,6 +102,7 @@ export function installInput(options: {
   options.canvas.addEventListener('pointercancel', up);
   options.canvas.addEventListener('wheel', wheel, { passive: false });
   return () => {
+    releasePlayer?.(); releasePlayer = null;
     options.document.removeEventListener('keydown', key);
     options.canvas.removeEventListener('pointerdown', down);
     options.canvas.removeEventListener('pointermove', move);

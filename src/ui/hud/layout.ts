@@ -66,8 +66,8 @@ export interface RegionBounds {
 export const HUD_REGION_BOUNDS: Readonly<Record<HudRegionId, RegionBounds>> = {
   /** Two rows. Measured 220 by 40 in Chromium. */
   legRail: { maxWidthPx: 220, maxHeightPx: 48 },
-  /** The tick, five chip rows and the two meters. Measured 220 by 145. */
-  policyChips: { maxWidthPx: 220, maxHeightPx: 150 },
+  /** The tick, five chip rows, the pace indicator row (WP-24) and the two meters. Measured 220 by 145 before the pace row. */
+  policyChips: { maxWidthPx: 220, maxHeightPx: 170 },
   /** Five pips. Measured 220 by 96. */
   convoyPips: { maxWidthPx: 220, maxHeightPx: 104 },
   /** Four rows. Measured 220 by 78. */

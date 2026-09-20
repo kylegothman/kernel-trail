@@ -50,6 +50,7 @@ import { SHIPPED_HANDLERS } from '@terminal/commands/index';
 import type { BootContext, SessionStart } from './boot';
 import { createRunHost } from './RunHost';
 import { GameLoop, installVisibilityGovernor } from './loop';
+import { createPacing, paceLabel, type Pacing } from './pacing';
 import { sinkOverBus } from './commandSinkAdapter';
 import { buildLayoutStage, type LayoutStage } from './stage/LayoutStage';
 import { throughputTargetFor } from './throughput';
@@ -64,6 +65,8 @@ import type { DeferredPanel } from './panels/panel';
 
 export interface BrowserSession {
   readonly loop: GameLoop;
+  /** WP-24 section 1: the player's clock over the loop. */
+  readonly pacing: Pacing;
   readonly runner: LegRunner;
   /** WP-23 section 1: present in a development build only; a production build never constructs it. */
   readonly debug?: KernelTrailDebug;
@@ -177,6 +180,7 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
   let atlas: SdfAtlas | null = null;
   let terminal: Terminal | null = null;
   let loop: GameLoop;
+  let pacing: Pacing;
   let emergencyFrame = 0;
   let card: Card | null = null;
   const stones = new Set<Card>();
@@ -198,9 +202,13 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
     if (!disposed) for (const panel of panels) panel.flush();
     const interactions = interactionPanel.element;
     if (interactions !== null) interactions.hidden = card !== null || stones.size > 0;
+    hud.setPace(paceLabel(pacing));
   };
-  const present = (next: Card): void => {
-    card?.dispose(); card = next;
+  /** WP-24 section 1: every card asks a question, so every card holds the clock while it is up. */
+  const present = (next: Card, reason: string): void => {
+    card?.dispose();
+    const release = pacing.hold(reason);
+    card = { el: next.el, dispose: () => { next.dispose(); release(); } };
     Object.assign(next.el.style, { pointerEvents: 'auto', position: 'absolute', zIndex: '5', top: '20%', left: '25%', maxWidth: '50%', maxHeight: '65%', overflow: 'auto' });
     boot.overlay.append(next.el);
   };
@@ -218,7 +226,7 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
       addAction(next.el, 'Back to title', () => {
         session.dispose(); boot.overlay.dispatchEvent(new Event('kt:title'));
       });
-      present(next);
+      present(next, 'panic');
     });
     emergencyFrame = view.requestAnimationFrame(() => {
       emergencyFrame = 0;
@@ -235,7 +243,7 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
       case 'debrief':
         commit(() => {
           const next = createDebriefCard(doc, event.view.card, event.view.counterfactual);
-          addAction(next.el, 'Continue', () => { void advance(); }); present(next);
+          addAction(next.el, 'Continue', () => { void advance(); }); present(next, 'debrief');
         });
         break;
       case 'tombstone':
@@ -243,7 +251,8 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
           const stone = createTombstoneCard(doc, { epitaph: event.epitaph, memberName: event.memberName, onCodex: openCodex });
           stone.el.style.pointerEvents = 'auto'; stone.el.style.position = 'absolute'; stone.el.style.top = '25%'; stone.el.style.left = '25%';
           boot.overlay.append(stone.el); stones.add(stone);
-          const remove = (): void => commit(() => { stone.dispose(); stones.delete(stone); });
+          const releaseStone = pacing.hold('tombstone');
+          const remove = (): void => commit(() => { stone.dispose(); stones.delete(stone); releaseStone(); });
           stone.el.addEventListener('click', remove, { once: true });
           const timer = setTimeout(() => { timers.delete(timer); remove(); }, DEREZZ_TIMING.convoy.release);
           timers.add(timer);
@@ -273,10 +282,12 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
     },
     onFailure: failure => panic(describe(failure.error)), onRunnerFailure: message => panic(message),
   });
-  const crossingPanel = new CrossingPanel({ document: doc, overlay: boot.overlay, runner });
-  const depotPanel = new DepotPanel({ document: doc, overlay: boot.overlay, runner, run: () => runStore.get() });
-  const reclamationPanel = new ReclamationPanel({ document: doc, overlay: boot.overlay, runner });
-  const codexPanel = new CodexPanel({ document: doc, overlay: boot.overlay, codex, registry });
+  // WP-24 section 1: every panel that asks a question holds the clock while open; the interactions panel does not.
+  const hold = (reason: string): (() => void) => pacing.hold(reason);
+  const crossingPanel = new CrossingPanel({ document: doc, overlay: boot.overlay, runner, hold });
+  const depotPanel = new DepotPanel({ document: doc, overlay: boot.overlay, runner, run: () => runStore.get(), hold });
+  const reclamationPanel = new ReclamationPanel({ document: doc, overlay: boot.overlay, runner, hold });
+  const codexPanel = new CodexPanel({ document: doc, overlay: boot.overlay, codex, registry, hold });
   const interactionPanel = new InteractionPanel({ document: doc, overlay: boot.overlay, runner, bus, run: () => runStore.get(),
     crossing: (def, context) => crossingPanel.open(def, context), depot: depot => depotPanel.open(depot), reclamation: layout => reclamationPanel.open(layout) });
   panels.push(interactionPanel, crossingPanel, depotPanel, reclamationPanel, codexPanel);
@@ -316,6 +327,7 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
       }
     },
   } });
+  pacing = createPacing(loop, paused => hooks.onRunStateChanged(!paused));
   const unwatchKernel = runner.onKernelChanged(kernel => {
     const old = terminal; terminal = null;
     if (old !== null) commit(() => old.dispose());
@@ -342,9 +354,8 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
     engine.setThresholds({ thrashingThreshold: kernel.config.thrashingThreshold });
     engine.resetForLeg();
   });
-  const unbindInput = installInput({ document: doc, canvas: boot.canvas, loop, focus, target, structures: () => stage?.structures ?? [], terminal: () => terminal,
-    toggleCodex: () => openCodex(), commit, paused: paused => hooks.onRunStateChanged(!paused),
-    controlsBlocked: () => transitioning || panicked || disposed });
+  const unbindInput = installInput({ document: doc, canvas: boot.canvas, pacing, focus, target, structures: () => stage?.structures ?? [], terminal: () => terminal,
+    toggleCodex: () => openCodex(), commit, controlsBlocked: () => transitioning || panicked || disposed });
   const unbindVisibility = installVisibilityGovernor(loop, {
     onHide: () => { if (!disposed && runner.kernel !== null) runner.saveProvisional(); },
     onShow: () => undefined, onBlur: () => undefined, onFocus: () => undefined,
@@ -400,7 +411,7 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
     index = at;
     commit(() => {
       const next = createLegUnavailableCard(doc, { legId: id, index: at, reason });
-      addAction(next.el, 'Skip', () => { void advance(); }); present(next);
+      addAction(next.el, 'Skip', () => { void advance(); }); present(next, 'unavailable');
     });
   }
   function clearStage(): void {
@@ -429,9 +440,8 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
   async function advance(to = index + 1): Promise<void> {
     if (disposed || transitioning || panicked) return;
     transitioning = true;
-    const previousScale = loop.currentTimeScale;
-    loop.setTimeScale(0);
-    hooks.onRunStateChanged(false);
+    // WP-24 section 1: entering is a hold like any other, so the pace indicator says why the clock stopped.
+    const releaseEntering = pacing.hold('entering');
     try {
       suppressLegEvents = true;
       try { if (runner.kernel !== null) runner.exit(); } finally { suppressLegEvents = false; }
@@ -444,7 +454,7 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
         runStore.mutate(run => { run.status = 'complete'; });
         commit(() => {
           const el = doc.createElement('section'); el.setAttribute('role', 'region'); el.textContent = 'Journey complete.';
-          present({ el, dispose: () => el.remove() });
+          present({ el, dispose: () => el.remove() }, 'complete');
         });
         return;
       }
@@ -455,7 +465,7 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
       runner.enter(module.default, { maxTicks: MAX_TICKS, stageContext: { quality: boot.tier, run: runStore.get() } }, r => r.applyContent(module.content));
       if (runner.kernel !== null && !panicked) await showLayout(module);
     } catch (error) { panic(describe(error)); }
-    finally { transitioning = false; if (!disposed && !panicked) { loop.setTimeScale(previousScale); hooks.onRunStateChanged(previousScale > 0); } }
+    finally { transitioning = false; releaseEntering(); }
   }
   function restoreDecisionPanels(module: LegModule): void {
     const phase = runner.phase;
@@ -473,7 +483,7 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
       reclamationPanel.open(layout);
     } else reclamationPanel.close();
   }
-  const session: BrowserSession & { debug?: KernelTrailDebug } = { loop, runner,
+  const session: BrowserSession & { debug?: KernelTrailDebug } = { loop, pacing, runner,
     dispose() {
       if (disposed) return;
       transitioning = true;

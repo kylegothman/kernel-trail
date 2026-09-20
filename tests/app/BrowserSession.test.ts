@@ -3,6 +3,7 @@ import 'fake-indexeddb/auto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Group, InstancedMesh, Mesh, PerspectiveCamera, PlaneGeometry, Scene, WebGPURenderer } from 'three/webgpu';
 import { createBrowserSession, type BrowserSession } from '@app/BrowserSession';
+import { TICK_HZ } from '@app/loop';
 import type { BootContext } from '@app/boot';
 import { LAYER, MIN_GLYPH_PX, TYPE_SCALE } from '@design';
 import { AudioEngine } from '@audio/AudioEngine';
@@ -172,6 +173,8 @@ async function startTravel() {
   const pending = createBrowserSession(f.boot, { kind: 'new', seed: 42, discClass: 'shell', difficulty: 'novice' }, { loaders });
   expect(AudioEngine.prototype.unlock).toHaveBeenCalledTimes(1);
   const session = await pending; sessions.push(session);
+  // WP-24: the fixtures keep one tick per three frames, the cadence every frame count in this file was written against; the player's two-tick default lives in pacing.test.ts.
+  session.pacing.setRate(TICK_HZ);
   // The synthetic opening has no player gate. Exit records its zero-segment completion.
   session.runner.exit();
   clock.frames(1);
@@ -187,7 +190,7 @@ async function resumeFixture(first: Awaited<ReturnType<typeof startTravel>>, fil
   first.session.dispose();
   const next = await fixtureBoot();
   const session = await createBrowserSession(next.boot, { kind: 'resume', file }, { loaders: first.loaders });
-  sessions.push(session); clock.frames(1);
+  sessions.push(session); session.pacing.setRate(TICK_HZ); clock.frames(1);
   return { ...next, session };
 }
 
@@ -348,7 +351,7 @@ describe('browser session assembly', () => {
     };
     const f = await fixtureBoot();
     const session = await createBrowserSession(f.boot, { kind: 'new', seed: 42, discClass: 'shell', difficulty: 'novice' }, { loaders });
-    sessions.push(session); clock.frames(4);
+    sessions.push(session); session.pacing.setRate(TICK_HZ); clock.frames(4);
     const scene = f.rendered.at(-1);
     if (scene === undefined) throw new Error('No authored layout rendered');
     const assertLayout = (module: LegModule, slabCount: number, steleCount?: number) => {
@@ -470,7 +473,7 @@ describe('browser session assembly', () => {
     first.session.dispose();
     const next = await fixtureBoot();
     const resumed = await createBrowserSession(next.boot, { kind: 'resume', file }, { loaders: first.loaders });
-    sessions.push(resumed);
+    sessions.push(resumed); resumed.pacing.setRate(TICK_HZ);
     expect(resumed.runner.currentLeg?.id).toBe('fork_fields');
     expect(resumed.runner.kernel?.tick).toBe(file.kernel.tick);
     const again = resumed.runner.saveProvisional();

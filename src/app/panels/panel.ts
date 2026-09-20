@@ -4,6 +4,13 @@ import { CYAN, FONT_STACK, SLATE, VOID, cssColor } from '@design';
 export interface PanelOptions {
   readonly document: Document;
   readonly overlay: HTMLElement;
+  /**
+   * WP-24 section 1: a panel that asks the player a question holds the clock
+   * while it is open. Supplied by the host as `pacing.hold`; the panel takes
+   * the hold on `show` and releases it on `close`, so it pauses by
+   * construction. Left out by the interactions panel, which is always open.
+   */
+  readonly hold?: (reason: string) => () => void;
 }
 
 export interface PanelShell {
@@ -59,14 +66,22 @@ export abstract class DeferredPanel {
   private dirty = false;
   private disposed = false;
   private shell: PanelShell | null = null;
+  private release: (() => void) | null = null;
 
   protected constructor(protected readonly options: PanelOptions, private readonly variant: string, private readonly label: string) {}
 
   get isOpen(): boolean { return this.visible; }
   get element(): HTMLElement | null { return this.shell?.element ?? null; }
-  protected show(): void { if (!this.disposed) { this.visible = true; this.dirty = true; } }
+  protected show(): void {
+    if (this.disposed) return;
+    this.visible = true; this.dirty = true;
+    if (this.release === null && this.options.hold !== undefined) this.release = this.options.hold(this.variant);
+  }
   protected invalidate(): void { if (!this.disposed) this.dirty = true; }
-  close(): void { this.visible = false; this.dirty = true; }
+  close(): void {
+    this.visible = false; this.dirty = true;
+    const release = this.release; this.release = null; release?.();
+  }
 
   flush(): void {
     if (!this.dirty || this.disposed) return;
