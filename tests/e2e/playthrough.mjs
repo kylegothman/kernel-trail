@@ -188,7 +188,7 @@ export async function playReload(context, baseUrl, backend, expectations, timeou
         const button = [...document.querySelectorAll('.kt-title-screen button')].find(candidate => candidate.textContent === 'Continue');
         return button !== undefined && !button.hidden && !button.disabled;
       }, undefined, { timeout, polling: 50 });
-      console.log('playthrough reload: the title screen offers Continue; the provisional save landed on pagehide');
+      console.log('playthrough reload: the title screen offers Continue; the provisional save landed at beforeunload');
       await continueButton.click();
       await waitForLegRail(page, 'The Boot Sector', timeout);
       await waitForSeam(page, timeout);
