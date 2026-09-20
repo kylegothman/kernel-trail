@@ -4,7 +4,7 @@ import type { CodexCounterfactual, CodexUnlock } from './codexTypes';
 import type { EpitaphCopySource } from './convoy/derezz';
 import { PER_LEG_ABILITY_CHARGES } from './convoy/status';
 import { LegSandbox, type LegFailure } from './LegSandbox';
-import { DIRECTOR_OWNED_KINDS, LEG_DONE_KIND, legDone, RunDirector, type DirectorSnapshot, type InteractionHandler } from './RunDirector';
+import { DIRECTOR_OWNED_KINDS, LEG_DONE_KIND, legDone, RunDirector, ZERO_SEGMENT_TICK_ALLOWANCE, type DirectorSnapshot, type InteractionHandler } from './RunDirector';
 import { buildDebrief, type DebriefView } from './debrief';
 import type { CrossingDef, CrossingResult } from './crossing/Crossing';
 import type { CrossingContext, CrossingOption } from './crossing/options';
@@ -65,6 +65,8 @@ export interface LegRunnerDeps {
 export interface LegRunOptions {
   readonly maxTicks: number;
   readonly stageContext: StageContext | null;
+  /** WP-24 section 2: omitted is ZERO_SEGMENT_TICK_ALLOWANCE; null ends a zero-segment leg on its leg_done record and on nothing else. */
+  readonly zeroSegmentAllowance?: number | null;
 }
 
 export interface RecruitPassive {
@@ -172,10 +174,11 @@ export class LegRunner {
     this.recruitState.push({ member, passiveMultiplier: codec ? 0 : 0.6, restoresCodecPassive: false });
   }
 
-  private makeDirector(kernel: ReplayKernel, leg: Leg, bindings: ConvoyBindings, sandbox: LegSandbox, maxTicks: number): RunDirector {
+  private makeDirector(kernel: ReplayKernel, leg: Leg, bindings: ConvoyBindings, sandbox: LegSandbox, opts: LegRunOptions): RunDirector {
     const director = new RunDirector({
       leg, kernel, store: this.deps.runStore, streams: this.deps.streams, bindings, sandbox,
-      epitaphs: this.deps.epitaphs, maxTicks, onCredit: emergencyCreditNeeded(this.deps.runStore.get().resources, leg.id),
+      epitaphs: this.deps.epitaphs, maxTicks: opts.maxTicks, onCredit: emergencyCreditNeeded(this.deps.runStore.get().resources, leg.id),
+      zeroSegmentAllowance: opts.zeroSegmentAllowance === undefined ? ZERO_SEGMENT_TICK_ALLOWANCE : opts.zeroSegmentAllowance,
       callbacks: {
         onLegEvent: this.deps.onLegEvent, onDerezz: this.deps.onDerezz, onRunnerFailure: this.deps.onRunnerFailure, codexSignal: this.deps.codexSignal,
         hasRecruited: () => this.recruitState.length > 0,
@@ -208,7 +211,7 @@ export class LegRunner {
     this.deps.runStore.mutate((run) => Object.assign(run, draft));
     livePolicyBinding.apply(kernel, this.deps.runStore.get().policy);
     this.installKernel(kernel);
-    this.activeDirector = this.makeDirector(kernel, leg, bindings, sandbox, opts.maxTicks);
+    this.activeDirector = this.makeDirector(kernel, leg, bindings, sandbox, opts);
     this.entry = { run: structuredClone(draft), rngStates: before };
     this.record = recordLegEntry(this.record, before);
     this.installHeadless(leg, this.activeDirector);
@@ -432,7 +435,7 @@ export class LegRunner {
     });
     livePolicyBinding.apply(resumed.kernel, this.deps.runStore.get().policy);
     this.sandbox = sandbox; this.installKernel(resumed.kernel);
-    this.activeDirector = this.makeDirector(resumed.kernel, leg, bindings, sandbox, options.maxTicks);
+    this.activeDirector = this.makeDirector(resumed.kernel, leg, bindings, sandbox, options);
     this.activeDirector.restore(checkpoint.director);
     this.completedOutcome = null;
     if (options.stageContext !== null) this.stage = sandbox.createStage(options.stageContext);
@@ -545,7 +548,7 @@ export class LegRunner {
       restoreRunStreams(this.deps.streams, file.rngStates);
       this.leg = target; this.options = opts; this.sandbox = sandbox; this.completedOutcome = null; this.entry = entry;
       this.installKernel(resumed.kernel);
-      this.activeDirector = this.makeDirector(resumed.kernel, target, bindings, sandbox, opts.maxTicks);
+      this.activeDirector = this.makeDirector(resumed.kernel, target, bindings, sandbox, opts);
       this.activeDirector.restore(snapshot);
       this.installHeadless(target, this.activeDirector); configure?.(this, target);
       if (opts.stageContext !== null) this.stage = sandbox.createStage(opts.stageContext);

@@ -44,6 +44,14 @@ export interface RunDirectorDeps {
   readonly sandbox: LegSandbox;
   readonly epitaphs: EpitaphCopySource;
   readonly maxTicks: number;
+  /**
+   * WP-24 section 2: a zero-segment leg completes at this kernel tick when no
+   * leg_done record has landed, or on the record alone when null. The harness
+   * passes ZERO_SEGMENT_TICK_ALLOWANCE, which is what it always used; the
+   * browser passes null while the tutorial drives the leg. Omitted is the
+   * constant, so a director built directly by an older test is unchanged.
+   */
+  readonly zeroSegmentAllowance?: number | null;
   readonly onCredit?: boolean;
   readonly replay?: boolean;
   readonly callbacks?: DirectorCallbacks;
@@ -74,8 +82,9 @@ export interface DirectorSnapshot {
  * deterministic.
  */
 export type InteractionHandler = (run: RunState, at: Tick, kernel: ReplayKernel) => void;
-/** WP-L00 ruling 1: a leg with no travel segments ends on a `leg_done` record its own handler pushes, or at this kernel tick as a normal completion. */
+/** WP-L00 ruling 1: a leg with no travel segments ends on a `leg_done` record its own handler pushes, or at the allowance tick as a normal completion. */
 export const LEG_DONE_KIND = 'leg_done';
+/** The allowance the harness passes (WP-24 section 2); the director reads only `RunDirectorDeps.zeroSegmentAllowance`. */
 export const ZERO_SEGMENT_TICK_ALLOWANCE = 200;
 /** True when this leg's decision log holds a `leg_done` record. */
 export function legDone(run: Readonly<RunState>, legId: Leg['id']): boolean {
@@ -134,8 +143,12 @@ export class RunDirector {
   get tickLimitReached(): boolean { return this.capped; }
   get complete(): boolean {
     if (this.capped || this.failed) return true;
-    if (this.travel.segmentsTotal === 0) return legDone(this.deps.store.get(), this.deps.leg.id) || this.deps.kernel.tick >= ZERO_SEGMENT_TICK_ALLOWANCE;
+    if (this.travel.segmentsTotal === 0) return legDone(this.deps.store.get(), this.deps.leg.id) || this.pastAllowance(this.deps.kernel.tick);
     return legProgress(this.travel) >= 1;
+  }
+  private pastAllowance(tick: number): boolean {
+    const allowance = this.deps.zeroSegmentAllowance === undefined ? ZERO_SEGMENT_TICK_ALLOWANCE : this.deps.zeroSegmentAllowance;
+    return allowance !== null && tick >= allowance;
   }
   dispose(): void { this.unsubscribe(); }
 
@@ -506,7 +519,7 @@ export class RunDirector {
         latest = run; if (initialPolicy === null) { initialPolicy = { ...run.policy }; initialQuantum = kernel.invariantState().schedulerParams.quantum; initialCredit = emergencyCreditNeeded(run.resources, this.deps.leg.id); }
         // Flush accepted tick-zero and final-boundary costs even if no step follows.
         if (entryContext !== null) return ensure(kernel, entryContext.streams, entryContext.store).complete;
-        return replay?.complete ?? (this.travel.segmentsTotal === 0 ? legDone(run, this.deps.leg.id) || _at >= ZERO_SEGMENT_TICK_ALLOWANCE : aliveMembers(run.convoy).length === 0);
+        return replay?.complete ?? (this.travel.segmentsTotal === 0 ? legDone(run, this.deps.leg.id) || this.pastAllowance(_at) : aliveMembers(run.convoy).length === 0);
       },
       admit: (cmd, origin) => {
         if (latest === null) return { ok: false, reason: 'Replay has no active leg.' };

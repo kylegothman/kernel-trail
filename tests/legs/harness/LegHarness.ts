@@ -27,6 +27,7 @@ import { createKernel, type KernelConfig, type KernelEvent, type SubsystemId } f
 import { CommandBus, type KernelMutators } from '@game/CommandBus';
 import type { CrossingDef, CrossingResult } from '@game/crossing/Crossing';
 import { LegRunner, type LegEvent, type LegRunOptions } from '@game/LegRunner';
+import { ZERO_SEGMENT_TICK_ALLOWANCE } from '@game/RunDirector';
 import type { LegFailure } from '@game/LegSandbox';
 import { hashEventLog } from '@game/replay/hash';
 import { createRunStreams, restoreRunStreams, type ReplayEntry, type ReplayKernel, type RunStreams } from '@game/replay/types';
@@ -313,7 +314,8 @@ function restoreMidLeg(session: HarnessSession, leg: Leg, legOpts: LegRunOptions
 export function runLegInSession(session: HarnessSession, leg: Leg, opts: HarnessOptions, alreadyEntered = false): { readonly result: HarnessResult; readonly session: HarnessSession } {
   assertHeadless();
   const maxTicks = opts.maxTicks ?? DEFAULT_MAX_TICKS;
-  const legOpts: LegRunOptions = { maxTicks, stageContext: null };
+  // WP-24 section 2: the allowance the harness always used, now said aloud; the browser passes null while the tutorial drives the leg.
+  const legOpts: LegRunOptions = { maxTicks, stageContext: null, zeroSegmentAllowance: ZERO_SEGMENT_TICK_ALLOWANCE };
   const content = opts.content ?? contentOf(leg);
   const scriptCrossings = opts.script?.crossings ?? [];
   const crossings = mergeCrossings(content?.crossings ?? [], scriptCrossings);

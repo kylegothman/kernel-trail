@@ -78,13 +78,14 @@ describe('LegRunner boundaries', () => {
     expect(card?.kind === 'debrief' ? card.view.dividend : null).toBe(0);
   });
   it('a zero-segment leg with no leg_done record completes at the tick allowance as a normal completion, and an early exit records its own leg_done', () => {
-    const late = rig(); late.runner.enter(createSyntheticLeg(), options);
+    // WP-24 section 2: the allowance is the option the harness passes, said aloud here; the browser passes null while the tutorial drives the leg.
+    const late = rig(); late.runner.enter(createSyntheticLeg(), { ...options, zeroSegmentAllowance: ZERO_SEGMENT_TICK_ALLOWANCE });
     for (let i = 0; i < ZERO_SEGMENT_TICK_ALLOWANCE + 5 && !late.runner.finished; i++) tick(late);
     expect(late.runner.finished).toBe(true); expect(late.runner.ticksElapsed).toBe(ZERO_SEGMENT_TICK_ALLOWANCE);
     expect(late.runner.director?.tickLimitReached).toBe(false); expect(late.failure).not.toHaveBeenCalled();
     late.runner.exit();
     expect(late.store.get().decisions.filter(record => record.kind === 'leg_done').map(record => [record.tick, record.choice])).toEqual([[ZERO_SEGMENT_TICK_ALLOWANCE, 'exit']]);
-    const early = rig(); early.runner.enter(createSyntheticLeg(), options);
+    const early = rig(); early.runner.enter(createSyntheticLeg(), { ...options, zeroSegmentAllowance: ZERO_SEGMENT_TICK_ALLOWANCE });
     tick(early); early.runner.exit();
     expect(early.store.get().decisions.filter(record => record.kind === 'leg_done').map(record => [record.tick, record.choice])).toEqual([[1, 'exit']]);
   });
@@ -597,7 +598,7 @@ describe('approved replay entry and terminal provenance regressions', () => {
     const seed = 71;
     const leg = createSyntheticLeg({ id: legId, index, service: [500, 501], config: { enabledSubsystems: ['process', 'scheduler', 'sync'] } });
     const r = rig(seed, initialRunState(seed, 'shell', tier));
-    r.runner.enter(leg, options);
+    r.runner.enter(leg, { ...options, zeroSegmentAllowance: ZERO_SEGMENT_TICK_ALLOWANCE });
     const entry = structuredClone(r.runner.replayEntry!);
     const before = { ...r.store.get().resources };
     for (const source of ['terminal', 'terminal', 'hud'] as const) {
