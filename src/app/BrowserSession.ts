@@ -1,7 +1,7 @@
 /** Browser assembly only. Layout forms and decision panels are replaceable stand-ins. */
-import { Scene, Vector3 } from 'three/webgpu';
+import { Box3, Scene, Vector3 } from 'three/webgpu';
 import { CAMERA } from '@design';
-import { asTick, createKernel, createRng, type KernelEvent } from '@kernel/index';
+import { asTick, createKernel, createRng, type KernelEvent, type Tick } from '@kernel/index';
 import { ObservedBus } from './panels/RefusalLine';
 import { LegRunner, type LegEvent, type LegPhase } from '@game/LegRunner';
 import { createRunStore, createTelemetryStore } from '@game/runStore';
@@ -305,8 +305,10 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
   const reclamationPanel = new ReclamationPanel({ document: doc, overlay: boot.overlay, runner, hold });
   const codexPanel = new CodexPanel({ document: doc, overlay: boot.overlay, codex, registry, hold });
   // WP-24 section 3: the Boot Sector's two panels; the driver opens them, and a skipped tutorial reaches them from the anchors panel's rows.
-  const requisitionPanel = new RequisitionPanel({ document: doc, overlay: boot.overlay, bus, run: () => runStore.get(), outcomes: bus, clock: () => performance.now(), hold });
-  const gatePanel = new GatePanel({ document: doc, overlay: boot.overlay, bus, run: () => runStore.get(), hold });
+  // They hold the clock, so their verbs apply synchronously at the current tick, as the terminal's sink does.
+  const kernelTick = (): Tick => runner.kernel?.tick ?? asTick(0);
+  const requisitionPanel = new RequisitionPanel({ document: doc, overlay: boot.overlay, bus, run: () => runStore.get(), tick: kernelTick, clock: () => performance.now(), hold });
+  const gatePanel = new GatePanel({ document: doc, overlay: boot.overlay, bus, run: () => runStore.get(), tick: kernelTick, hold });
   const interactionPanel = new InteractionPanel({ document: doc, overlay: boot.overlay, runner, bus, run: () => runStore.get(), outcomes: bus, clock: () => performance.now(),
     crossing: (def, context) => crossingPanel.open(def, context), depot: depot => depotPanel.open(depot), reclamation: layout => reclamationPanel.open(layout) });
   panels.push(interactionPanel, crossingPanel, depotPanel, reclamationPanel, codexPanel, requisitionPanel, gatePanel);
@@ -608,7 +610,9 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
       anchorOnScreen: id => {
         const structure = stage?.structures.find(candidate => candidate.id === id);
         if (structure === undefined) return null;
-        const point = structure.root.getWorldPosition(new Vector3()).project(focus.camera);
+        // The centre of the structure's bounds, not its base: a ray at the base of a stele misses the mesh above it.
+        structure.root.updateWorldMatrix(true, true);
+        const point = new Box3().setFromObject(structure.root).getCenter(new Vector3()).project(focus.camera);
         if (point.z > 1) return null;
         return { x: (point.x + 1) / 2 * view.innerWidth, y: (1 - point.y) / 2 * view.innerHeight };
       },

@@ -59,8 +59,8 @@ async function bootSector() {
     runner.postTick(k.tick, k.step());
     now += 500;
   };
-  const requisition = new RequisitionPanel({ document, overlay, bus, run: () => store.get(), outcomes: bus, clock: () => now });
-  const gate = new GatePanel({ document, overlay, bus, run: () => store.get() });
+  const requisition = new RequisitionPanel({ document, overlay, bus, run: () => store.get(), tick: () => runner.kernel!.tick, clock: () => now });
+  const gate = new GatePanel({ document, overlay, bus, run: () => store.get(), tick: () => runner.kernel!.tick });
   cleanups.push(() => { requisition.dispose(); gate.dispose(); });
   const flush = (): void => { requisition.flush(); gate.flush(); };
   const button = (label: string): HTMLButtonElement => {
@@ -198,6 +198,23 @@ describe('the requisition panel', () => {
     r.button('cycles').click(); r.tick(); r.flush();
     expect(overlay.querySelector('[data-outcome="costly"]')?.textContent).toBe(`cycles: costly. ${GATE_LINES.costly}`);
     expect(r.runner.finished).toBe(true);
+  });
+
+  it('a verb lands at the current tick with no tick passing, because the panel holds the clock and a held clock drains no queue', async () => {
+    const r = await bootSector();
+    r.requisition.open(); r.flush();
+    const tick = r.runner.ticksElapsed;
+    r.button('Request memory quota mode').click();
+    expect(r.interactions()).toEqual([['boot.set_mode @ anchor.win.quota:kernel', 'pending']]);
+    expect(r.store.get().decisions.at(-1)?.tick).toBe(tick);
+    r.flush();
+    expect(r.button('Request memory quota mode').textContent).toBe('Mode: kernel');
+    r.button('Submit').click();
+    expect(r.interactions().at(-1)).toEqual(['boot.trap_purchase @ anchor.win.quota', 'good']);
+    r.gate.open(); r.flush();
+    r.button('blocks').click();
+    expect(r.runner.finished).toBe(true);
+    expect(r.runner.ticksElapsed).toBe(tick);
   });
 
   it('every string the panel dispatches parses as the leg parses it', async () => {

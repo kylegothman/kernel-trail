@@ -128,8 +128,8 @@ function stubHost() {
   const restricted: (readonly string[] | null)[] = [];
   const rig = realRig();
   let now = 10_000;
-  const requisition = new RequisitionPanel({ document: doc, overlay, bus: rig.bus, run: () => rig.store.get(), outcomes: rig.bus, clock: () => now });
-  const gate = new GatePanel({ document: doc, overlay, bus: rig.bus, run: () => rig.store.get() });
+  const requisition = new RequisitionPanel({ document: doc, overlay, bus: rig.bus, run: () => rig.store.get(), tick: () => rig.runner.kernel!.tick, clock: () => now });
+  const gate = new GatePanel({ document: doc, overlay, bus: rig.bus, run: () => rig.store.get(), tick: () => rig.runner.kernel!.tick });
   const host: DriverHost = {
     document: doc, canvas, run: () => rig.store.get(), structures: () => structures, sceneObject: name => scene.get(name) ?? null,
     focus, hud, pacing, terminal: () => terminal, interactions: { restrict: ids => { restricted.push(ids); } }, requisition, gate, clock: () => now,

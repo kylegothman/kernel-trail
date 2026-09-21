@@ -10,18 +10,26 @@
  * re-reads `reduceRequisition` and re-renders from it, so what the player
  * sees is the leg's own view of the requisition and never the panel's
  * memory. An errno comes back as a refusal line with the man page beside it.
+ *
+ * The panel holds the clock while it is open, and a held clock drains no
+ * queue, so the verbs are applied through the bus synchronously at the
+ * current tick, the road the terminal's sink takes; the record lands in the
+ * same order a queued command would at that tick boundary, and the refusal
+ * is read from the outcome apply returns.
  */
+import type { Tick } from '@kernel/types';
 import type { CommandBus } from '@game/CommandBus';
 import type { RunState } from '@game/types';
 import { DEPOT_AMBIENT, TRAP_SIGNAGE } from '@legs/boot_sector/copy';
 import { TRAP_COST, WINDOWS, reduceRequisition, unitPrice, windowAnchor, type RequisitionState, type WindowDef, type WindowId, type WindowMode } from '@legs/boot_sector/windows';
 import { DeferredPanel, button, messageOf, paragraph, type PanelOptions, type PanelShell } from './panel';
-import { RefusalLines, refusalElement, refusalFor, type OutcomeSource } from './RefusalLine';
+import { RefusalLines, refusalElement, refusalFor } from './RefusalLine';
 
 export interface RequisitionPanelOptions extends PanelOptions {
-  readonly bus: Pick<CommandBus, 'dispatch'>;
+  readonly bus: Pick<CommandBus, 'apply'>;
   readonly run: () => Readonly<RunState>;
-  readonly outcomes?: OutcomeSource;
+  /** The kernel tick a verb is applied at. */
+  readonly tick: () => Tick;
   readonly clock?: () => number;
   /** Beat 7 exits when the player closes the requisition through the panel's own Close. */
   readonly onClose?: () => void;
@@ -37,18 +45,8 @@ export class RequisitionPanel extends DeferredPanel {
   private submitAt: WindowId | null = null;
   private seenDecisions = -1;
   private readonly refusals = new RefusalLines();
-  private readonly unwatchOutcomes: () => void;
 
-  constructor(private readonly config: RequisitionPanelOptions) {
-    super(config, 'requisition', 'Requisition');
-    this.unwatchOutcomes = config.outcomes?.onOutcomes(outcomes => {
-      const run = config.run();
-      for (const outcome of outcomes) {
-        const refusal = refusalFor(outcome, run);
-        if (refusal !== null && refusal.id === 'boot.trap_purchase') { this.refusals.show(refusal, this.now()); this.invalidate(); }
-      }
-    }) ?? (() => undefined);
-  }
+  constructor(private readonly config: RequisitionPanelOptions) { super(config, 'requisition', 'Requisition'); }
 
   open(): void { this.message = ''; this.show(); }
 
@@ -65,7 +63,9 @@ export class RequisitionPanel extends DeferredPanel {
 
   private dispatch(id: string, anchor: string): void {
     try {
-      if (!this.config.bus.dispatch({ kind: 'interaction', id, anchor }, { source: 'world', legId: LEG_ID })) throw new Error('Command queue full. Try again after the next tick.');
+      const outcome = this.config.bus.apply({ kind: 'interaction', id, anchor }, { source: 'world', legId: LEG_ID }, this.config.tick());
+      const refusal = refusalFor(outcome, this.config.run());
+      if (refusal !== null && refusal.id === 'boot.trap_purchase') this.refusals.show(refusal, this.now());
       this.message = '';
     } catch (error) { this.message = messageOf(error); }
     this.invalidate();
@@ -148,5 +148,4 @@ export class RequisitionPanel extends DeferredPanel {
     super.flush();
   }
 
-  override dispose(): void { this.unwatchOutcomes(); super.dispose(); }
 }

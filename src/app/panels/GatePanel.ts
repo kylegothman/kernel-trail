@@ -5,6 +5,7 @@
  * handler decides good or costly; the panel shows which with one sentence
  * from the leg's own copy, and the leg ends on the record the handler writes.
  */
+import type { Tick } from '@kernel/types';
 import type { CommandBus } from '@game/CommandBus';
 import { startingLedger } from '@game/travel/ledger';
 import type { DiscClass, RunState } from '@game/types';
@@ -14,8 +15,10 @@ import { reduceRequisition } from '@legs/boot_sector/windows';
 import { DeferredPanel, button, messageOf, paragraph, resourcesText, type PanelOptions, type PanelShell } from './panel';
 
 export interface GatePanelOptions extends PanelOptions {
-  readonly bus: Pick<CommandBus, 'dispatch'>;
+  /** Applied synchronously at `tick`: the panel holds the clock, and a held clock drains no queue. */
+  readonly bus: Pick<CommandBus, 'apply'>;
   readonly run: () => Readonly<RunState>;
+  readonly tick: () => Tick;
 }
 
 /** The four ledger stocks the gate asks about, narrative bible 4 and 5.2. */
@@ -57,10 +60,8 @@ export class GatePanel extends DeferredPanel {
       for (const resource of GATE_RESOURCES) {
         choices.append(button(doc, resource, () => {
           try {
-            if (!this.config.bus.dispatch({ kind: 'interaction', id: 'boot.choose_disc', anchor: `${ANCHORS.discPlinth}:${resource}` }, { source: 'world', legId: 'boot_sector' })) {
-              throw new Error('Command queue full. Try again after the next tick.');
-            }
-            this.message = '';
+            const outcome = this.config.bus.apply({ kind: 'interaction', id: 'boot.choose_disc', anchor: `${ANCHORS.discPlinth}:${resource}` }, { source: 'world', legId: 'boot_sector' }, this.config.tick());
+            this.message = outcome.refused ?? '';
           } catch (error) { this.message = messageOf(error); }
           this.invalidate();
         }));
