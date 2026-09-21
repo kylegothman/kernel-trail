@@ -46,7 +46,7 @@ export function createPanel(doc: Document, variant: string, label: string, overl
     .kt-panel th,.kt-panel td { text-align:left; padding:5px; border-bottom:1px solid ${cssColor(CYAN.dim, 0.3)}; }
     .kt-panel pre { white-space:pre-wrap; font-family:${FONT_STACK.mono}; }
     .kt-panel--interactions { left:24px; right:auto; width:min(22rem,calc(100% - 48px)); }
-    .kt-panel--requisition { top:max(24px,2.5vh); max-height:calc(100% - 2 * max(24px,2.5vh)); display:flex; flex-direction:column; overflow:hidden; }
+    .kt-panel--requisition { max-height:calc(82% - max(24px,2.5vh)); display:flex; flex-direction:column; overflow:hidden; }
     .kt-panel--requisition > h2 { flex:0 0 auto; }
     .kt-panel--requisition > div { flex:1 1 auto; min-height:0; overflow:auto; }
     .kt-panel--requisition > footer { flex:0 0 auto; flex-wrap:wrap; align-items:center; border-top:1px solid ${cssColor(CYAN.dim, 0.3)}; padding-top:8px; }
