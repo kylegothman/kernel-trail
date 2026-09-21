@@ -244,9 +244,12 @@ export async function playTutorial(context, baseUrl, backend, expectations, time
     // 4. The reach: release the focus lock with the engage key, then the one verb, and the hard stop.
     await arrived('beat.reach');
     await page.keyboard.press('F');
+    // The reach verb has been listed since entry, so the beat's own signal is the panel narrowing to that one row on the release.
+    await page.waitForFunction(() => document.querySelectorAll('.kt-panel--interactions [data-interaction]').length === 1, undefined, { timeout, polling: 50 });
     const reach = page.getByRole('button', { name: 'Take the blocks', exact: true });
     await reach.waitFor({ timeout });
     same('verbs shown in beat.reach', await page.locator('.kt-panel--interactions [data-interaction]').count(), 1);
+    same('the one verb shown is the reach', await page.locator('.kt-panel--interactions [data-interaction]').getAttribute('data-interaction'), 'boot.direct_reach');
     // A HUD-layer button is hittable through the real DOM: elementFromPoint at its centre is the button itself.
     const centre = await reach.evaluate(button => { const r = button.getBoundingClientRect(); const at = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2); return at === button ? 'the button' : `${at?.tagName ?? 'nothing'}.${at?.className ?? ''}`; });
     same('elementFromPoint at the centre of a HUD button', centre, 'the button');
