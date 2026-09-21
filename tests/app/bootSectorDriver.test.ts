@@ -125,7 +125,7 @@ function stubHost() {
   const scales: number[] = [];
   const pacing = createPacing({ setTimeScale: scale => { scales.push(scale); } });
   const listeners = new Set<(name: string, argv: readonly string[], result: { ok: boolean }) => void>();
-  const terminal = { shell: { onCommand: (l: (name: string, argv: readonly string[], result: { ok: boolean }) => void) => { listeners.add(l); return () => { listeners.delete(l); }; } } };
+  const terminal = { isOpen: true, close: vi.fn(() => { terminal.isOpen = false; }), shell: { onCommand: (l: (name: string, argv: readonly string[], result: { ok: boolean }) => void) => { listeners.add(l); return () => { listeners.delete(l); }; } } };
   const restricted: (readonly string[] | null)[] = [];
   const enabled: (readonly string[] | null)[] = [];
   const rig = realRig();
@@ -146,7 +146,7 @@ function stubHost() {
   const visible = (id: string): boolean => { const s = structures.find(candidate => candidate.id === id)!; return s.root.visible && s.root.scale.x > 0; };
   const runCommand = (name: string, argv: string[], ok = true): void => { for (const l of listeners) l(name, argv, { ok }); };
   const card = (): { beat: string | null; text: string | null } => { const el = overlay.querySelector('.kt-card--beat'); return { beat: el?.getAttribute('data-beat') ?? null, text: el?.querySelector('.kt-beat-hint')?.textContent ?? null }; };
-  return { ...rig, host, structures, scene, state, focus, notes, hovers, hudElement, pips, hint, pacing, scales, restricted, enabled, requisition, gate, overlay, advance, flush, button, visible, runCommand, clock: () => now, listeners, card };
+  return { ...rig, host, structures, scene, state, focus, notes, hovers, hudElement, pips, hint, pacing, scales, restricted, enabled, requisition, gate, overlay, advance, flush, button, visible, runCommand, clock: () => now, listeners, card, terminal };
 }
 
 describe('the Boot Sector driver', () => {
@@ -254,6 +254,7 @@ describe('the Boot Sector driver', () => {
     s.runCommand('man', ['EPERM']); driver.update(s.clock());
     // 6. The trap: the requisition opens; a refused submission does not end the beat; a successful one does.
     expect(driver.beatId).toBe('beat.trap');
+    expect(s.terminal.close).toHaveBeenCalledOnce();
     expect(s.hint.textContent).toBe('');
     expect(s.listeners.size).toBe(0);
     expect(s.requisition.isOpen).toBe(true);

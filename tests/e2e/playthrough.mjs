@@ -307,6 +307,8 @@ export async function playTutorial(context, baseUrl, backend, expectations, time
     // 6. The trap: the requisition opens and holds the clock; a question open stops time (section 1).
     await arrived('beat.trap');
     await page.locator('.kt-panel--requisition').waitFor({ timeout });
+    // The depot opening closed the terminal, which would otherwise sit on top of the windows.
+    same('the terminal is closed when the requisition opens', await page.locator('.kt-terminal').isHidden(), true);
     // The beat card is never covered by a panel: its box and the requisition's do not intersect.
     const boxes = await page.evaluate(() => {
       const card = document.querySelector('.kt-card--beat').getBoundingClientRect();

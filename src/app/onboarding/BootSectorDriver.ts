@@ -61,6 +61,8 @@ export interface DriverHud {
 
 export interface DriverTerminal {
   readonly shell: { onCommand(listener: (name: string, argv: readonly string[], result: { readonly ok: boolean }) => void): () => void };
+  readonly isOpen: boolean;
+  close(): void;
 }
 
 export interface DriverHost {
@@ -318,6 +320,9 @@ export class BootSectorDriver {
   private enterTrap(): void {
     this.hintSpan?.remove(); this.hintSpan = null;
     this.unwatchShell?.(); this.unwatchShell = null;
+    // The depot opening is the world's move: the terminal, topmost while open, closes so the windows are reachable.
+    const terminal = this.host.terminal();
+    if (terminal !== null && terminal.isOpen) terminal.close();
     this.host.requisition.open();
   }
 
