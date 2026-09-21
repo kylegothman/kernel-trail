@@ -8,13 +8,16 @@
  * oversight. `consume` never throws: the whole body is guarded and a failure
  * is counted rather than propagated, because `EventFanout` disables a consumer
  * that throws for the rest of the leg.
+ *
+ * WP-25: no kernel metric reaches the score. The load model that once read
+ * ticks, switches, faults and wait queues out of this stream is gone; the
+ * consumer routes cues, aggregates fault density, and pumps the score's
+ * sequencer once per frame.
  */
-import type { KernelEvent, Pid, ResourceId } from '@kernel/types';
+import type { KernelEvent } from '@kernel/types';
 import { FAULT_DENSITY, GRAIN, INTERRUPT_TICKS_PER_FRAME } from '../synth/constants';
 import type { GranularVoice } from '../voices/GranularVoice';
-import type { LoadModel } from '../score/loadModel';
 import type { Score } from '../score/Score';
-import { makeTargets, type LayerTargets } from '../score/layers';
 import type { FrameAggregates } from '@world/FrameEventQueue';
 import type { PositionSource } from './PositionSource';
 import type { SoundBank } from './eventSounds';
@@ -31,7 +34,6 @@ export interface EventConsumer {
 /** What the consumer needs from the engine, kept narrow for the tests. */
 export interface ConsumerHost {
   readonly bank: SoundBank;
-  readonly load: LoadModel;
   readonly positions: PositionSource;
   readonly mono: boolean;
   readonly ready: boolean;
@@ -52,16 +54,8 @@ export interface ConsumerStats {
 export class AudioConsumer implements EventConsumer {
   readonly name = 'audio';
   readonly stats: ConsumerStats = { consumed: 0, errors: 0, frames: 0, faultDensityUpdates: 0 };
-  private readonly targets: LayerTargets = makeTargets();
-  private readonly queueDepths = new Map<ResourceId, number>();
-  private runningPid: Pid | null = null;
   private frameStart = 0;
-  private lastFrameEnd = -1;
   private frameOpen = false;
-  private currentTick = -1;
-  private faultsThisTick = 0;
-  private switchesThisTick = 0;
-  private ticksThisFrame = 0;
   private faultsThisFrame = 0;
   private aggregateFaults: number | null = null;
   private interruptsThisFrame = 0;
@@ -71,7 +65,6 @@ export class AudioConsumer implements EventConsumer {
   beginFrame(): void {
     this.frameOpen = true;
     this.frameStart = this.host.now;
-    this.ticksThisFrame = 0;
     this.faultsThisFrame = 0;
     this.aggregateFaults = null;
     this.interruptsThisFrame = 0;
@@ -93,7 +86,6 @@ export class AudioConsumer implements EventConsumer {
   consume(e: KernelEvent): void {
     this.stats.consumed += 1;
     try {
-      this.trackTick(e.tick as unknown as number);
       this.route(e);
     } catch {
       this.stats.errors += 1;
@@ -132,14 +124,12 @@ export class AudioConsumer implements EventConsumer {
         bank.processStarving(e, this.pan(e));
         return;
       case 'context.switch':
-        this.switchesThisTick += 1;
-        this.runningPid = e.to;
         bank.contextSwitch(e, this.pan(e));
         return;
       case 'quantum.expired':
         // Deliberate silence: it is always followed by the context.switch it
-        // caused, whose click lands on the pulse gate; a second click would
-        // smear the gate.
+        // caused, whose click lands on the score's grid; a second click would
+        // smear the beat.
         return;
       case 'thread.created':
       case 'thread.joined':
@@ -154,7 +144,6 @@ export class AudioConsumer implements EventConsumer {
         return;
       case 'memory.page_fault':
         // Aggregated to a density at endFrame, never one grain per fault.
-        this.faultsThisTick += 1;
         this.faultsThisFrame += 1;
         return;
       case 'memory.page_loaded':
@@ -172,8 +161,7 @@ export class AudioConsumer implements EventConsumer {
         bank.allocationFailed(this.pan(e));
         return;
       case 'memory.thrashing':
-        this.host.load.adoptFaultRate(e.faultRate);
-        bank.thrashing(e);
+        bank.thrashing(e, this.pan(e));
         return;
       case 'tlb.miss':
         // Deliberate silence: up to eight are sampled per frame and the lesson
@@ -186,15 +174,11 @@ export class AudioConsumer implements EventConsumer {
         bank.syncAcquired(e, this.pan(e));
         return;
       case 'sync.blocked':
-        // Deliberate silence: it feeds the contention layer's width through
-        // queueLength; the layer is its sound.
-        this.queueDepths.set(e.resource, e.queueLength);
+        // Deliberate silence: a block can repeat every tick for every waiter;
+        // the queue is drawn as a queue, and the crossing section is the music
+        // of contention. A cue per block would be a metronome under a held panel.
         return;
       case 'sync.released':
-        if (e.woke !== null) {
-          const depth = this.queueDepths.get(e.resource);
-          if (depth !== undefined) this.queueDepths.set(e.resource, Math.max(0, depth - 1));
-        }
         bank.syncReleased(e, this.pan(e));
         return;
       case 'sync.race_detected':
@@ -224,7 +208,6 @@ export class AudioConsumer implements EventConsumer {
         bank.deadlockDetected();
         return;
       case 'deadlock.resolved':
-        this.queueDepths.clear();
         bank.deadlockResolved(e, this.pan(e));
         return;
 
@@ -258,8 +241,7 @@ export class AudioConsumer implements EventConsumer {
         return;
       case 'io.poll_wasted':
         // Deliberate silence: one per tick while polling; the tally on the
-        // stele's base is the channel and the wasted ticks already starve the
-        // pulse layer of switches.
+        // stele's base is the channel, and the stalled convoy is the picture.
         return;
 
       /* ---- file system, Ch. 13 to 15 ---------------------------------- */
@@ -292,7 +274,8 @@ export class AudioConsumer implements EventConsumer {
       /* ---- kernel ------------------------------------------------------ */
       case 'syscall.invoked':
         // Deliberate silence: package line 240. No sound individually; the
-        // switches it causes drive the pulse layer's rate.
+        // trap is the mode flip the terminal prints, and the switch it causes
+        // clicks on the grid.
         return;
       case 'kernel.panic':
         bank.kernelPanic();
@@ -309,36 +292,13 @@ export class AudioConsumer implements EventConsumer {
     return Math.min(PAN_CLAMP, Math.max(-PAN_CLAMP, x));
   }
 
-  private trackTick(tick: number): void {
-    if (tick === this.currentTick) return;
-    this.flushTick();
-    this.currentTick = tick;
-  }
-
-  private flushTick(): void {
-    if (this.currentTick < 0) return;
-    this.host.load.observeTick(this.faultsThisTick, this.runningPid !== null, this.switchesThisTick);
-    this.ticksThisFrame += 1;
-    this.faultsThisTick = 0;
-    this.switchesThisTick = 0;
-    this.currentTick = -1;
-  }
-
   private finishFrame(): void {
-    this.flushTick();
     this.stats.frames += 1;
-    const now = this.host.now;
-    const wall = this.lastFrameEnd < 0 ? 0 : now - this.lastFrameEnd;
-    this.lastFrameEnd = now;
-    let depth = 0;
-    for (const d of this.queueDepths.values()) depth += d;
-    this.host.load.observeFrame(this.ticksThisFrame, wall, depth);
     if (!this.host.ready) return;
-    const score = this.host.score;
-    if (score !== null) {
-      this.host.load.targets(this.targets);
-      score.update(now, this.targets, this.host.load.pulseRateHz);
-    }
+    const now = this.host.now;
+    // WP-25 section 2: the frame pumps the sequencer too, so the score keeps
+    // time even when the session has handed the engine no interval.
+    this.host.score?.pump(now);
     this.applyFaultDensity(this.aggregateFaults ?? this.faultsThisFrame, now);
     const until = now + GRAIN.lookaheadMs / 1000;
     for (const g of this.host.granulars()) g.scheduleUntil(until);

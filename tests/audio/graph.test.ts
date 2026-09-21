@@ -182,7 +182,10 @@ describe('graph', () => {
         expect(spec, `${file}: value import ${clause}`).toBe('@kernel/index');
         expect(clause.replace(/[{}\s]/g, ''), file).toBe('createRng');
       }
-      expect(code, file).not.toMatch(/from\s*['"]@game/);
+      // WP-25 (S7): static imports from the game layer are type-only, held by the loop above (criterion 6). The
+      // two routes that loop cannot see, a re-export and a dynamic import, are closed here.
+      expect(code, file).not.toMatch(/export\s[^;]*from\s*['"]@game/);
+      expect(code, file).not.toMatch(/import\s*\(\s*['"]@game/);
       const platform = [...code.matchAll(/^\s*import\s+([^;]+?)\s+from\s*['"]@platform[^'"]*['"]/gm)];
       for (const m of platform) expect((m[1] ?? '').startsWith('type '), `${file}: platform must be type-only`).toBe(true);
     }

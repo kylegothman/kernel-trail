@@ -156,7 +156,8 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
   const leases = new GeometryLeases();
   const derezzSource = leases.take(makeSlab());
   const visualRng = createRng(initial.seed, 'browser-derezz');
-  const engine = new AudioEngine({ tier: boot.tier, seed: initial.seed });
+  // WP-25: the score's 25 ms pump is the session's timer, because src/audio keeps no timers of its own.
+  const engine = new AudioEngine({ tier: boot.tier, seed: initial.seed, interval: (fn, ms) => { const id = setInterval(fn, ms); return () => clearInterval(id); } });
   // This runs synchronously in the title button gesture, before any await.
   engine.unlock();
   let unbindSettings = (): void => undefined;
@@ -251,6 +252,7 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
   }
   function legEvent(event: LegEvent): void {
     if (disposed || suppressLegEvents || (panicked && event.kind !== 'panic')) return;
+    engine.onLegEvent(event);
     switch (event.kind) {
       case 'leg_unavailable': unavailable(event.legId, event.index, event.reason); break;
       case 'panic': panic(event.message); break;
@@ -300,7 +302,10 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
   });
   // WP-24 section 1: every panel that asks a question holds the clock while open; the interactions panel does not.
   const hold = (reason: string): (() => void) => pacing.hold(reason);
-  const crossingPanel = new CrossingPanel({ document: doc, overlay: boot.overlay, runner, hold });
+  // WP-25 section 4: the crossing's result is a return value, so the score hears it on the way back to the panel.
+  const crossingPanel = new CrossingPanel({ document: doc, overlay: boot.overlay, runner: {
+    resolveCrossing: (def, option) => { const result = runner.resolveCrossing(def, option); engine.onDirectorEvent({ kind: 'crossing_resolved', succeeded: result.succeeded, casualties: result.casualties.length }); return result; },
+    continueTravel: () => runner.continueTravel() }, hold });
   const depotPanel = new DepotPanel({ document: doc, overlay: boot.overlay, runner, run: () => runStore.get(), hold });
   const reclamationPanel = new ReclamationPanel({ document: doc, overlay: boot.overlay, runner, hold });
   const codexPanel = new CodexPanel({ document: doc, overlay: boot.overlay, codex, registry, hold });
@@ -319,7 +324,9 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
       if (worldAggregates !== null) { router.endFrame(worldAggregates); worldAggregates = null; }
       if (audioAggregates !== null) { engine.observeAggregates(audioAggregates); engine.consumer.endFrame(); audioAggregates = null; }
     }, commit: flushUi, panic, canFinish: () => !panicked && !transitioning,
-    audioRunning: () => !panicked && !transitioning && loop.currentTimeScale > 0 });
+    // WP-25 (S3): a held clock is a moment, not silence; the music plays through pauses, holds, the panic and the
+    // transition, and only a hidden tab suspends it.
+    audioRunning: () => doc.visibilityState !== 'hidden' });
   const host = createRunHost({ runner, commandBus: bus, runStore, telemetry, hooks });
   host.queue.addWorld({ name: router.name, consume: event => router.consume(event), endFrame: aggregates => { worldAggregates = aggregates; } });
   host.queue.addAudio({ name: engine.consumer.name, beginFrame: () => engine.consumer.beginFrame(), consume: event => engine.consumer.consume(event), endFrame: aggregates => { audioAggregates = aggregates; } });
@@ -352,7 +359,7 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
   const unwatchKernel = runner.onKernelChanged(kernel => {
     const old = terminal; terminal = null;
     if (old !== null) commit(() => old.dispose());
-    if (kernel === null) return;
+    if (kernel === null) { engine.onDirectorEvent({ kind: 'leg_exit' }); return; }
     const leg = runner.currentLeg;
     if (leg === null) return;
     const module = modules.get(leg.id);
@@ -378,8 +385,8 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
       next.element.style.pointerEvents = 'auto'; boot.overlay.append(next.element); terminal = next;
     });
     engine.setConvoyPids(runStore.get().convoy.flatMap(member => member.pid === null ? [] : [member.pid]));
-    engine.setThresholds({ thrashingThreshold: kernel.config.thrashingThreshold });
     engine.resetForLeg();
+    engine.onDirectorEvent({ kind: 'leg_entered', legId: leg.id, index: leg.index });
   });
   const unbindInput = installInput({ document: doc, canvas: boot.canvas, pacing, focus, target, structures: () => stage?.structures ?? [], terminal: () => terminal,
     toggleCodex: () => openCodex(), commit, controlsBlocked: () => transitioning || panicked || disposed });

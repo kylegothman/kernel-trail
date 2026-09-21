@@ -4,7 +4,7 @@ import type { KernelEvent } from '@kernel/types';
 import type { QualityTier } from '@platform/quality';
 import { POOL_SPLIT, VOICE_BUDGET, VoiceAllocator } from '../../src/audio/VoiceBudget';
 import { ToneVoice } from '../../src/audio/voices/ToneVoice';
-import { REDUCED_MOTION_ENVELOPE_SCALE } from '../../src/audio/synth/constants';
+import { REDUCED_MOTION_ENVELOPE_SCALE, SEEK_SWEEP } from '../../src/audio/synth/constants';
 import type { FakeParam } from './fakeContext';
 import { GLOBAL_EVENTS, ev, makeRig, nextTick, randomEvents, resetSequence } from './helpers';
 
@@ -65,19 +65,24 @@ describe('budget', () => {
     expect(allocator.stats.stolen).toBe(3);
   });
 
-  it('exempt voices: the alarm layer and the panic impact are never stolen', () => {
+  it('exempt voices: the score\'s voices and the panic impact are never stolen', () => {
     resetSequence();
     const rig = makeRig('low');
     const allocator = rig.engine.allocator;
-    const alarm = rig.engine.score?.layerVoice('alarm');
-    if (allocator === null || alarm === null || alarm === undefined) throw new Error('missing');
-    expect(alarm.exempt).toBe(true);
+    if (allocator === null) throw new Error('missing');
+    // WP-25 (S2): the score's pad is the voice a world burst must never take.
+    rig.engine.onDirectorEvent({ kind: 'leg_entered', legId: 'boot_sector', index: 0 });
+    rig.idle(3);
+    const pad = rig.engine.voices().find((v) => v.kind === 'drone' && v.busy && v.bus === 'score');
+    if (pad === undefined) throw new Error('no pad');
+    expect(pad.exempt).toBe(true);
     for (let i = 0; i < 12; i++) {
-      const v = allocator.acquire('drone', 'world', 100 + i);
-      expect(v).not.toBe(alarm);
-      v?.start(100 + i, { hz: 100, gain: 0.1, pan: 0, layer: true });
+      const v = allocator.acquire('drone', 'world', rig.fake.currentTime + 0.001 * i);
+      expect(v).not.toBe(pad);
+      expect(v).toBeNull();
     }
-    expect(alarm.busy).toBe(true);
+    expect(pad.busy).toBe(true);
+    expect(pad.bus).toBe('score');
     nextTick();
     rig.frame([ev('kernel.panic', { message: 'halt' })]);
     const panic = rig.engine.voices().find((v) => v.busy && v.kind === 'impact');
@@ -137,7 +142,7 @@ describe('budget', () => {
   });
 
   it('reduced motion halves every envelope time and removes the alarm swell', () => {
-    const attackEnd = (reduced: boolean): { end: number; swells: number; frozen: number } => {
+    const attackEnd = (reduced: boolean): { end: number; played: number; frozen: number } => {
       resetSequence();
       const rig = makeRig('medium', { reducedMotionProbe: () => reduced });
       expect(rig.engine.settings.reducedMotion).toBe(reduced);
@@ -151,13 +156,17 @@ describe('budget', () => {
       rig.frame(events);
       const noise = rig.engine.voices().find((v) => v.kind === 'noise' && v.busy);
       if (noise === undefined) throw new Error('no noise voice');
-      return { end: noise.finishAt - noise.startedAt, swells: rig.engine.score?.alarmSwells ?? -1, frozen: rig.engine.bank.stats.frozen };
+      return { end: noise.finishAt - noise.startedAt, played: rig.engine.bank.stats.played, frozen: rig.engine.bank.stats.frozen };
     };
     const normal = attackEnd(false);
     const reduced = attackEnd(true);
-    expect(reduced.end).toBeCloseTo(normal.end / 2, 6);
-    expect(normal.swells).toBe(1);
-    expect(reduced.swells).toBe(0);
+    // The seek's hold is proportional to distance and is not an envelope time; the envelope around it halves.
+    // (The old assertion measured WP-16's contention layer, whose length was infinite, and passed vacuously.)
+    const hold = (SEEK_SWEEP.baseMs + SEEK_SWEEP.msPerCylinder * 100) / 1000;
+    expect(reduced.end - hold).toBeCloseTo((normal.end - hold) / 2, 6);
+    // WP-25 (S2): the thrashing cue plays under both settings; there is no alarm layer to remove.
+    expect(normal.played).toBe(2);
+    expect(reduced.played).toBe(normal.played);
     const rig = makeRig('low', { reducedMotionProbe: () => true });
     const tone = rig.engine.voices().find((v): v is ToneVoice => v instanceof ToneVoice);
     if (tone === undefined) throw new Error('no tone');

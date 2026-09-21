@@ -11,14 +11,18 @@ import type { BusId, Voice, VoiceKind } from './voices/Voice';
 export const VOICE_BUDGET: Readonly<Record<QualityTier, number>> = { low: 16, medium: 32, high: 64 };
 
 /**
- * How the budget is split across the five kinds. Four drones and one noise
- * voice are the score's five layers at every tier; the rest is the world's.
- * Each row sums to the tier's budget, asserted by test.
+ * How the budget is split across the kinds, WP-25 section 2. The score's
+ * share: `chord` holds the bass plus the chord voices (two at low, four at
+ * medium and high, one spare at high for the release overlap on a chord
+ * change), one kick, one lead (two at high), one pad drone at low, two at
+ * medium, three at high, and one of the tones is the arp (two at high). The
+ * rest is the world's. A travel section takes 6 voices at low, 9 at medium
+ * and 11 at high. Each row sums to the tier's budget, asserted by test.
  */
 export const POOL_SPLIT: Readonly<Record<QualityTier, Readonly<Record<VoiceKind, number>>>> = {
-  low: { drone: 4, noise: 3, tone: 5, impact: 2, granular: 2 },
-  medium: { drone: 4, noise: 6, tone: 11, impact: 5, granular: 6 },
-  high: { drone: 4, noise: 12, tone: 24, impact: 10, granular: 14 },
+  low: { tone: 5, noise: 2, impact: 2, drone: 1, granular: 1, chord: 3, kick: 1, lead: 1 },
+  medium: { tone: 8, noise: 5, impact: 5, drone: 2, granular: 5, chord: 5, kick: 1, lead: 1 },
+  high: { tone: 22, noise: 10, impact: 8, drone: 3, granular: 12, chord: 6, kick: 1, lead: 2 },
 };
 
 export interface AllocatorStats {

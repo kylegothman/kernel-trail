@@ -449,7 +449,7 @@ describe('browser session assembly', () => {
     expect(clock.pending).toBe(0);
   });
 
-  it('keeps audio suspended when a paused session becomes visible', async () => {
+  it('keeps audio running through a pause, suspends it while hidden, and resumes it when visible again', async () => {
     const f = await startTravel();
     const context = new FakeContext();
     vi.spyOn(AudioAdapter.prototype, 'context', 'get').mockReturnValue(context);
@@ -458,13 +458,16 @@ describe('browser session assembly', () => {
     f.boot.canvas.tabIndex = 0; f.boot.canvas.focus();
     document.dispatchEvent(new KeyboardEvent('keydown', { code: 'Space', key: ' ' }));
     expect(f.session.loop.currentTimeScale).toBe(0);
-    expect(context.state).toBe('suspended');
+    // WP-25 (S3): a held clock is a moment, not silence; the score plays through the pause. Only a hidden tab suspends.
+    expect(suspend).not.toHaveBeenCalled();
+    expect(context.state).toBe('running');
     const visible = vi.spyOn(document, 'visibilityState', 'get').mockReturnValue('hidden');
     document.dispatchEvent(new Event('visibilitychange'));
-    visible.mockReturnValue('visible'); document.dispatchEvent(new Event('visibilitychange'));
-    expect(resume).not.toHaveBeenCalled();
     expect(suspend).toHaveBeenCalled();
     expect(context.state).toBe('suspended');
+    visible.mockReturnValue('visible'); document.dispatchEvent(new Event('visibilitychange'));
+    expect(resume).toHaveBeenCalled();
+    expect(context.state).toBe('running');
   });
 
   it('resumes a provisional save with every prior module and the saved kernel tick and decisions', async () => {
