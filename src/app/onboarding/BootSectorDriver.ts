@@ -149,7 +149,10 @@ export class BootSectorDriver {
     const title = this.host.document.createElement('h2'); title.className = 'kt-headline'; title.textContent = beat.title;
     const line = this.host.document.createElement('p'); line.className = 'kt-beat-hint'; line.textContent = hintFor(beat);
     card.append(title, line);
-    Object.assign(card.style, { pointerEvents: 'none', position: 'absolute', left: '50%', top: '12%', transform: 'translateX(-50%)', maxWidth: '40%' });
+    // In the safe-inset band above the panels' top edge (18 percent), above them in the stack, and never a hit target.
+    Object.assign(card.style, { pointerEvents: 'none', position: 'absolute', left: '50%', top: 'max(24px, 2.5vh)', transform: 'translateX(-50%)', maxWidth: '56%', zIndex: '6', padding: '6px 12px', boxSizing: 'border-box' });
+    title.style.cssText = 'margin:0;font-size:12px;font-weight:500;letter-spacing:0.06em;text-transform:uppercase;line-height:1.4';
+    line.style.cssText = 'margin:2px 0 0;font-size:14px;line-height:1.4';
     this.host.overlay.append(card);
     this.card = card;
   }

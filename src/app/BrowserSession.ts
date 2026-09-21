@@ -217,6 +217,9 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
     if (!disposed) for (const panel of panels) panel.flush();
     const interactions = interactionPanel.element;
     if (interactions !== null) interactions.hidden = card !== null || stones.size > 0;
+    // While the terminal is open the panels sit dimmed beneath it.
+    const dimmed = terminal?.isOpen === true;
+    for (const panel of panels) { const element = panel.element; if (element !== null) element.style.opacity = dimmed ? '0.3' : ''; }
     hud.setPace(paceLabel(pacing));
   };
   /** WP-24 section 1: every card asks a question, so every card holds the clock while it is up. */
@@ -382,7 +385,8 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
         if (transitioning || panicked || disposed || runner.kernel !== kernel) return;
         bus.apply({ kind: 'terminal', line: [name, ...argv].join(' ') }, { source: 'terminal', legId: leg.id }, kernel.tick);
       });
-      next.element.style.pointerEvents = 'auto'; boot.overlay.append(next.element); terminal = next;
+      // The M3 playtest found the terminal painted behind the panels appended after it: it is the topmost layer while open.
+      next.element.style.pointerEvents = 'auto'; next.element.style.zIndex = '20'; boot.overlay.append(next.element); terminal = next;
     });
     engine.setConvoyPids(runStore.get().convoy.flatMap(member => member.pid === null ? [] : [member.pid]));
     engine.resetForLeg();

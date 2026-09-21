@@ -283,6 +283,16 @@ export async function playTutorial(context, baseUrl, backend, expectations, time
     await page.locator('input[aria-label="terminal input"]').waitFor({ timeout });
     const prompt = await page.locator('.kt-terminal').textContent();
     assert(prompt?.includes('> '), `the terminal shows the one character prompt: ${JSON.stringify(prompt?.slice(0, 80))}`);
+    // The M3 playtest found the terminal painted behind the panels: while it is open it is the topmost layer and the panels are dimmed.
+    const layered = await page.evaluate(() => {
+      const anchors = document.querySelector('.kt-panel--interactions');
+      const r = anchors.getBoundingClientRect();
+      const at = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+      return { overTerminal: at !== null && document.querySelector('.kt-terminal').contains(at), anchorsOpacity: getComputedStyle(anchors).opacity };
+    });
+    console.log(`playthrough terminal layering: ${JSON.stringify(layered)}`);
+    same('elementFromPoint at the centre of the Anchors panel with the terminal open', layered.overTerminal, true);
+    assert(Number(layered.anchorsOpacity) < 1, `the Anchors panel is dimmed under the terminal: opacity ${layered.anchorsOpacity}`);
     // Pre-flight ruling 9.3: a terminal line is a decision. The ruling named `sched rr`, which the Boot Sector's shell does not carry (its
     // sixteen commands are the base fourteen plus man, syscall and mode), so the leg's own `syscall getpid` is the command that
     // mutates through the sink; it records its syscall and its line once each, in that order.
@@ -297,6 +307,15 @@ export async function playTutorial(context, baseUrl, backend, expectations, time
     // 6. The trap: the requisition opens and holds the clock; a question open stops time (section 1).
     await arrived('beat.trap');
     await page.locator('.kt-panel--requisition').waitFor({ timeout });
+    // The beat card is never covered by a panel: its box and the requisition's do not intersect.
+    const boxes = await page.evaluate(() => {
+      const card = document.querySelector('.kt-card--beat').getBoundingClientRect();
+      const panel = document.querySelector('.kt-panel--requisition').getBoundingClientRect();
+      const intersects = card.left < panel.right && panel.left < card.right && card.top < panel.bottom && panel.top < card.bottom;
+      return { intersects, card: [card.left, card.top, card.right, card.bottom].map(Math.round), panel: [panel.left, panel.top, panel.right, panel.bottom].map(Math.round) };
+    });
+    console.log(`playthrough beat card versus the requisition: ${JSON.stringify(boxes)}`);
+    same('the beat card does not intersect the requisition panel', boxes.intersects, false);
     const held = await readSeam(page);
     await page.waitForTimeout(2000);
     const stillHeld = await readSeam(page);
