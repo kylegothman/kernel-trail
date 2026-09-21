@@ -6,7 +6,16 @@
  * proves that the browser's frame loop drives the kernel exactly as the
  * headless harness's pump does: the per-leg event-log hashes are equal.
  *
- * Two runs per backend. The reload run (pre-flight ruling 3) starts the Boot
+ * Three runs per backend (WP-24 section 6). The tutorial run comes first on
+ * a fresh profile: the eight beats driven through the real UI, each exit
+ * asserted in order, the decisions the harness's known-good script records,
+ * the pacing rule with a question open, and the profile flag. The reload and
+ * journey runs then take Skip tutorial, which a completed profile is offered
+ * once, so a skipped tutorial is the passive leg (pre-flight ruling 9.1).
+ * The player's clock is two ticks a second; both runs step to four with the
+ * bracket key, real input, so a passive Boot Sector is fifty seconds.
+ *
+ * The reload run (WP-23 pre-flight ruling 3) starts the Boot
  * Sector, reloads the page at tick twenty or later, continues from the title
  * screen's Continue button and plays the leg out. Its losslessness proof is
  * three hashes: the leg's own hash equals an uninterrupted run's, the hash
@@ -42,7 +51,7 @@ export const LEGS = ['boot_sector', 'quantum_pass', 'the_narrows', 'allocation_y
  */
 const SKIPPED = { quantum_pass: ['fork_fields', 'the_weave'], the_narrows: [], allocation_yards: ['the_cistern', 'the_gridlock'] };
 const RELOAD_AT_TICK = 20;
-/** The whole playthrough per backend; twelve minutes is the document's hard timeout for CI. */
+/** The whole playthrough per backend; twelve minutes is the document's hard timeout for CI. WP-24 adds the tutorial run and a slower clock; the budget is held by stepping to four ticks a second. */
 const HARD_TIMEOUT_MS = 12 * 60_000;
 
 /**
@@ -61,6 +70,13 @@ export async function prepareExpectations() {
     const { HarnessSession, runLegInSession } = await import('../legs/harness/LegHarness.ts');
     const { tryLoadLegForTest } = await import('../legs/harness/loadLeg.ts');
     const { readGolden } = await import('../legs/harness/goldenLog.ts');
+    const { DB_NAME } = await import('../../src/game/save.ts');
+    const { BOOT_SECTOR_COMPLETED_KEY } = await import('../../src/game/persist/SaveService.ts');
+    const { ONBOARDING } = await import('../../src/legs/boot_sector/onboarding.ts');
+    const { KNOWN_GOOD_SCRIPT } = await import('../legs/boot_sector/scripts.ts');
+    const { describeChoice } = await import('../../src/game/CommandBus.ts');
+    // What the harness records for a terminal step of `syscall getpid`: one terminal decision with the line, and nothing else, because the harness never runs the shell.
+    const harnessTerminalStep = { kind: 'terminal', choice: describeChoice({ kind: 'terminal', line: 'syscall getpid' }) };
     const loaded = [];
     for (const id of LEGS) {
       const result = await tryLoadLegForTest(id);
@@ -92,7 +108,12 @@ export async function prepareExpectations() {
     const golden = readGolden('quantum_pass', 'bad');
     assert(golden !== null, 'tests/golden/legs/quantum_pass.bad.fingerprint.txt is missing');
     for (const id of LEGS) console.log(`playthrough harness ${id}: hash=${legs[id].hash} ticks=${legs[id].ticks} events=${legs[id].events} headline=${JSON.stringify(legs[id].headline)} entering=${JSON.stringify(legs[id].enteringLedger)}`);
-    return { seed: SEED, legs, quantumPassBadGolden: golden.fingerprint.hash };
+    // The known-good script's own records for the four things the tutorial run must leave in run.decisions, in the script's order.
+    const scripted = KNOWN_GOOD_SCRIPT.steps.filter(step => step.command.kind === 'terminal' && step.command.line === 'man EPERM'
+      || step.command.kind === 'interaction' && ['boot.direct_reach', 'boot.trap_purchase', 'boot.choose_disc'].includes(step.command.id))
+      .map(step => ({ kind: step.command.kind, choice: describeChoice(step.command) }));
+    return { seed: SEED, legs, quantumPassBadGolden: golden.fingerprint.hash, dbName: DB_NAME, flagKey: BOOT_SECTOR_COMPLETED_KEY,
+      beats: ONBOARDING.map(beat => beat.id), scripted, harnessTerminalStep };
   } finally {
     await unregister();
   }
@@ -125,13 +146,172 @@ async function openTitle(page, baseUrl, timeout) {
   await page.getByRole('button', { name: 'New run', exact: true }).waitFor({ timeout });
 }
 
-async function startNewRun(page, timeout) {
+/** Start a new run; with `skip`, take the Skip tutorial card a completed profile is offered. Then step the clock to four ticks a second. */
+async function startNewRun(page, timeout, { skip = false } = {}) {
   await page.locator('select[name="disc-class"]').selectOption('shell');
   await page.locator('select[name="difficulty"]').selectOption('operator');
   await page.locator('select[name="quality"]').selectOption('low');
   await page.getByRole('button', { name: 'New run', exact: true }).click();
+  if (skip) {
+    const card = page.locator('.kt-card--tutorial');
+    await card.waitFor({ timeout });
+    console.log(`playthrough skip: ${JSON.stringify(await card.textContent())}`);
+    await card.getByRole('button', { name: 'Skip tutorial', exact: true }).click();
+  }
   await waitForLegRail(page, 'The Boot Sector', timeout);
   await waitForSeam(page, timeout);
+  await page.keyboard.press(']'); await page.keyboard.press(']');
+  const pace = await page.locator('.kt-pace').textContent();
+  console.log(`playthrough pace after two bracket presses: ${JSON.stringify(pace)}`);
+}
+
+const readBeat = page => page.evaluate(() => globalThis.__kernelTrailDebug?.beat() ?? null);
+
+/** Resolves when the driver reports `beat`, or null once the tutorial is done. */
+async function waitForBeat(page, beat, timeout) {
+  await page.waitForFunction(expected => (globalThis.__kernelTrailDebug?.beat() ?? null) === expected, beat, { timeout, polling: 50 });
+}
+
+const decisionsOf = page => page.evaluate(() => globalThis.__kernelTrailDebug.run().decisions.map(record => ({ kind: record.kind, choice: record.choice, outcome: record.outcome })));
+
+async function terminalSubmit(page, line) {
+  const input = page.locator('input[aria-label="terminal input"]');
+  await input.fill(line);
+  await input.press('Enter');
+}
+
+/** The tutorial on a fresh profile: the eight beats through the real UI, each exit in order. Returns the wall time each beat took. */
+export async function playTutorial(context, baseUrl, backend, expectations, timeout) {
+  const path = `wp24-tutorial-${backend}`;
+  const page = await context.newPage();
+  const diagnostics = capturePageDiagnostics(page);
+  const timings = [];
+  let previous = performance.now();
+  const arrived = async (beat) => {
+    await waitForBeat(page, beat, timeout);
+    const now = performance.now();
+    timings.push({ beat, wallMs: Math.round(now - previous) });
+    previous = now;
+    console.log(`playthrough tutorial: ${beat} reached (${timings.at(-1).wallMs} ms since the previous beat)`);
+  };
+  try {
+    console.log(`Starting ${path}`);
+    await openTitle(page, baseUrl, timeout);
+    await startNewRun(page, timeout);
+    // 1. Nothing exists: the clock is held for the beat's duration; no tick passes.
+    same('tutorial first beat', await readBeat(page), expectations.beats[0]);
+    const void0 = await readSeam(page);
+    const pace = await page.locator('.kt-pace').textContent();
+    console.log(`playthrough tutorial: pace during beat.void ${JSON.stringify(pace)}`);
+    assert.match(pace ?? '', /paused \(beat\.void\)/, 'the pace indicator names the beat one hold');
+    // 2 and 3. The floor writes itself, then the convoy lights.
+    await arrived('beat.floor');
+    const void1 = await readSeam(page);
+    same('ticks during beat.void', void1.tick - void0.tick, 0);
+    // The hold rule's other half: once the beat one hold lifts, the clock advances again.
+    await page.waitForFunction(tick => globalThis.__kernelTrailDebug.tick() > tick, void1.tick, { timeout, polling: 50 });
+    console.log('playthrough tutorial: the clock advanced again once the beat.void hold lifted');
+    await arrived('beat.convoy');
+    // The player clicks a stele: the first to light, at the point the seam projects it to; the rig engages on the hit.
+    await page.waitForFunction(() => globalThis.__kernelTrailDebug.anchorOnScreen('anchor.convoy.lumen') !== null, undefined, { timeout, polling: 50 });
+    for (let attempt = 0; attempt < 20 && (await readBeat(page)) === 'beat.convoy'; attempt++) {
+      const point = await page.evaluate(() => globalThis.__kernelTrailDebug.anchorOnScreen('anchor.convoy.lumen'));
+      assert(point !== null, 'the lumen stele projects onto the screen');
+      await page.mouse.click(point.x, point.y);
+      await page.waitForTimeout(400);
+    }
+    // 4. The reach: release the focus lock with the engage key, then the one verb, and the hard stop.
+    await arrived('beat.reach');
+    await page.keyboard.press('F');
+    const reach = page.getByRole('button', { name: 'Take the blocks', exact: true });
+    await reach.waitFor({ timeout });
+    same('verbs shown in beat.reach', await page.locator('.kt-panel--interactions [data-interaction]').count(), 1);
+    await reach.click();
+    const refusal = page.locator('.kt-panel--interactions .kt-refusal');
+    await refusal.waitFor({ timeout });
+    same('the refusal line on the reach', await refusal.textContent(), 'EPERM. man EPERM.');
+    // 5. The terminal: the hint names the key, the key opens it with the one character prompt, and man EPERM ends the beat.
+    await arrived('beat.terminal');
+    same('the focus hint in beat.terminal', await page.locator('.kt-hint').textContent(), 'terminal  [`] open');
+    await page.keyboard.press('`');
+    await page.locator('input[aria-label="terminal input"]').waitFor({ timeout });
+    const prompt = await page.locator('.kt-terminal').textContent();
+    assert(prompt?.includes('> '), `the terminal shows the one character prompt: ${JSON.stringify(prompt?.slice(0, 80))}`);
+    // Pre-flight ruling 9.3: a terminal line is a decision. The ruling named `sched rr`, which the Boot Sector's shell does not carry (its
+    // sixteen commands are the base fourteen plus man, syscall and mode), so the leg's own `syscall getpid` is the command that
+    // mutates through the sink; it records its syscall and its line once each, in that order.
+    const before = (await decisionsOf(page)).length;
+    await terminalSubmit(page, 'syscall getpid');
+    await page.waitForFunction(count => globalThis.__kernelTrailDebug.run().decisions.length > count, before, { timeout, polling: 50 });
+    const gained = (await decisionsOf(page)).slice(before);
+    console.log(`playthrough tutorial: syscall getpid recorded ${JSON.stringify(gained)}; the harness records ${JSON.stringify(expectations.harnessTerminalStep)} for the same step`);
+    assert.deepEqual(gained.map(record => record.kind), ['syscall', 'terminal'], 'syscall getpid records its syscall and its line, each once, in that order');
+    same('the recorded terminal line', gained[1].choice.replace('[terminal] ', ''), expectations.harnessTerminalStep.choice);
+    await terminalSubmit(page, 'man EPERM');
+    // 6. The trap: the requisition opens and holds the clock; a question open stops time (section 1).
+    await arrived('beat.trap');
+    await page.locator('.kt-panel--requisition').waitFor({ timeout });
+    const held = await readSeam(page);
+    await page.waitForTimeout(2000);
+    const stillHeld = await readSeam(page);
+    same('ticks across two seconds with the requisition open', stillHeld.tick - held.tick, 0);
+    assert.match(await page.locator('.kt-pace').textContent() ?? '', /paused \(requisition\)/, 'the pace indicator names the requisition hold');
+    const requisition = page.locator('.kt-panel--requisition');
+    await requisition.getByRole('button', { name: 'Request memory quota mode', exact: true }).click();
+    await requisition.locator('[aria-label="Request memory quota amount"]').fill('40');
+    await requisition.locator('[aria-label="Request memory quota amount"]').dispatchEvent('change');
+    await requisition.getByRole('button', { name: 'Add Request memory quota', exact: true }).click();
+    await requisition.getByRole('button', { name: 'Submit', exact: true }).click();
+    // 7. The batching lesson: the signage in the heading, until Close.
+    await arrived('beat.batching');
+    const heading = await requisition.locator('h2').textContent();
+    console.log(`playthrough tutorial: requisition heading ${JSON.stringify(heading)}`);
+    assert.match(heading ?? '', /^Trap: 4 cycles/, 'the depot signage states the trap price');
+    await requisition.getByRole('button', { name: 'Close', exact: true }).click();
+    // 8. The gate opens on the next frame and holds in its turn; the pace indicator names it. The leg ends on leg_done; the debrief follows.
+    await arrived('beat.gate');
+    await page.locator('.kt-panel--gate').waitFor({ timeout });
+    assert.match(await page.locator('.kt-pace').textContent() ?? '', /paused \(gate\)/, 'the pace indicator names the gate hold once the requisition has closed');
+    await page.locator('.kt-panel--gate').getByRole('button', { name: 'blocks', exact: true }).click();
+    const end = await waitForDebrief(page, 'boot_sector', timeout);
+    same('tutorial beat after the gate', await readBeat(page), null);
+    const decisions = await decisionsOf(page);
+    const relevant = decisions.filter(record => record.kind === 'leg_done' || record.kind === 'terminal' && record.choice.endsWith('man EPERM')
+      || record.kind === 'interaction' && ['boot.direct_reach', 'boot.trap_purchase', 'boot.choose_disc'].some(id => record.choice.startsWith(`${id} @`)));
+    console.log(`playthrough tutorial: decisions ${JSON.stringify(relevant)}`);
+    // The script reads the manual before it reaches; the tutorial's beats reach first. Same kinds and outcomes, the order the beats fix.
+    const expectedKinds = ['interaction', 'terminal', 'interaction', 'interaction', 'leg_done'];
+    assert.deepEqual(relevant.map(record => record.kind), expectedKinds, 'the reach, the manual, one submission, the gate and leg_done');
+    same('the reach is costly', relevant[0].outcome, 'costly');
+    same('the manual line', relevant[1].choice.replace('[terminal] ', ''), 'man EPERM');
+    same('the submission is good', relevant[2].outcome, 'good');
+    same('the gate is good', relevant[3].outcome, 'good');
+    same('the gate answer', relevant[3].choice, expectations.scripted.find(record => record.choice.startsWith('boot.choose_disc')).choice);
+    same('the gate writes leg_done', relevant[4].choice, 'blocks');
+    same('tutorial legHashes length', end.legHashes.length, 1);
+    assert(end.legHashes[0].ticks < 200, `the tutorial ended on the gate at tick ${end.legHashes[0].ticks}, before the allowance the browser did not pass`);
+    // The profile records the completed Boot Sector.
+    const flag = await page.evaluate(([name, key]) => new Promise((resolve, reject) => {
+      const request = indexedDB.open(name);
+      request.onerror = () => reject(request.error);
+      request.onsuccess = () => {
+        const db = request.result;
+        const get = db.transaction('settings', 'readonly').objectStore('settings').get(key);
+        get.onsuccess = () => { db.close(); resolve(get.result?.value ?? null); };
+        get.onerror = () => { db.close(); reject(get.error); };
+      };
+    }), [expectations.dbName, expectations.flagKey]);
+    same('bootSectorCompleted in the profile', flag, true);
+    const validation = await page.evaluate(() => globalThis.__kernelTrailGpuValidation.snapshot());
+    assert.deepEqual(validation, [], `${path}: native GPU validation`);
+    assert.equal(diagnostics.pageErrors.length, 0, `${path}: page errors`);
+    assert.deepEqual(consoleErrors(diagnostics), [], `${path}: console errors`);
+    return { path, backend, timings, ticks: end.legHashes[0].ticks, hash: end.legHashes[0].hash };
+  } catch (error) {
+    await describeFailure(page, path);
+    console.error(formatPageDiagnostics(diagnostics));
+    throw new Error(`${path}: ${error.stack || String(error)}`);
+  } finally { await page.close(); }
 }
 
 const debrief = page => page.locator('.kt-card--debrief');
@@ -172,7 +352,7 @@ export async function playReload(context, baseUrl, backend, expectations, timeou
     try {
       console.log(`Starting ${path}`);
       await openTitle(page, baseUrl, timeout);
-      await startNewRun(page, timeout);
+      await startNewRun(page, timeout, { skip: true });
       await waitForTick(page, RELOAD_AT_TICK, timeout);
       const observed = await readSeam(page);
       console.log(`playthrough reload: observed tick ${observed.tick} before the reload`);
@@ -192,6 +372,7 @@ export async function playReload(context, baseUrl, backend, expectations, timeou
       await continueButton.click();
       await waitForLegRail(page, 'The Boot Sector', timeout);
       await waitForSeam(page, timeout);
+      await page.keyboard.press(']'); await page.keyboard.press(']');
       const resumed = await readSeam(page);
       console.log(`playthrough reload: tick after resume ${resumed.tick}, tick before reload ${observed.tick}, saved tick ${captured.tick}`);
       same('legId after resume', resumed.legId, 'boot_sector');
@@ -228,7 +409,7 @@ export async function playJourney(context, baseUrl, backend, expectations, timeo
   try {
     console.log(`Starting ${path}`);
     await openTitle(page, baseUrl, timeout);
-    await startNewRun(page, timeout);
+    await startNewRun(page, timeout, { skip: true });
     const seen = [];
     // 2. The Boot Sector, uninterrupted: the equivalence assertion.
     const boot = await waitForDebrief(page, 'boot_sector', timeout);
@@ -294,9 +475,10 @@ export async function runPlaythrough(browser, baseUrl, webgpuAvailable, expectat
     try {
       const outcome = await Promise.race([
         (async () => {
+          const tutorial = await playTutorial(context, baseUrl, backend, expectations, timeout);
           const reload = await playReload(context, baseUrl, backend, expectations, timeout);
           const journey = await playJourney(context, baseUrl, backend, expectations, timeout);
-          return { backend, reload: reload.first, journey };
+          return { backend, tutorial, reload: reload.first, journey };
         })(),
         new Promise((_, reject) => { hardTimer = setTimeout(() => reject(new Error(`the ${backend} playthrough exceeded the hard timeout of ${HARD_TIMEOUT_MS / 60_000} minutes`)), HARD_TIMEOUT_MS); }),
       ]);
