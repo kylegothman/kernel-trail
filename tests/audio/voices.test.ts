@@ -3,6 +3,7 @@ import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { stripComments } from '../kernel/sourceScan';
 import { VOICE_KINDS } from '../../src/audio/voices/Voice';
+import { POOL_SPLIT } from '../../src/audio/VoiceBudget';
 import { ToneVoice } from '../../src/audio/voices/ToneVoice';
 import { ImpactVoice, IMPACT_CHARACTER } from '../../src/audio/voices/ImpactVoice';
 import { GranularVoice } from '../../src/audio/voices/GranularVoice';
@@ -14,11 +15,12 @@ import { FakeParam, FakeNode, type FakeOscillator } from './fakeContext';
 import { GLOBAL_EVENTS, makeRig, randomEvents, resetSequence, REASONS } from './helpers';
 
 describe('voices', () => {
-  it('five voice types: the set is exactly tone, noise, impact, drone, granular', () => {
-    expect([...VOICE_KINDS].sort()).toEqual(['drone', 'granular', 'impact', 'noise', 'tone']);
+  it('eight voice types: WP-16 tone, noise, impact, drone, granular and WP-25 chord, kick, lead', () => {
+    expect([...VOICE_KINDS].sort()).toEqual(['chord', 'drone', 'granular', 'impact', 'kick', 'lead', 'noise', 'tone']);
     const { engine } = makeRig('low');
     const kinds = new Set(engine.voices().map((v) => v.kind));
-    expect([...kinds].sort()).toEqual(['drone', 'granular', 'impact', 'noise', 'tone']);
+    expect([...kinds].sort()).toEqual(['chord', 'drone', 'granular', 'impact', 'kick', 'lead', 'noise', 'tone']);
+    for (const kind of VOICE_KINDS) expect(POOL_SPLIT.low[kind], kind).toBeGreaterThan(0);
   });
 
   it('release: live node count returns to the pool baseline after 1,000 start and stop cycles and to zero after dispose', () => {

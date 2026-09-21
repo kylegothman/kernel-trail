@@ -1,7 +1,11 @@
 /**
- * Synthesised UI sounds for the HUD, the terminal and the codex, package
- * section 7. Quiet, short, in the game's tuning, and the focus pair lasts
- * exactly the camera's 520 ms engage and 380 ms release.
+ * Synthesised UI sounds for the HUD, the terminal and the codex, WP-16
+ * section 7, re-voiced by WP-25 section 5 into the current leg's key: the
+ * accept and the focus pair move between the tonic and the fifth, the alert
+ * is the third under the sixth, the reject is the palette's shaped burst.
+ * Quiet, short, and the focus pair lasts exactly the camera's 520 ms engage
+ * and 380 ms release. `keyTick` is the one sound left as WP-16 made it,
+ * because a terminal should sound like a terminal. The ids are unchanged.
  */
 import type { SoundBank } from '../events/eventSounds';
 

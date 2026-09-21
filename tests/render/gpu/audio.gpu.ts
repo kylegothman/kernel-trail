@@ -12,6 +12,8 @@ import { AudioEngine } from '../../../src/audio/AudioEngine';
 import { generateBuffers, isAudioBufferSet, sameBuffers, transferList, type AudioBufferSet } from '../../../src/audio/buffers';
 import type { AudioContextLike } from '../../../src/audio/context';
 import { VOICE_BUDGET } from '../../../src/audio/VoiceBudget';
+import { barSeconds } from '../../../src/audio/score/Arrangement';
+import { arrangementFor } from '../../../src/audio/score/material';
 import type { QualityTier } from '../../../src/platform/quality';
 import { GLOBAL_EVENTS, randomEvents } from '../../audio/helpers';
 
@@ -48,13 +50,56 @@ function offlineAdapter(offline: OfflineAudioContext, clock: { now: number }): A
   };
 }
 
-function initializeProbe(): void {
+interface TravelRender {
+  readonly peak: number;
+  readonly seconds: number;
+  readonly notes: number;
+  readonly unplaced: number;
+  readonly wallMs: number;
+}
+
+/**
+ * WP-25 section 7: eight bars of the Quantum Pass's travel rendered offline
+ * through the engine itself, before the gesture (an offline context is not
+ * the adapter's context), so a silent or a blown mix fails on the runner.
+ * The peak lands in `info()` and the runner asserts it.
+ */
+async function renderTravel(buffers: AudioBufferSet): Promise<TravelRender> {
+  const bars = 8;
+  const arrangement = arrangementFor('quantum_pass', SEED);
+  const end = bars * barSeconds(arrangement);
+  const seconds = end + 0.5;
+  const offline = new OfflineAudioContext({ numberOfChannels: 2, length: Math.ceil(seconds * SAMPLE_RATE), sampleRate: SAMPLE_RATE });
+  const clock = { now: 0 };
+  const engine = new AudioEngine({ tier: 'high', seed: SEED, buffers, contextFactory: () => offlineAdapter(offline, clock), reducedMotionProbe: () => false });
+  engine.unlock();
+  const score = engine.score;
+  if (score === null) throw new Error(`travel render: no score (${engine.adapter.failureReason ?? 'no reason'})`);
+  if (!score.audition('quantum_pass', 'travel', 0)) throw new Error('travel render: the section did not start');
+  score.scheduleUntil(end, 0);
+  score.stop(end);
+  const stats = engine.stats();
+  const t1 = performance.now();
+  const rendered = await offline.startRendering();
+  const wallMs = performance.now() - t1;
+  let peak = 0;
+  for (let c = 0; c < rendered.numberOfChannels; c++) {
+    const data = rendered.getChannelData(c);
+    for (let i = 0; i < data.length; i++) peak = Math.max(peak, Math.abs(data[i] ?? 0));
+  }
+  engine.dispose();
+  if (!(peak > 0.05 && peak < 1)) throw new Error(`travel render: peak ${peak} is outside (0.05, 1)`);
+  return { peak, seconds: rendered.duration, notes: stats.scoreNotes, unplaced: stats.scoreUnplaced, wallMs };
+}
+
+async function initializeProbe(): Promise<void> {
   const status = document.querySelector<HTMLPreElement>('#status');
   const button = document.querySelector<HTMLButtonElement>('#unlock');
   if (status === null || button === null) throw new Error('probe markup missing');
   const t0 = performance.now();
   const buffers = generateBuffers(SEED, SAMPLE_RATE);
   const mainThreadMs = performance.now() - t0;
+  const travel = await renderTravel(buffers);
   const engine = new AudioEngine({ tier: 'high', seed: SEED, buffers, reducedMotionProbe: () => false });
   let workerReply: Promise<WorkerReply> | null = null;
 
@@ -80,7 +125,11 @@ function initializeProbe(): void {
   const api = {
     info() {
       const ctx = engine.adapter.context;
-      return { state: engine.state, failureReason: engine.adapter.failureReason, sampleRate: ctx?.sampleRate ?? null, bufferRate: buffers.sampleRate, constructions: engine.adapter.contextConstructions, droppedBeforeGesture: engine.bank.stats.dropped };
+      return {
+        state: engine.state, failureReason: engine.adapter.failureReason, sampleRate: ctx?.sampleRate ?? null, bufferRate: buffers.sampleRate,
+        constructions: engine.adapter.contextConstructions, droppedBeforeGesture: engine.bank.stats.dropped,
+        travelPeak: travel.peak, travelSeconds: travel.seconds, travelNotes: travel.notes, travelUnplaced: travel.unplaced, travelRenderMs: travel.wallMs,
+      };
     },
     /** Drop one cue before the gesture, so the autoplay counter is exercised. */
     poke() {
@@ -159,10 +208,8 @@ if (typeof document === 'undefined') {
     scope.postMessage({ ms, set }, transferList(set) as ArrayBuffer[]);
   };
 } else {
-  try {
-    initializeProbe();
-  } catch (error) {
+  initializeProbe().catch((error: unknown) => {
     const err = error instanceof Error ? error : new Error(String(error));
     Object.assign(globalThis, { __kernelTrailAudioProbe: { status: 'failed', error: { message: err.message, stack: err.stack ?? '' } } });
-  }
+  });
 }

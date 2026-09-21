@@ -15,8 +15,9 @@ import type { ImpactCharacter } from './ImpactVoice';
 export type BusId = 'score' | 'world' | 'ui' | 'voice_alerts';
 export const BUS_IDS: readonly BusId[] = ['score', 'world', 'ui', 'voice_alerts'];
 
-export type VoiceKind = 'tone' | 'noise' | 'impact' | 'drone' | 'granular';
-export const VOICE_KINDS: readonly VoiceKind[] = ['tone', 'noise', 'impact', 'drone', 'granular'];
+/** WP-16's five, and WP-25 section 3's three: the pumped saw chord, the kick that triggers the side-chain, the formant lead. */
+export type VoiceKind = 'tone' | 'noise' | 'impact' | 'drone' | 'granular' | 'chord' | 'kick' | 'lead';
+export const VOICE_KINDS: readonly VoiceKind[] = ['tone', 'noise', 'impact', 'drone', 'granular', 'chord', 'kick', 'lead'];
 
 /** The session buffers after upload into the context. */
 export interface UploadedBuffers {
@@ -53,7 +54,11 @@ export interface VoiceParams {
   readonly adsr?: Adsr;
   /** Seconds held at sustain before release. Absent means sustained until `stop`. */
   readonly hold?: number;
-  /** True for score layers: the Score drives `level` itself, no envelope is applied. */
+  /**
+   * True for a score voice. WP-16's layers had the Score drive `level`; WP-25's
+   * sequenced notes keep their envelopes but share the flag, because it is what
+   * keeps the world's deadlock hold and panic stop away from the music.
+   */
   readonly layer?: boolean;
   readonly filterHz?: number;
   readonly filterEndHz?: number;
@@ -67,6 +72,9 @@ export interface VoiceParams {
   readonly intensity?: number;
   readonly pitchJitter?: number;
   readonly removeFundamental?: boolean;
+  /** The lead's vowel at onset and at the end of the note, 0 to 1 along the formant path. WP-25 section 3. */
+  readonly vowel?: number;
+  readonly vowelEnd?: number;
 }
 
 export abstract class Voice {
@@ -74,7 +82,7 @@ export abstract class Voice {
   busy = false;
   bus: BusId = 'world';
   exempt = false;
-  /** True for score layers: the Score owns the level; sweeps leave it alone. */
+  /** True for a score voice: the world's holds and stops leave it alone. */
   layer = false;
   startedAt = 0;
   /** When the current cue is silent. `Infinity` while sustained. */

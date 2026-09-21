@@ -70,14 +70,12 @@ describe('eventSounds', () => {
       const rig = makeRig('medium');
       rig.idle(2);
       const before = { ...rig.engine.bank.stats };
-      const swells = rig.engine.score?.alarmSwells ?? 0;
       const density = rig.engine.consumer.stats.faultDensityUpdates;
       nextTick();
       rig.frame([sampleEvents()[type]]);
       const stats = rig.engine.bank.stats;
       const played = stats.played - before.played;
       const reacted = played > 0
-        || (rig.engine.score?.alarmSwells ?? 0) > swells
         || rig.engine.consumer.stats.faultDensityUpdates > density
         || rig.engine.bank.frozenUntil > rig.fake.currentTime - 1;
       if (EVENT_TREATMENT[type] === 'sound') {
@@ -193,7 +191,8 @@ describe('eventSounds', () => {
     nextTick();
     rig.frame([ev('process.created', { pid: asPid(4), parent: asPid(1), name: 'a' }), ev('disk.seek', { from: 0, to: 100, distance: 100 })]);
     const busyBefore = busyCount(rig);
-    expect(busyBefore).toBeGreaterThan(5);
+    // WP-25 (S4): the two cues; WP-16's five layers no longer sit busy underneath them.
+    expect(busyBefore).toBe(2);
     const t0 = rig.fake.currentTime;
     const seen = new Set(rig.fake.automation().map(({ param, event }) => `${param.owner.id}:${param.name}:${event.time}`));
     nextTick();
@@ -201,15 +200,13 @@ describe('eventSounds', () => {
     const at = t0 + 0.005;
     const until = at + DEADLOCK_HOLD_MS / 1000;
     expect(rig.engine.bank.frozenUntil).toBeCloseTo(until, 6);
-    expect(rig.engine.score?.holdEndsAt).toBeCloseTo(until, 6);
     const fresh = rig.fake.automation().filter(({ param, event }) => !seen.has(`${param.owner.id}:${param.name}:${event.time}`));
     for (const { param, event } of fresh) {
       const inside = event.time > at + 1e-6 && event.time < until - 1e-6;
       expect(inside, `${param.owner.kind}.${param.name} ${event.kind} at ${event.time} moves during the hold`).toBe(false);
     }
-    const alarm = rig.engine.score?.layerVoice('alarm')?.level as unknown as FakeParam;
-    const swell = alarm.events.find((e) => e.kind === 'curve');
-    expect(swell?.time).toBeCloseTo(until, 6);
+    // WP-25 (S4): the hold is the world's; the score has no alarm to swell and keeps time (conductor.test.ts).
+    expect(rig.engine.score?.current).toBeNull();
     nextTick();
     rig.frame([ev('process.created', { pid: asPid(5), parent: asPid(1), name: 'b' })]);
     expect(rig.engine.bank.stats.frozen).toBe(1);
@@ -224,6 +221,8 @@ describe('eventSounds', () => {
   it('panic silence: one impact at full, then 900 ms of scheduled silence', () => {
     resetSequence();
     const rig = makeRig('medium');
+    // WP-25 (S4): a leg is playing, so the panic can be seen to cut the music too.
+    rig.engine.onDirectorEvent({ kind: 'leg_entered', legId: 'boot_sector', index: 0 });
     rig.idle(2);
     nextTick();
     rig.frame(randomEvents(30, 9).filter((e) => e.type !== 'kernel.panic' && e.type !== 'deadlock.detected'));
@@ -231,8 +230,9 @@ describe('eventSounds', () => {
     const t0 = rig.fake.currentTime;
     nextTick();
     rig.frame([ev('kernel.panic', { message: 'halt' })]);
+    rig.engine.onLegEvent({ kind: 'panic', message: 'halt', tick: 1 as never });
     const at = t0 + 0.005;
-    // The five layer voices stay busy by design; the Score holds them at silence.
+    // The score's voices carry `layer` and are the Conductor's; the world's stop leaves one impact.
     const busy = rig.engine.voices().filter((v) => v.busy && !v.layer);
     expect(busy.length).toBe(1);
     expect(busy[0]?.kind).toBe('impact');
@@ -248,10 +248,22 @@ describe('eventSounds', () => {
     }
     expect(rig.engine.bank.stats.played).toBe(played);
     expect(rig.engine.bank.stats.silenced).toBeGreaterThan(0);
-    for (const layer of ['bed', 'pulse', 'strain', 'contention', 'alarm'] as const) {
-      expect(rig.engine.score?.layerGainAt(layer, at + 1), layer).toBeCloseTo(0, 4);
-      expect(rig.engine.score?.layerVoice(layer)?.busy, layer).toBe(true);
+    // WP-25 (S4): the panic leg event cut the score mid-bar. Every score voice but the pad was released at the
+    // event, the pad holds, and the score's trim decays to silence over four bars of the leg's tempo.
+    const score = rig.engine.score;
+    if (score === null) throw new Error('no score');
+    expect(score.current).toBe('panic');
+    const cutAt = t0 + 1 / 60;
+    for (const v of rig.engine.voices()) {
+      if (v.bus !== 'score' || v.kind === 'drone') continue;
+      expect(v.busy, v.kind).toBe(false);
+      expect((v.level as unknown as FakeParam).valueAt(cutAt + 0.25), v.kind).toBeLessThan(0.002);
     }
+    expect(rig.engine.voices().some((v) => v.kind === 'drone' && v.busy)).toBe(true);
+    const bar = 240 / 110;
+    const trim = score.trim.gain as unknown as FakeParam;
+    expect(trim.valueAt(cutAt)).toBeCloseTo(1, 6);
+    expect(trim.valueAt(cutAt + 4 * bar)).toBeCloseTo(0, 6);
     rig.idle(200);
     expect(rig.fake.currentTime).toBeGreaterThan(silenceEnd);
     nextTick();
