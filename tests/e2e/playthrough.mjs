@@ -200,7 +200,11 @@ export async function playTutorial(context, baseUrl, backend, expectations, time
     await startNewRun(page, timeout);
     // 1. Nothing exists: the clock is held for the beat's duration; no tick passes. The anchors panel lists the leg's seven verbs
     // from entry, as WP-22 listed them, and enables none of them before the reach, so the beats cannot be skipped from it.
+    // The driver is mounted on a fresh profile (beat() is non-null and no Skip tutorial card was offered), the world is the void
+    // (the HUD hidden), and the clock is held; the M3 playtest asked for each of these, since it saw the clock run free.
     same('tutorial first beat', await readBeat(page), expectations.beats[0]);
+    same('no skip card on a fresh profile', await page.locator('.kt-card--tutorial').count(), 0);
+    same('the HUD is hidden in beat.void', await page.locator('.kt-hud').isHidden(), true);
     const verbs = page.locator('.kt-panel--interactions [data-interaction]');
     same('verbs listed at entry', await verbs.count(), 7);
     same('verbs enabled before the reach', await page.locator('.kt-panel--interactions [data-interaction] button:enabled').count(), 0);
@@ -210,6 +214,7 @@ export async function playTutorial(context, baseUrl, backend, expectations, time
     assert.match(pace ?? '', /paused \(beat\.void\)/, 'the pace indicator names the beat one hold');
     // 2 and 3. The floor writes itself, then the convoy lights.
     await arrived('beat.floor');
+    same('the HUD appears with the floor', await page.locator('.kt-hud').isVisible(), true);
     const void1 = await readSeam(page);
     same('ticks during beat.void', void1.tick - void0.tick, 0);
     // The hold rule's other half: once the beat one hold lifts, the clock advances again.
