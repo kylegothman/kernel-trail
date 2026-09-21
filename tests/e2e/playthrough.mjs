@@ -218,6 +218,18 @@ export async function playTutorial(context, baseUrl, backend, expectations, time
     await arrived('beat.convoy');
     // The player clicks a stele: the first to light, at the point the seam projects it to; the rig engages on the hit.
     await page.waitForFunction(() => globalThis.__kernelTrailDebug.anchorOnScreen('anchor.convoy.lumen') !== null, undefined, { timeout, polling: 50 });
+    // Pointer events through the real DOM: the HUD container is none with no inline override, and a canvas point inside the safe
+    // inset resolves to the canvas, so a click there is the world's (609585a; the M3 playtest reported nothing clickable).
+    const hit = await page.evaluate(() => {
+      const hud = document.querySelector('.kt-hud');
+      const point = globalThis.__kernelTrailDebug.anchorOnScreen('anchor.convoy.lumen');
+      const at = document.elementFromPoint(point.x, point.y);
+      return { computed: hud === null ? null : getComputedStyle(hud).pointerEvents, inline: hud?.style.pointerEvents ?? null, at: at === null ? null : `${at.tagName}#${at.id}`, point };
+    });
+    console.log(`playthrough pointer: ${JSON.stringify(hit)}`);
+    same('the HUD container is pointer-events none', hit.computed, 'none');
+    same('the HUD container carries no inline pointer-events', hit.inline, '');
+    same('elementFromPoint at a canvas point inside the safe inset', hit.at, 'CANVAS#stage');
     for (let attempt = 0; attempt < 20 && (await readBeat(page)) === 'beat.convoy'; attempt++) {
       const point = await page.evaluate(() => globalThis.__kernelTrailDebug.anchorOnScreen('anchor.convoy.lumen'));
       assert(point !== null, 'the lumen stele projects onto the screen');
@@ -230,6 +242,9 @@ export async function playTutorial(context, baseUrl, backend, expectations, time
     const reach = page.getByRole('button', { name: 'Take the blocks', exact: true });
     await reach.waitFor({ timeout });
     same('verbs shown in beat.reach', await page.locator('.kt-panel--interactions [data-interaction]').count(), 1);
+    // A HUD-layer button is hittable through the real DOM: elementFromPoint at its centre is the button itself.
+    const centre = await reach.evaluate(button => { const r = button.getBoundingClientRect(); const at = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2); return at === button ? 'the button' : `${at?.tagName ?? 'nothing'}.${at?.className ?? ''}`; });
+    same('elementFromPoint at the centre of a HUD button', centre, 'the button');
     await reach.click();
     const refusal = page.locator('.kt-panel--interactions .kt-refusal');
     await refusal.waitFor({ timeout });
