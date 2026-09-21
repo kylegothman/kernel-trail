@@ -126,13 +126,14 @@ function stubHost() {
   const listeners = new Set<(name: string, argv: readonly string[], result: { ok: boolean }) => void>();
   const terminal = { shell: { onCommand: (l: (name: string, argv: readonly string[], result: { ok: boolean }) => void) => { listeners.add(l); return () => { listeners.delete(l); }; } } };
   const restricted: (readonly string[] | null)[] = [];
+  const enabled: (readonly string[] | null)[] = [];
   const rig = realRig();
   let now = 10_000;
   const requisition = new RequisitionPanel({ document: doc, overlay, bus: rig.bus, run: () => rig.store.get(), tick: () => rig.runner.kernel!.tick, clock: () => now });
   const gate = new GatePanel({ document: doc, overlay, bus: rig.bus, run: () => rig.store.get(), tick: () => rig.runner.kernel!.tick });
   const host: DriverHost = {
     document: doc, canvas, run: () => rig.store.get(), structures: () => structures, sceneObject: name => scene.get(name) ?? null,
-    focus, hud, pacing, terminal: () => terminal, interactions: { restrict: ids => { restricted.push(ids); } }, requisition, gate, clock: () => now,
+    focus, hud, pacing, terminal: () => terminal, interactions: { restrict: ids => { restricted.push(ids); }, enableOnly: ids => { enabled.push(ids); } }, requisition, gate, clock: () => now,
   };
   const advance = (ms: number): void => { now += ms; };
   const flush = (): void => { requisition.flush(); gate.flush(); };
@@ -143,7 +144,7 @@ function stubHost() {
   };
   const visible = (id: string): boolean => { const s = structures.find(candidate => candidate.id === id)!; return s.root.visible && s.root.scale.x > 0; };
   const runCommand = (name: string, argv: string[], ok = true): void => { for (const l of listeners) l(name, argv, { ok }); };
-  return { ...rig, host, structures, scene, state, focus, notes, hudElement, pips, hint, pacing, scales, restricted, requisition, gate, overlay, advance, flush, button, visible, runCommand, clock: () => now, listeners };
+  return { ...rig, host, structures, scene, state, focus, notes, hudElement, pips, hint, pacing, scales, restricted, enabled, requisition, gate, overlay, advance, flush, button, visible, runCommand, clock: () => now, listeners };
 }
 
 describe('the Boot Sector driver', () => {
@@ -171,6 +172,9 @@ describe('the Boot Sector driver', () => {
     expect(s.hudElement.hidden).toBe(true);
     expect([...s.pips.children].every(pip => (pip as HTMLElement).hidden)).toBe(true);
     expect(s.pacing.held()).toEqual(['beat.void']);
+    // The seven verbs are listed from entry and none is enabled before the reach, so the beats cannot be skipped from the anchors panel.
+    expect(s.restricted).toEqual([]);
+    expect(s.enabled).toEqual([[]]);
     const blocked = new PointerEvent('pointerdown', { bubbles: true, cancelable: true }); const reached = vi.fn();
     s.host.canvas.addEventListener('pointerdown', reached); s.host.canvas.dispatchEvent(blocked);
     expect(reached).not.toHaveBeenCalled();
@@ -216,6 +220,7 @@ describe('the Boot Sector driver', () => {
     s.state.mode = 'releasing'; driver.update(s.clock());
     expect(s.visible('anchor.block_stack')).toBe(true);
     expect(s.restricted.at(-1)).toEqual(['boot.direct_reach']);
+    expect(s.enabled.at(-1)).toBeNull();
     s.state.mode = 'free';
     s.advance(19_999); driver.update(s.clock()); expect(s.notes).toEqual([]);
     s.advance(1); driver.update(s.clock()); expect(s.notes).toEqual([HINTS['beat.reach']]);
@@ -256,6 +261,7 @@ describe('the Boot Sector driver', () => {
     expect(s.runner.finished).toBe(true);
     expect(beats).toEqual(ONBOARDING.slice(1).map(beat => beat.id));
     expect(s.restricted.at(-1)).toBeNull();
+    expect(s.enabled.at(-1)).toBeNull();
     driver.dispose();
     expect(s.pacing.held()).toEqual([]);
   });

@@ -75,6 +75,20 @@ describe('LegContent.arguments', () => {
     expect(bus.dispatch).toHaveBeenLastCalledWith({ kind: 'interaction', id: 'boot.direct_reach', anchor: 'anchor.block_stack' }, { source: 'world', legId: 'boot_sector' });
   });
 
+  it('enableOnly keeps every verb listed and readable, enables only the named ones, and disables the launchers until cleared', () => {
+    const { leg, content } = legWithGate();
+    const { panel } = panelFor(leg, content);
+    panel.enableOnly([]); panel.flush();
+    expect(overlay.querySelectorAll('[data-interaction]')).toHaveLength(2);
+    expect(overlay.textContent).toContain('Reach for the stack directly.');
+    for (const label of ['Choose a disc class', 'Take the blocks', 'Open depot', 'Open reclamation']) expect(button(label).disabled, label).toBe(true);
+    panel.enableOnly(['boot.direct_reach']); panel.flush();
+    expect(button('Take the blocks').disabled).toBe(false);
+    expect(button('Choose a disc class').disabled).toBe(true);
+    panel.enableOnly(null); panel.flush();
+    for (const label of ['Choose a disc class', 'Take the blocks', 'Open reclamation']) expect(button(label).disabled, label).toBe(false);
+  });
+
   it('restrict shows only the named verbs and withholds the launchers until cleared', () => {
     const { leg, content } = legWithGate();
     const { panel } = panelFor(leg, content);

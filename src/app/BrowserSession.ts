@@ -469,8 +469,6 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
       sceneObject: name => scene.getObjectByName(name) ?? null, focus, hud, pacing, terminal: () => terminal,
       interactions: interactionPanel, requisition: requisitionPanel, gate: gatePanel, clock: () => performance.now(),
     });
-    // The two panels are the tutorial's UI; the anchors panel shows the same verbs only when the tutorial is skipped.
-    interactionPanel.restrict([]);
   }
   async function showLayout(module: LegModule): Promise<void> {
     if (disposed) return;

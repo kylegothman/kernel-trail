@@ -70,7 +70,8 @@ export interface DriverHost {
   readonly hud: DriverHud;
   readonly pacing: Pacing;
   readonly terminal: () => DriverTerminal | null;
-  readonly interactions: { restrict(ids: readonly string[] | null): void };
+  /** The anchors panel: every verb listed from entry, none enabled before beat four, one shown in beat four, all after. */
+  readonly interactions: { restrict(ids: readonly string[] | null): void; enableOnly(ids: readonly string[] | null): void };
   readonly requisition: { open(): void; showSignage(): void; readonly isOpen: boolean };
   readonly gate: { open(): void };
   /** Wall clock in milliseconds. */
@@ -174,6 +175,8 @@ export class BootSectorDriver {
     this.host.hud.element.hidden = true;
     for (const pip of this.pips()) pip.hidden = true;
     this.release = this.host.pacing.hold(this.beat.id);
+    // The seven verbs are listed from entry and read as WP-22 listed them; none is enabled before the reach, so the beats cannot be skipped.
+    this.host.interactions.enableOnly([]);
     // Orbit is added in beat two: until then a pointer on the canvas goes nowhere.
     this.host.document.addEventListener('pointerdown', this.blockOrbit, true);
     this.host.document.addEventListener('wheel', this.blockOrbit, true);
@@ -240,6 +243,7 @@ export class BootSectorDriver {
 
   private revealStack(): void {
     this.reveal(ANCHORS.blockStack);
+    this.host.interactions.enableOnly(null);
     this.host.interactions.restrict(['boot.direct_reach']);
     this.revealedStack = true;
     this.activeMs = 0;
@@ -325,6 +329,7 @@ export class BootSectorDriver {
   private finish(): void {
     if (this.pickerInstalled) { this.host.canvas.removeEventListener('pointerdown', this.picker); this.pickerInstalled = false; }
     this.host.interactions.restrict(null);
+    this.host.interactions.enableOnly(null);
   }
 
   dispose(): void {

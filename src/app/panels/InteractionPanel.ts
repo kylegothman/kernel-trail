@@ -30,6 +30,8 @@ export class InteractionPanel extends DeferredPanel {
   private message = '';
   /** WP-24 section 2: while set, only these verbs render and the crossing, depot and reclamation launchers are withheld. */
   private only: ReadonlySet<string> | null = null;
+  /** While set, every verb is listed but only these are enabled, and the launchers are disabled: the tutorial's beats one to three. */
+  private enabledOnly: ReadonlySet<string> | null = null;
   /** The argument anchor chosen per verb, kept across re-renders. */
   private readonly chosen = new Map<string, string>();
   private readonly controls: { readonly button: HTMLButtonElement; readonly enabled: () => boolean }[] = [];
@@ -53,6 +55,11 @@ export class InteractionPanel extends DeferredPanel {
 
   /** Show only these verbs, or every verb and launcher again with null. The Boot Sector driver uses it for beat 4. */
   restrict(ids: readonly string[] | null): void { this.only = ids === null ? null : new Set(ids); this.invalidate(); }
+
+  /** List every verb but enable only these (an empty list enables none); null enables all again. Rows stay visible so the player can read them. */
+  enableOnly(ids: readonly string[] | null): void { this.enabledOnly = ids === null ? null : new Set(ids); this.invalidate(); }
+
+  private permitted(id: string): boolean { return this.enabledOnly === null || this.enabledOnly.has(id); }
 
   private act(action: () => void): void {
     try { action(); this.message = ''; } catch (error) { this.message = messageOf(error); }
@@ -100,7 +107,7 @@ export class InteractionPanel extends DeferredPanel {
         row.append(paragraph(doc, def.description), paragraph(doc, `Cost: ${resourcesText(def.cost)}`));
         const refusal = this.refusals.text(def.id);
         if (refusal !== null) row.append(refusalElement(doc, refusal));
-        this.controls.push({ button: action, enabled: () => this.travelling() && this.available(def) });
+        this.controls.push({ button: action, enabled: () => this.travelling() && this.permitted(def.id) && this.available(def) });
         section.append(row);
       }
       shell.body.append(section);
@@ -113,16 +120,16 @@ export class InteractionPanel extends DeferredPanel {
       row.append(paragraph(doc, `${def.id} (${def.anchor})`));
       const approach = button(doc, 'Approach', () => this.act(() => this.config.crossing(def, this.config.runner.openCrossing(def))));
       approach.setAttribute('aria-label', `Approach ${def.id}`);
-      this.controls.push({ button: approach, enabled: () => this.travelling() }); row.append(approach); crossings.append(row);
+      this.controls.push({ button: approach, enabled: () => this.travelling() && this.enabledOnly === null }); row.append(approach); crossings.append(row);
     }
     if (content.crossings.length === 0) crossings.append(paragraph(doc, 'No crossings.'));
     shell.body.append(crossings);
     const depotHeading = doc.createElement('h3'); depotHeading.textContent = 'Depot';
     const depot = button(doc, 'Open depot', () => this.act(() => this.config.depot(this.config.runner.openDepot())));
-    this.controls.push({ button: depot, enabled: () => DEPOT_LEGS.includes(leg.id) && this.travelling() });
+    this.controls.push({ button: depot, enabled: () => DEPOT_LEGS.includes(leg.id) && this.travelling() && this.enabledOnly === null });
     const reclamationHeading = doc.createElement('h3'); reclamationHeading.textContent = 'Reclamation';
     const reclamation = button(doc, 'Open reclamation', () => this.act(() => this.config.reclamation(this.config.runner.openReclamation())));
-    this.controls.push({ button: reclamation, enabled: () => this.travelling() });
+    this.controls.push({ button: reclamation, enabled: () => this.travelling() && this.enabledOnly === null });
     shell.body.append(depotHeading, depot, reclamationHeading, reclamation);
   }
 

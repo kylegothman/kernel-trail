@@ -198,8 +198,12 @@ export async function playTutorial(context, baseUrl, backend, expectations, time
     console.log(`Starting ${path}`);
     await openTitle(page, baseUrl, timeout);
     await startNewRun(page, timeout);
-    // 1. Nothing exists: the clock is held for the beat's duration; no tick passes.
+    // 1. Nothing exists: the clock is held for the beat's duration; no tick passes. The anchors panel lists the leg's seven verbs
+    // from entry, as WP-22 listed them, and enables none of them before the reach, so the beats cannot be skipped from it.
     same('tutorial first beat', await readBeat(page), expectations.beats[0]);
+    const verbs = page.locator('.kt-panel--interactions [data-interaction]');
+    same('verbs listed at entry', await verbs.count(), 7);
+    same('verbs enabled before the reach', await page.locator('.kt-panel--interactions [data-interaction] button:enabled').count(), 0);
     const void0 = await readSeam(page);
     const pace = await page.locator('.kt-pace').textContent();
     console.log(`playthrough tutorial: pace during beat.void ${JSON.stringify(pace)}`);
