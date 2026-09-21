@@ -120,6 +120,12 @@ describe('the requisition panel', () => {
     expect(overlay.querySelector('[data-window="quota"]')?.textContent).toContain('2 cycles per quota, lots of 25');
     expect(overlay.querySelector('[data-window="identity"]')?.textContent).toContain('No goods');
     expect(overlay.querySelector('h2')?.textContent).toBe('Requisition');
+    // Submit, its window chooser and Close are pinned in the footer; the windows scroll in the body above them.
+    const footer = overlay.querySelector('.kt-panel--requisition footer');
+    expect(footer?.contains(r.button('Submit'))).toBe(true);
+    expect(footer?.contains(r.field('Submit at window'))).toBe(true);
+    expect(footer?.contains(r.button('Close'))).toBe(true);
+    expect(overlay.querySelector('.kt-panel--requisition > div')?.contains(r.button('Submit'))).toBe(false);
     r.requisition.showSignage(); r.flush();
     expect(overlay.querySelector('h2')?.textContent).toBe(TRAP_SIGNAGE);
     for (const def of ['quota', 'blocks', 'bandwidth', 'manifest', 'identity', 'priority']) {

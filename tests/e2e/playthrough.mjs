@@ -316,6 +316,14 @@ export async function playTutorial(context, baseUrl, backend, expectations, time
     });
     console.log(`playthrough beat card versus the requisition: ${JSON.stringify(boxes)}`);
     same('the beat card does not intersect the requisition panel', boxes.intersects, false);
+    // The M3 playtest found Submit below the panel's visible edge at 1000 px tall: at both viewports it is inside the viewport while the panel is open.
+    for (const [width, height] of [[1280, 720], [1440, 900]]) {
+      await page.setViewportSize({ width, height });
+      await page.waitForTimeout(250);
+      const submitBox = await page.evaluate(() => { const r = document.querySelector('.kt-panel--requisition [aria-label="Submit"]').getBoundingClientRect(); return { left: r.left, top: r.top, right: r.right, bottom: r.bottom, w: innerWidth, h: innerHeight }; });
+      console.log(`playthrough Submit at ${width}x${height}: ${JSON.stringify(submitBox)}`);
+      assert(submitBox.top >= 0 && submitBox.left >= 0 && submitBox.bottom <= submitBox.h && submitBox.right <= submitBox.w, `Submit is inside the ${width}x${height} viewport`);
+    }
     const held = await readSeam(page);
     await page.waitForTimeout(2000);
     const stillHeld = await readSeam(page);

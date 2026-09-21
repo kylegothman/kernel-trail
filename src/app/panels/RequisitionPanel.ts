@@ -114,7 +114,17 @@ export class RequisitionPanel extends DeferredPanel {
     for (const item of state.pending) { const li = doc.createElement('li'); li.textContent = `${item.window}: ${item.amount}`; list.append(li); }
     if (state.pending.length === 0) list.append(paragraph(doc, 'Nothing pending; a submission here carries the window\'s default amount.'));
     pending.append(list);
-    // The trap is raised at one window: the first pending item's, or the chosen one for a bare submission.
+    shell.body.append(pending);
+    const done = doc.createElement('section'); done.setAttribute('aria-label', 'Submissions');
+    const doneHeading = doc.createElement('h3'); doneHeading.textContent = 'Submissions'; done.append(doneHeading);
+    for (const submission of state.submissions) {
+      const items = submission.items.map(item => `${item.window}: ${item.amount}`).join(', ') || 'nothing';
+      done.append(paragraph(doc, `${submission.mode} at ${submission.window ?? 'no window'}; ${items}; ${submission.errno ?? 'ok'}`));
+    }
+    shell.body.append(done);
+    // The trap is raised at one window: the first pending item's, or the chosen one for a bare submission. The chooser, Submit and
+    // its refusal line live in the footer, pinned at the panel's bottom while the windows scroll above them (the M3 playtest found
+    // Submit below the visible edge at 1000 px tall).
     const first = state.pending[0]?.window ?? null;
     const at = doc.createElement('select'); at.setAttribute('aria-label', 'Submit at window');
     for (const def of WINDOWS) { const option = doc.createElement('option'); option.value = def.id; option.textContent = def.service; at.append(option); }
@@ -124,18 +134,9 @@ export class RequisitionPanel extends DeferredPanel {
     const submit = button(doc, `Submit (trap: ${TRAP_COST} cycles)`, () => this.dispatch('boot.trap_purchase', windowAnchor(at.value as WindowId)));
     submit.setAttribute('aria-label', 'Submit');
     submit.disabled = run.resources.cycles < TRAP_COST;
-    pending.append(at, submit);
+    shell.footer.append(at, submit, button(doc, 'Close', () => { this.close(); this.config.onClose?.(); }));
     const refusal = this.refusals.text('boot.trap_purchase');
-    if (refusal !== null) pending.append(refusalElement(doc, refusal));
-    shell.body.append(pending);
-    const done = doc.createElement('section'); done.setAttribute('aria-label', 'Submissions');
-    const doneHeading = doc.createElement('h3'); doneHeading.textContent = 'Submissions'; done.append(doneHeading);
-    for (const submission of state.submissions) {
-      const items = submission.items.map(item => `${item.window}: ${item.amount}`).join(', ') || 'nothing';
-      done.append(paragraph(doc, `${submission.mode} at ${submission.window ?? 'no window'}; ${items}; ${submission.errno ?? 'ok'}`));
-    }
-    shell.body.append(done);
-    shell.footer.append(button(doc, 'Close', () => { this.close(); this.config.onClose?.(); }));
+    if (refusal !== null) shell.footer.append(refusalElement(doc, refusal));
     this.seenDecisions = run.decisions.length;
   }
 
