@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { LEG_ORDER } from '@game/types';
+import { LEG_ORDER, type LegId } from '@game/types';
 import { createRng } from '@kernel/rng';
 import { stripComments } from '../kernel/sourceScan';
 import {
@@ -64,7 +64,7 @@ describe('material', () => {
       expect(validateArrangement(a), legId).toEqual([]);
       for (const id of SECTION_IDS) expect(a.sections[id].bars, `${legId} ${id}`).toBe(SECTION_BARS[id]);
     }
-    expect(() => arrangementFor('the_void', SEED)).toThrow(/not a leg/);
+    expect(() => arrangementFor('the_void' as LegId, SEED)).toThrow(/not a leg/);
     expect(new GeneratedScoreSource().arrangement('boot_sector', SEED)).toEqual(arrangementFor('boot_sector', SEED));
     expect(GENERATED_SCORE_SOURCE.arrangement('the_portal', 3)).toEqual(arrangementFor('the_portal', 3));
   });
@@ -350,7 +350,7 @@ describe('material', () => {
     const rng = legRng('boot_sector', SEED) as unknown as { label?: string };
     expect(rng.label).toBe('audio/score/boot_sector');
     // Authored legs consume no draws for their material; generated legs draw a fixed sequence.
-    const spy = (legId: string): number => {
+    const spy = (legId: LegId): number => {
       let draws = 0;
       const base = legRng(legId, SEED);
       const counting = new Proxy(base, { get(target, key: keyof typeof base) { const v = target[key]; return typeof v === 'function' ? (...args: unknown[]) => { draws += 1; return (v as (...a: unknown[]) => unknown).apply(target, args); } : v; } });

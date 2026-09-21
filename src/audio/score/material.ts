@@ -21,6 +21,7 @@
  */
 import { createRng } from '@kernel/index';
 import type { Rng } from '@kernel/types';
+import type { LegId } from '@game/types';
 import { midiToHz } from '../synth/tuning';
 import { CHORD_ADSR } from '../voices/ChordVoice';
 import { LEAD_ADSR } from '../voices/LeadVoice';
@@ -36,18 +37,18 @@ import type { MutableVoiceParams, PatchContext, Voicing } from './Sequencer';
 /* ------------------------------------------------------------------ */
 
 /**
- * The fourteen legs in journey order. The audio layer may not take a value
+ * The fourteen legs in journey order. The audio layer may take only types
  * from the game layer, so the order is stated here and the material test
  * holds it equal to `LEG_ORDER`.
  */
-export const JOURNEY: readonly string[] = [
+export const JOURNEY: readonly LegId[] = [
   'boot_sector', 'fork_fields', 'the_weave', 'quantum_pass', 'the_narrows', 'the_cistern', 'the_gridlock',
   'allocation_yards', 'drowned_reach', 'the_platters', 'the_bus', 'the_archive', 'arbiter_wall', 'the_portal',
 ];
 
-export function legIndex(legId: string): number {
+export function legIndex(legId: LegId): number {
   const index = JOURNEY.indexOf(legId);
-  if (index < 0) throw new RangeError(`material: ${legId} is not a leg`);
+  if (index < 0) throw new RangeError(`material: ${String(legId)} is not a leg`);
   return index;
 }
 
@@ -169,7 +170,7 @@ export function hasSeventhOrNinth(c: Chord): boolean {
 export type ArpShape = 'up' | 'up_down';
 
 export interface LegMaterial {
-  readonly legId: string;
+  readonly legId: LegId;
   readonly index: number;
   readonly authored: boolean;
   /** Pitch class of the key root. */
@@ -211,7 +212,7 @@ interface AuthoredSpec {
  * walk lands, so the generated legs between them are related to both
  * neighbours.
  */
-export const AUTHORED: Readonly<Record<string, AuthoredSpec>> = {
+export const AUTHORED: Readonly<Partial<Record<LegId, AuthoredSpec>>> = {
   /** F major, the slowest leg. Warm, and the borrowed Ebmaj7 and the C11 keep the loop from sounding finished. */
   boot_sector: {
     keyPc: 5, mode: 'major', tempo: 110, arp: 'up', barsPerChord: 2,
@@ -279,7 +280,7 @@ export const PROGRESSIONS: Readonly<Record<'minor' | 'dorian', readonly (readonl
 };
 
 /** The per-leg stream. One fork per leg off the audio stream, never a kernel stream. */
-export function legRng(legId: string, seed: number): Rng {
+export function legRng(legId: LegId, seed: number): Rng {
   return createRng(seed | 0, 'audio').fork('score').fork(legId);
 }
 
@@ -298,7 +299,7 @@ export function tempoFor(index: number, rng: Rng): number {
  * `buildArrangement`, on the same stream, so the whole thing is one fixed
  * sequence per leg and seed.
  */
-export function materialFor(legId: string, seed: number, rng: Rng = legRng(legId, seed)): LegMaterial {
+export function materialFor(legId: LegId, seed: number, rng: Rng = legRng(legId, seed)): LegMaterial {
   const index = legIndex(legId);
   const authored = AUTHORED[legId];
   if (authored !== undefined) {
@@ -645,7 +646,7 @@ export function buildArrangement(material: LegMaterial, rng: Rng): Arrangement {
 }
 
 /** The whole thing for a leg and a seed: material, then arrangement, on one stream. */
-export function arrangementFor(legId: string, seed: number): Arrangement {
+export function arrangementFor(legId: LegId, seed: number): Arrangement {
   const rng = legRng(legId, seed);
   return buildArrangement(materialFor(legId, seed, rng), rng);
 }

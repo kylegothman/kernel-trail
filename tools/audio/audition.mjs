@@ -3,8 +3,7 @@
  * WP-25 section 7: render a leg's arrangement, or one section of it, to a
  * WAV through OfflineAudioContext at 48 kHz, deterministically from the
  * seed, and print the file's hash. It is how Kyle listens without playing
- * the game and how a reviewer checks that two renders of one seed are
- * byte-identical.
+ * the game and how a reviewer checks two renders of one seed.
  *
  *   node tools/audio/audition.mjs --leg boot_sector
  *   node tools/audio/audition.mjs --leg quantum_pass --section travel --bars 16
@@ -12,11 +11,18 @@
  *
  * Node has no offline audio context, so this is one file with two
  * branches: under Node it serves itself through a vite dev server and
- * drives the runner's own Chromium; in the browser it builds the graph,
- * the pool, the side-chain and the sequencer over an offline context,
- * schedules the whole render at once, and hands back 16-bit PCM. Without
- * `--section` the render is a tour of every section in the order the game
- * would reach them, ending in a panic cut half way through a bar.
+ * drives the runner's own Chromium; in the browser it builds the real
+ * engine over an offline context and drives its two hooks with the events
+ * the game would send, so what is rendered is the production path: the
+ * pool from POOL_SPLIT, the side-chain, the Conductor's table, the default
+ * volumes. Without `--section` the render is a tour: the events of a leg
+ * in an order the game could reach them, ending in a panic cut mid-bar.
+ *
+ * Two hashes are printed. The WAV's bytes can differ by one 16-bit step in
+ * a fraction of a percent of samples between two renders of one seed,
+ * because Chromium sums a node's inputs in an order that varies per
+ * process; the schedule hash, over every note the sequencer placed and
+ * every event the tour sent, is the same seed's same music.
  */
 
 const IN_BROWSER = typeof document !== 'undefined';
@@ -25,29 +31,30 @@ const DEFAULT_SEED = 0x4b54524c;
 const TIERS = ['low', 'medium', 'high'];
 
 /**
- * The score's slice of the pool per tier, the split the pre-flight
- * approved. `POOL_SPLIT` carries these counts once WP-16's layers have gone
- * (the conductor commit); until then the tool holds them here.
+ * The tour, in bars from the leg's first bar line. Entry runs eight bars into
+ * travel on its own; a crossing plays its eight-bar introduction and one pass
+ * of its loop before it resolves; the debrief plays a full eight; the panic
+ * cuts the bar after it.
  */
-const SCORE_POOL = {
-  low: { chord: 3, kick: 1, lead: 1, tone: 5, drone: 1 },
-  medium: { chord: 5, kick: 1, lead: 1, tone: 8, drone: 2 },
-  high: { chord: 6, kick: 1, lead: 2, tone: 22, drone: 3 },
-};
-
-/** The tour: every section in an order the game could reach them, the panic cut mid-bar at the end. */
 const TOUR = [
-  ['entry', 8], ['travel', 16], ['crossing', 16], ['resolve_good', 4], ['travel', 8], ['loss', 4],
-  ['travel', 8], ['resolve_bad', 4], ['debrief', 8], ['travel', 2.5], ['panic', 4],
+  { atBar: 0, kind: 'leg_entered' },
+  { atBar: 24, kind: 'crossing_open' },
+  { atBar: 40, kind: 'crossing_resolved', succeeded: true, casualties: 0 },
+  { atBar: 52, kind: 'tombstone' },
+  { atBar: 64, kind: 'crossing_open' },
+  { atBar: 72, kind: 'crossing_resolved', succeeded: false, casualties: 0 },
+  { atBar: 84, kind: 'debrief' },
+  { atBar: 94.5, kind: 'panic' },
 ];
+const TOUR_BARS = 98.5;
 
 /* ------------------------------------------------------------------ */
 /* Browser branch                                                      */
 /* ------------------------------------------------------------------ */
 
-function offlineAdapter(offline) {
+function offlineAdapter(offline, clock) {
   return {
-    get currentTime() { return 0; },
+    get currentTime() { return clock.now; },
     sampleRate: offline.sampleRate,
     get state() { return 'running'; },
     destination: offline.destination,
@@ -75,91 +82,61 @@ function toBase64(bytes) {
   return btoa(out);
 }
 
+async function sha256(text) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
 async function renderInBrowser(request) {
-  const [buffersModule, graphModule, budgetModule, tone, drone, chordVoice, kickVoice, leadVoice, sidechainModule, sequencerModule, material, arrangementModule, rngModule, settingsModule] = await Promise.all([
-    import('/src/audio/buffers.ts'), import('/src/audio/graph.ts'), import('/src/audio/VoiceBudget.ts'),
-    import('/src/audio/voices/ToneVoice.ts'), import('/src/audio/voices/DroneVoice.ts'), import('/src/audio/voices/ChordVoice.ts'),
-    import('/src/audio/voices/KickVoice.ts'), import('/src/audio/voices/LeadVoice.ts'), import('/src/audio/synth/sidechain.ts'),
-    import('/src/audio/score/Sequencer.ts'), import('/src/audio/score/material.ts'), import('/src/audio/score/Arrangement.ts'),
-    import('/src/kernel/rng.ts'), import('/src/audio/settings.ts'),
+  const [{ AudioEngine }, { SECTION_IDS, barSeconds }, { legIndex }, { GENERATED_SCORE_SOURCE }] = await Promise.all([
+    import('/src/audio/AudioEngine.ts'), import('/src/audio/score/Arrangement.ts'), import('/src/audio/score/material.ts'), import('/src/audio/score/source.ts'),
   ]);
-  const arrangement = material.arrangementFor(request.leg, request.seed);
-  const sections = arrangementModule.SECTION_IDS;
-  if (request.section !== null && !sections.includes(request.section)) throw new Error(`no section ${request.section}; one of ${sections.join(', ')}`);
-  const plan = request.section === null ? TOUR : [[request.section, request.bars ?? arrangement.sections[request.section].bars]];
-  const bar = arrangementModule.barSeconds(arrangement);
+  const index = legIndex(request.leg);
+  const arrangement = GENERATED_SCORE_SOURCE.arrangement(request.leg, request.seed);
+  if (request.section !== null && !SECTION_IDS.includes(request.section)) throw new Error(`no section ${request.section}; one of ${SECTION_IDS.join(', ')}`);
+  const bar = barSeconds(arrangement);
+  const bars = request.section === null ? TOUR_BARS : (request.bars ?? arrangement.sections[request.section].bars);
   const tail = 1.5;
-  const totalBars = plan.reduce((sum, [, bars]) => sum + bars, 0);
-  const seconds = totalBars * bar + tail;
+  const seconds = bars * bar + tail;
   const offline = new OfflineAudioContext({ numberOfChannels: 2, length: Math.ceil(seconds * SAMPLE_RATE), sampleRate: SAMPLE_RATE });
-  const ctx = offlineAdapter(offline);
-  const buffers = graphModule.uploadBuffers(ctx, buffersModule.generateBuffers(request.seed, SAMPLE_RATE), request.tier);
-  const graph = new graphModule.MasterGraph(ctx, request.tier, buffers);
-  // The level the game plays at: the default score and master volumes.
-  const defaults = settingsModule.DEFAULT_AUDIO_SETTINGS;
-  graph.setBusGain('score', defaults.score, 0, 0.001);
-  graph.setMasterGain(defaults.master, 0);
-  let sequencer = null;
-  const host = {
-    ctx, buffers,
-    busInput: (bus) => (bus === 'score' && sequencer !== null ? sequencer.trim : graph.busInput(bus)),
-    envelopeScale: 1, mono: false, rng: rngModule.createRng(request.seed, 'audio').fork('runtime'),
+  const clock = { now: 0 };
+  const engine = new AudioEngine({ tier: request.tier, seed: request.seed, contextFactory: () => offlineAdapter(offline, clock), reducedMotionProbe: () => false });
+  engine.unlock();
+  const score = engine.score;
+  if (score === null) throw new Error(`the engine did not build: ${engine.adapter.failureReason ?? 'no reason recorded'}`);
+  const schedule = [];
+  score.sequencer.onNote = (part, note, onset, length, section) => {
+    schedule.push(`${section} ${part} ${note.step} ${note.midi} ${note.velocity.toFixed(3)} ${note.cutoff.toFixed(4)} ${onset.toFixed(6)} ${length.toFixed(6)}`);
   };
-  const sidechain = new sidechainModule.Sidechain(sidechainModule.SIDECHAIN_DEPTH[request.tier], () => 1);
-  const allocator = new budgetModule.VoiceAllocator(budgetModule.VOICE_BUDGET[request.tier]);
-  const pool = SCORE_POOL[request.tier];
-  const make = (count, factory) => {
-    for (let i = 0; i < count; i++) {
-      const voice = factory();
-      voice.warmUp(0);
-      allocator.register(voice);
-      if (voice instanceof drone.DroneVoice) sidechain.register(voice.gate);
+  const send = (step) => {
+    schedule.push(`event ${step.kind} ${clock.now.toFixed(6)}`);
+    switch (step.kind) {
+      case 'leg_entered': engine.onDirectorEvent({ kind: 'leg_entered', legId: request.leg, index }); return;
+      case 'crossing_resolved': engine.onDirectorEvent({ kind: 'crossing_resolved', succeeded: step.succeeded, casualties: step.casualties }); return;
+      case 'leg_exit': engine.onDirectorEvent({ kind: 'leg_exit' }); return;
+      default: engine.onLegEvent({ kind: step.kind }); return;
     }
   };
-  make(pool.chord, () => new chordVoice.ChordVoice(host, sidechain));
-  make(pool.kick, () => new kickVoice.KickVoice(host, sidechain));
-  make(pool.lead, () => new leadVoice.LeadVoice(host));
-  make(pool.tone, () => new tone.ToneVoice(host));
-  make(pool.drone, () => new drone.DroneVoice(host));
-  // The schedule, as text, for a hash that does not depend on how the platform sums a node's inputs.
-  const schedule = [];
-  const originalAcquire = allocator.acquire.bind(allocator);
-  allocator.acquire = (kind, bus, when, exempt) => { const voice = originalAcquire(kind, bus, when, exempt); schedule.push(`${kind}@${when.toFixed(6)}${voice === null ? ' unplaced' : ''}`); return voice; };
-  const voicing = Object.fromEntries(Object.entries(material.SCORE_VOICING).map(([part, v]) => [part, { ...v, patch: (n, c, out) => { v.patch(n, c, out); schedule.push(`${part} ${c.section.id} ${n.step} ${n.midi} ${n.velocity.toFixed(3)} ${n.cutoff.toFixed(4)} ${c.seconds.toFixed(6)}`); } }]));
-  sequencer = new sequencerModule.Sequencer({ ctx, allocator, voicing, envelopeScale: 1, scoreBus: graph.busInput('score') });
-
-  // The plan walks bar by bar through the hook; a panic entry is a cut, applied between two scheduling passes.
-  let entry = 0;
-  let remaining = plan[0][1];
-  let cutAt = null;
-  let before = 0;
-  for (const [id, bars] of plan) {
-    if (id === 'panic') { cutAt = before * bar; break; }
-    before += bars;
-  }
-  sequencer.onBar = (info) => {
-    if (info.section === 'panic') return info.barInSection >= info.bars ? 'end' : null;
-    if (remaining > 0) { remaining -= 1; return null; }
-    entry += 1;
-    const next = plan[entry];
-    if (next === undefined || next[0] === 'panic') return 'end';
-    remaining = next[1] - 1;
-    return next[0];
-  };
-  const started = sequencer.start(arrangement, plan[0][0], 0);
-  if (started !== 'ok') throw new Error(`sequencer: ${started}`);
-  remaining -= 1;
-  if (cutAt === null) {
-    sequencer.scheduleUntil(seconds, 0);
+  if (request.section === null) {
+    // The leg's first bar line is the lead the Conductor gives a live start; the tour's bars count from it.
+    clock.now = -0.02;
+    send(TOUR[0]);
+    for (const step of TOUR.slice(1)) {
+      const t = step.atBar * bar;
+      score.scheduleUntil(t, 0);
+      clock.now = t;
+      send(step);
+    }
+    score.scheduleUntil(bars * bar + tail, 0);
   } else {
-    sequencer.scheduleUntil(cutAt, 0);
-    sequencer.cut(cutAt);
-    sequencer.scheduleUntil(seconds, 0);
+    if (!score.audition(request.leg, request.section, 0)) throw new Error(`${request.section} did not start`);
+    const end = bars * bar;
+    score.scheduleUntil(end, 0);
+    score.stop(end);
   }
-  const stats = { ...sequencer.stats, stolen: allocator.stats.stolen, dropped: allocator.stats.dropped, kicks: sidechain.stats.triggers };
-  const scheduleText = schedule.join('\n');
-  const scheduleDigest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(scheduleText));
-  const scheduleHash = [...new Uint8Array(scheduleDigest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+  const stats = engine.stats();
+  const timeline = score.conductor.timeline.map((e) => `${e.section}@${e.time.toFixed(2)}`);
+  const scheduleHash = await sha256(schedule.join('\n'));
   const rendered = await offline.startRendering();
   const left = rendered.getChannelData(0);
   const right = rendered.getChannelData(1);
@@ -172,11 +149,12 @@ async function renderInBrowser(request) {
     pcm[2 * i] = Math.round(l * 32767);
     pcm[2 * i + 1] = Math.round(r * 32767);
   }
+  engine.dispose();
   return {
     base64: toBase64(new Uint8Array(pcm.buffer)),
-    seconds: rendered.duration, peak, stats, scheduleHash, scheduled: schedule.length,
+    seconds: rendered.duration, peak, scheduleHash, scheduled: schedule.length, timeline,
+    stats: { notes: stats.scoreNotes, unplaced: stats.scoreUnplaced, errors: stats.scoreErrors, stolen: stats.voicesStolen, dropped: stats.voicesDropped, peakVoices: stats.voicesPeak },
     arrangement: { tempo: arrangement.tempo, rootMidi: arrangement.rootMidi, mode: arrangement.mode, swing: arrangement.swing },
-    plan: plan.map(([id, bars]) => `${id} x${bars}`),
   };
 }
 
@@ -206,14 +184,14 @@ function parseArgs(argv) {
   }
   if (out.leg === null) throw new Error('--leg is required');
   if (!TIERS.includes(out.tier)) throw new Error(`--tier must be one of ${TIERS.join(', ')}`);
-  if (out.bars !== null && !(out.bars > 0)) throw new Error('--bars must be positive');
+  if (out.bars !== null && !(Number.isInteger(out.bars) && out.bars > 0)) throw new Error('--bars must be a positive whole number');
+  if (out.bars !== null && out.section === null) throw new Error('--bars needs --section; the tour has its own length');
   if (!Number.isInteger(out.seed)) throw new Error('--seed must be an integer');
-  if (out.section !== null && out.bars !== null && !Number.isInteger(out.bars)) throw new Error('--bars must be a whole number');
   return out;
 }
 
 function usage() {
-  console.log('usage: node tools/audio/audition.mjs --leg <leg_id> [--section <id>] [--bars <n>] [--seed <n>] [--tier low|medium|high] [--out <file.wav>]');
+  console.log('usage: node tools/audio/audition.mjs --leg <leg_id> [--section <id> [--bars <n>]] [--seed <n>] [--tier low|medium|high] [--out <file.wav>]');
 }
 
 function wavBytes(pcmBytes, channels, sampleRate) {
@@ -269,13 +247,11 @@ async function main() {
     const peakDb = result.peak > 0 ? (20 * Math.log10(result.peak)).toFixed(1) : '-inf';
     console.log(`leg ${args.leg}  tier ${args.tier}  seed ${args.seed}`);
     console.log(`tempo ${result.arrangement.tempo}  root midi ${result.arrangement.rootMidi}  mode ${result.arrangement.mode}  swing ${result.arrangement.swing.toFixed(3)}`);
-    console.log(`plan ${result.plan.join(', ')}`);
-    console.log(`notes ${result.stats.notes}  unplaced ${result.stats.unplaced}  kicks ${result.stats.kicks}  bars ${result.stats.bars}  stolen ${result.stats.stolen}`);
+    console.log(`sections ${result.timeline.join(', ')}`);
+    console.log(`notes ${result.stats.notes}  unplaced ${result.stats.unplaced}  errors ${result.stats.errors}  stolen ${result.stats.stolen}  dropped ${result.stats.dropped}  peak voices ${result.stats.peakVoices}`);
     console.log(`rendered ${result.seconds.toFixed(2)} s in ${(renderMs / 1000).toFixed(1)} s  peak ${result.peak.toFixed(3)} (${peakDb} dBFS)`);
     console.log(`wav ${outPath}`);
     console.log(`sha256 ${hash}`);
-    // Chromium sums a node's inputs in an order that varies per process, so two renders of one seed can differ by
-    // one 16-bit step in a fraction of a percent of samples. The schedule hash is the same seed's same music.
     console.log(`schedule sha256 ${result.scheduleHash} (${result.scheduled} events)`);
   } finally {
     await browser.close();

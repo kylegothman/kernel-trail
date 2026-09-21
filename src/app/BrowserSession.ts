@@ -339,7 +339,6 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
       next.element.style.pointerEvents = 'auto'; boot.overlay.append(next.element); terminal = next;
     });
     engine.setConvoyPids(runStore.get().convoy.flatMap(member => member.pid === null ? [] : [member.pid]));
-    engine.setThresholds({ thrashingThreshold: kernel.config.thrashingThreshold });
     engine.resetForLeg();
   });
   const unbindInput = installInput({ document: doc, canvas: boot.canvas, loop, focus, target, structures: () => stage?.structures ?? [], terminal: () => terminal,

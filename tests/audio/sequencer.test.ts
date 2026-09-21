@@ -476,7 +476,7 @@ function makeVoices(tier: QualityTier = 'medium', envelopeScale = 1): VoicePool 
   const kick = new KickVoice(host, sidechain);
   const lead = new LeadVoice(host);
   const pad = new DroneVoice(host);
-  sidechain.register(pad.gate);
+  sidechain.register(pad.gate, false);
   for (const v of [chord, kick, lead, pad]) { v.warmUp(0); v.bus = 'score'; }
   return { fake, sidechain, chord, kick, lead, pad, bus, setScale: (next) => { scale = next; } };
 }
@@ -521,6 +521,8 @@ describe('score voices', () => {
     const p = makeVoices('high');
     p.sidechain.duck(2);
     expect(p.sidechain.isDucked).toBe(true);
+    // The pad's gate pumps with the kick but is the low bed the duck leaves standing.
+    expect(param(p.pad.gate).events.filter((e) => e.time >= 2).length).toBe(0);
     const duck = param(p.chord.duckParam);
     expect(duck.valueAt(2)).toBeCloseTo(1, 6);
     expect(duck.valueAt(2 + DEREZZ_DUCK_MS / 2000)).toBeCloseTo(0.5, 2);

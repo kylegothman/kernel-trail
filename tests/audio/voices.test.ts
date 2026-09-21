@@ -19,8 +19,8 @@ describe('voices', () => {
     expect([...VOICE_KINDS].sort()).toEqual(['chord', 'drone', 'granular', 'impact', 'kick', 'lead', 'noise', 'tone']);
     const { engine } = makeRig('low');
     const kinds = new Set(engine.voices().map((v) => v.kind));
-    // The pool holds every kind the split gives a slot; the three new kinds take theirs when WP-16's layers go.
-    expect([...kinds].sort()).toEqual(VOICE_KINDS.filter((k) => POOL_SPLIT.low[k] > 0).sort());
+    expect([...kinds].sort()).toEqual(['chord', 'drone', 'granular', 'impact', 'kick', 'lead', 'noise', 'tone']);
+    for (const kind of VOICE_KINDS) expect(POOL_SPLIT.low[kind], kind).toBeGreaterThan(0);
   });
 
   it('release: live node count returns to the pool baseline after 1,000 start and stop cycles and to zero after dispose', () => {

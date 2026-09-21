@@ -9,10 +9,11 @@ import type { KernelEventOf, KernelEventType, Pid } from '@kernel/types';
 import { CORRUPTION, DUR, FOCUS_DURATION_MS, PANIC_POST } from '@design/motion';
 import type { Adsr } from '../synth/envelope';
 import { centsToRatio, pitchForPid, pitchHz } from '../synth/tuning';
-import { DIRTY_EVICT_EXTRA_MS, RACE_BEAT_CENTS, SEEK_SWEEP } from '../synth/constants';
+import { DEADLOCK_HOLD_MS, DIRTY_EVICT_EXTRA_MS, RACE_BEAT_CENTS, SEEK_SWEEP } from '../synth/constants';
 import type { VoiceAllocator } from '../VoiceBudget';
 import type { BusId, Voice, VoiceKind } from '../voices/Voice';
 import { IMPACT_CHARACTER, IMPACT_PRESETS, impactDuration, type ImpactCharacter } from '../voices/ImpactVoice';
+import type { Mode } from '../score/Arrangement';
 import type { Score } from '../score/Score';
 
 /** What the bank needs from the engine. */
@@ -21,7 +22,10 @@ export interface SoundHost {
   readonly ready: boolean;
   readonly now: number;
   readonly rootMidi: number;
+  /** WP-25: the current leg's mode, so pitched cues sit in its key. */
+  readonly mode: Mode;
   readonly allocator: VoiceAllocator | null;
+  /** WP-25: the score facade; the bank asks it for the grid and nothing else. */
   readonly score: Score | null;
   isConvoy(pid: Pid): boolean;
 }
@@ -111,13 +115,12 @@ export class SoundBank {
   }
 
   /**
-   * The derezz. A convoy Program ducks the score first (package line 228);
-   * an anonymous process is the same impact at a fraction of the weight.
+   * The derezz. A convoy Program is the impact at full weight and an
+   * anonymous process a fraction of it; the score's duck now follows the
+   * tombstone event through the Conductor (WP-25 section 4), not this cue.
    */
   processExited(e: KernelEventOf<'process.exited'>, pan: number): void {
-    const at = this.at();
     const convoy = this.host.isConvoy(e.pid);
-    if (convoy) this.host.score?.duck(at);
     const p = IMPACT;
     p.impact = IMPACT_CHARACTER[e.reason]; p.gain = convoy ? 1 : 0.4; p.pan = pan;
     this.play('impact', 'world', p);
@@ -140,10 +143,10 @@ export class SoundBank {
     this.play('tone', 'world', p);
   }
 
-  /** A click at the top of the pulse gate, pitched from the incoming pid. */
+  /** A click on the next sixteenth of the score's grid, pitched from the incoming pid. */
   contextSwitch(e: KernelEventOf<'context.switch'>, pan: number): void {
     if (e.to === null) return; // Switching to idle has no incoming pitch: no click.
-    const at = this.host.score?.nextGateTime(this.at()) ?? this.at();
+    const at = this.host.score?.nextStepTime(this.at()) ?? this.at();
     const hz = pitchForPid(this.host.rootMidi, e.to, 2);
     const p = TONE;
     p.hz = hz; p.hz2 = hz * 2; p.detuneCents = 0; p.gain = 0.16; p.pan = pan; p.filterHz = hz * 6; p.adsr = CLICK_ADSR; p.hold = 0;
@@ -160,9 +163,14 @@ export class SoundBank {
     this.play('noise', 'world', p);
   }
 
-  /** `critical` adds the alarm swell; the strain jump itself is the load model's. */
-  thrashing(e: KernelEventOf<'memory.thrashing'>): void {
-    if (e.severity === 'critical') this.host.score?.swellAlarm(this.at());
+  /** Strain as a cue: a low pair adrift from each other, wider and longer when critical. The score does not move. */
+  thrashing(e: KernelEventOf<'memory.thrashing'>, pan: number): void {
+    const hz = pitchHz(this.host.rootMidi, 0, 1);
+    const critical = e.severity === 'critical';
+    const p = TONE;
+    p.hz = hz; p.hz2 = hz; p.detuneCents = critical ? 32 : 16; p.gain = critical ? 0.26 : 0.18; p.pan = pan;
+    p.filterHz = hz * 3; p.adsr = PAD_ADSR; p.hold = (critical ? DUR.travel : DUR.base) / 1000;
+    this.play('tone', 'world', p);
   }
 
   /** A low denial: the request had nowhere to go. */
@@ -196,13 +204,12 @@ export class SoundBank {
 
   /* ---- deadlock ----------------------------------------------------- */
 
-  /** Every voice sustains and stops moving for the hold; then the alarm swell. */
+  /** Every world voice sustains and stops moving for the hold. The score keeps time (WP-25 section 4). */
   deadlockDetected(): void {
     if (!this.host.ready) { this.stats.dropped += 1; return; }
     const at = this.at();
-    const score = this.host.score;
-    const until = score !== null ? score.hold(at) : at;
-    // World voices sustain; layer voices belong to the Score, which is holding.
+    const until = at + DEADLOCK_HOLD_MS / 1000;
+    // World voices sustain; score voices carry `layer` and are left alone.
     this.host.allocator?.sustainAll(at, until);
     this.freezeUntil = until;
   }
@@ -289,14 +296,14 @@ export class SoundBank {
   /* ---- kernel ------------------------------------------------------- */
 
   /**
-   * Everything stops, one impact at full on the alert bus, then the flood's
-   * 900 ms of silence (`PANIC_POST.floodMs`).
+   * Every world voice stops, one impact at full on the alert bus, then the
+   * flood's 900 ms of silence (`PANIC_POST.floodMs`). The score's own panic
+   * follows the panic leg event through the Conductor.
    */
   kernelPanic(): void {
     if (!this.host.ready) { this.stats.dropped += 1; return; }
     const at = this.at();
     this.host.allocator?.stopAll(at);
-    this.host.score?.silence(at);
     const p = IMPACT;
     p.impact = IMPACT_PRESETS.panic; p.gain = 1; p.pan = 0;
     this.freezeUntil = -1;

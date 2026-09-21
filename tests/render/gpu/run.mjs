@@ -208,6 +208,7 @@ try {
       const boot = await audioPage.evaluate(() => globalThis.__kernelTrailAudioProbe);
       if (boot.status === 'failed') throw new Error(`Audio probe failed to initialise: ${boot.error?.message}\n${boot.error?.stack}`);
       const before = await audioPage.evaluate(() => globalThis.__kernelTrailAudioProbe.api.info());
+      assert(before.travelPeak > 0.05 && before.travelPeak < 1, `WP-25: eight bars of the Quantum Pass travel rendered offline peak at ${before.travelPeak}, wanted above 0.05 and below clipping`);
       assert.equal(before.state, 'unstarted', 'no audio context may exist before the gesture');
       assert.equal(before.constructions, 0, 'no audio context may be constructed before the gesture');
       const droppedBefore = await audioPage.evaluate(() => globalThis.__kernelTrailAudioProbe.api.poke());

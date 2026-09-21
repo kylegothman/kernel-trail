@@ -32,6 +32,8 @@ export interface SidechainStats {
 
 export class Sidechain {
   private readonly params = new Set<ParamLike>();
+  /** The params the derezz duck takes down: the chords and the bass, never the pad, which is the low bed that stays. */
+  private readonly duckable = new Set<ParamLike>();
   private ducked = false;
   readonly stats: SidechainStats = { triggers: 0, ducks: 0 };
 
@@ -52,12 +54,16 @@ export class Sidechain {
     return this.ducked;
   }
 
-  register(param: ParamLike): void {
+  /** Every registered param pumps with the kick; only a `duckable` one falls with the derezz duck. */
+  register(param: ParamLike, duckable = true): void {
     this.params.add(param);
+    if (duckable) this.duckable.add(param);
+    else this.duckable.delete(param);
   }
 
   unregister(param: ParamLike): void {
     this.params.delete(param);
+    this.duckable.delete(param);
   }
 
   /**
@@ -80,10 +86,10 @@ export class Sidechain {
     this.stats.triggers += 1;
   }
 
-  /** The derezz: every param to silence over 400 ms, held there. Kicks are ignored until `restore`. */
+  /** The derezz: every duckable param to silence over 400 ms, held there. Kicks are ignored until `restore`. */
   duck(when: number): void {
     const seconds = (DEREZZ_DUCK_MS / 1000) * this.envelopeScale();
-    for (const param of this.params) {
+    for (const param of this.duckable) {
       param.cancelScheduledValues(when);
       param.setValueAtTime(1, when);
       param.linearRampToValueAtTime(MIN_EXP_TARGET, when + Math.max(0.002, seconds));
@@ -95,7 +101,7 @@ export class Sidechain {
   /** Bring a ducked score back over `seconds`. Idempotent. */
   restore(when: number, seconds = DUCK_RESTORE_SECONDS): void {
     if (!this.ducked) return;
-    for (const param of this.params) {
+    for (const param of this.duckable) {
       param.cancelScheduledValues(when);
       param.setValueAtTime(MIN_EXP_TARGET, when);
       param.linearRampToValueAtTime(1, when + Math.max(0.002, seconds));

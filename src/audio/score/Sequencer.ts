@@ -105,10 +105,14 @@ export interface SequencerStats {
   refused: number;
 }
 
+/** A tap on every note placed, for the audition tool's schedule hash and the tests. */
+export type NoteHook = (part: PartId, note: Note, onset: number, seconds: number, section: SectionId) => void;
+
 export class Sequencer {
   /** The score trim: every score voice reaches the bus through it, so a fade or a panic decay is one ramp. */
   readonly trim: GainLike;
   onBar: BarHook | null = null;
+  onNote: NoteHook | null = null;
   readonly stats: SequencerStats = { notes: 0, unplaced: 0, bars: 0, changes: 0, cuts: 0, lateSteps: 0, refused: 0 };
   private arrangement: Arrangement | null = null;
   private section: Section | null = null;
@@ -421,6 +425,7 @@ export class Sequencer {
       voice.start(onset, params);
     }
     this.stats.notes += 1;
+    if (this.onNote !== null) this.onNote(part, note, onset, seconds, section.id);
   }
 
   /** Release every score voice at `at`, the pad too unless kept. A note not yet sounding is silenced without a blip. */
