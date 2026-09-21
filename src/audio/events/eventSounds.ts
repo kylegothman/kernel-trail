@@ -1,19 +1,31 @@
 /**
- * The event-to-sound mapping, package section 6. Every cue lives here as a
- * method on `SoundBank`; the consumer's exhaustive switch calls them. The
- * treatment table at the bottom is a `Record` over `KernelEventType`, so
- * removing a variant's row is a compile error and the coverage test can walk
- * all forty-five rows.
+ * The event-to-sound mapping, WP-16 section 6, re-voiced by WP-25 section 5
+ * so that every cue belongs to the same instrument as the score. Every cue
+ * lives here as a method on `SoundBank`; the consumer's exhaustive switch
+ * calls them. The treatment table at the bottom is a `Record` over
+ * `KernelEventType`, so removing a variant's row is a compile error and the
+ * coverage test can walk all forty-five rows.
+ *
+ * The palette's three rules. Pitched material sits in the current leg's key:
+ * a degree of the leg's mode over its root, which the Conductor sets when a
+ * leg enters. Percussive material shares the kick's transient design: the
+ * ticks take the kick click's one-millisecond attack and twelve-millisecond
+ * decay. Nothing is white noise unshaped: every noise source runs through a
+ * band-pass or a low-pass, and the sweeps are placed as multiples of the
+ * root. `keyTick` is the one sound that stays as WP-16 left it, because a
+ * terminal should sound like a terminal.
  */
 import type { KernelEventOf, KernelEventType, Pid } from '@kernel/types';
 import { CORRUPTION, DUR, FOCUS_DURATION_MS, PANIC_POST } from '@design/motion';
 import type { Adsr } from '../synth/envelope';
-import { centsToRatio, pitchForPid, pitchHz } from '../synth/tuning';
+import { centsToRatio, midiToHz, pitchHz } from '../synth/tuning';
 import { DEADLOCK_HOLD_MS, DIRTY_EVICT_EXTRA_MS, RACE_BEAT_CENTS, SEEK_SWEEP } from '../synth/constants';
 import type { VoiceAllocator } from '../VoiceBudget';
 import type { BusId, Voice, VoiceKind } from '../voices/Voice';
 import { IMPACT_CHARACTER, IMPACT_PRESETS, impactDuration, type ImpactCharacter } from '../voices/ImpactVoice';
+import { KICK } from '../voices/KickVoice';
 import type { Mode } from '../score/Arrangement';
+import { scaleMidi } from '../score/material';
 import type { Score } from '../score/Score';
 
 /** What the bank needs from the engine. */
@@ -42,11 +54,24 @@ export interface SoundStats {
   unplaced: number;
 }
 
-/* Envelope presets. Times in seconds; reduced motion halves them in the voice. */
-const CUE_ADSR: Adsr = { attack: 0.006, decay: 0.09, sustain: 0.45, release: 0.14 };
-const CLICK_ADSR: Adsr = { attack: 0.001, decay: 0.02, sustain: 0.2, release: 0.03 };
-const TICK_ADSR: Adsr = { attack: 0.001, decay: 0.03, sustain: 0.3, release: 0.05 };
-const PAD_ADSR: Adsr = { attack: 0.02, decay: 0.12, sustain: 0.6, release: 0.25 };
+/*
+ * Envelope presets. Times in seconds; reduced motion halves them in the voice.
+ * Section 5: every cue but the pinned ones is under 400 ms, so each preset's
+ * attack, decay and release leave room for its hold.
+ */
+/** Pitched cues: a soft edge, a short tail. */
+export const CUE_ADSR: Adsr = { attack: 0.005, decay: 0.08, sustain: 0.45, release: 0.12 };
+/** The percussive ticks: the kick click's attack and decay, so every tick is the kick's transient. */
+export const TICK_ADSR: Adsr = { attack: 0.001, decay: KICK.clickSeconds, sustain: 0.2, release: 0.03 };
+/** Swelling pairs and alerts. */
+export const SWELL_ADSR: Adsr = { attack: 0.02, decay: 0.1, sustain: 0.6, release: 0.15 };
+/** The long glides: the starving drift and the focus pair. */
+export const GLIDE_ADSR: Adsr = { attack: 0.02, decay: 0.12, sustain: 0.6, release: 0.25 };
+/** WP-16's terminal tick, kept as it was. */
+const TERMINAL_TICK_ADSR: Adsr = { attack: 0.001, decay: 0.03, sustain: 0.3, release: 0.05 };
+
+/** The dma sweep's longest hold, so a transfer never runs past the palette's 400 ms. */
+export const DMA_SWEEP_MAX_SECONDS = 0.28;
 
 /*
  * Scratch parameter objects, one per cue shape, mutated in place so the consume
@@ -54,7 +79,7 @@ const PAD_ADSR: Adsr = { attack: 0.02, decay: 0.12, sustain: 0.6, release: 0.25 
  * own interface: the voice reads absence as "not this feature".
  */
 interface ToneScratch {
-  hz: number; hz2: number; detuneCents: number; gain: number; hold: number; pan: number; filterHz: number; adsr: Adsr;
+  hz: number; hz2: number; detuneCents: number; gain: number; hold: number; pan: number; filterHz: number; q: number; waveform: 'sine' | 'triangle' | 'sawtooth'; adsr: Adsr;
 }
 interface GlideScratch extends ToneScratch {
   glideToHz: number; glideSeconds: number;
@@ -72,7 +97,7 @@ interface GrainScratch {
   intensity: number; gain: number; filterHz: number; pitchJitter: number; removeFundamental: boolean; hold: number; pan: number;
 }
 
-const TONE: ToneScratch = { hz: 220, hz2: 220, detuneCents: 0, gain: 0.3, hold: 0.1, pan: 0, filterHz: 2000, adsr: CUE_ADSR };
+const TONE: ToneScratch = { hz: 220, hz2: 220, detuneCents: 0, gain: 0.3, hold: 0.1, pan: 0, filterHz: 2000, q: 1.5, waveform: 'triangle', adsr: CUE_ADSR };
 const GLIDE: GlideScratch = { ...TONE, glideToHz: 220, glideSeconds: 0.1 };
 const FATAL: FatalScratch = { ...GLIDE, stepToHz: 220 };
 const NOISE: NoiseScratch = { filterHz: 1000, filterEndHz: 1000, q: 2, gain: 0.3, hold: 0.1, pan: 0 };
@@ -103,21 +128,39 @@ export class SoundBank {
     this.freezeUntil = -1;
   }
 
+  /* ---- the key --------------------------------------------------- */
+
+  /** A degree of the leg's mode over its root, one-based; 8 is the octave. */
+  keyHz(degree: number, octave: number): number {
+    return midiToHz(scaleMidi(this.host.rootMidi, this.host.mode, degree, octave));
+  }
+
+  /** A pid's degree: dense integers land on neighbouring degrees, ten before a pitch repeats. */
+  pidHz(pid: Pid, octave: number): number {
+    return this.keyHz(1 + pidDegree(pid), octave);
+  }
+
+  /** The root's frequency, the reference the noise sweeps are placed against. */
+  rootHz(): number {
+    return midiToHz(this.host.rootMidi);
+  }
+
   /* ---- processes ---------------------------------------------------- */
 
-  /** A short rising tone, pitch from the pid so siblings differ. */
+  /** A short rising saw, pitch from the pid so siblings differ, gliding in from a whole tone below. */
   processCreated(e: KernelEventOf<'process.created'>, pan: number): void {
-    const hz = pitchForPid(this.host.rootMidi, e.pid, 1);
+    const hz = this.pidHz(e.pid, 2);
     const p = GLIDE;
-    p.hz = hz * centsToRatio(-120); p.hz2 = hz; p.detuneCents = 0; p.gain = 0.3; p.pan = pan;
-    p.filterHz = hz * 5; p.adsr = CUE_ADSR; p.glideToHz = hz; p.glideSeconds = DUR.quick / 1000; p.hold = DUR.base / 1000;
+    p.hz = hz * centsToRatio(-200); p.hz2 = hz; p.detuneCents = 0; p.gain = 0.26; p.pan = pan; p.waveform = 'sawtooth';
+    p.filterHz = hz * 4; p.q = 1.5; p.adsr = CUE_ADSR; p.glideToHz = hz; p.glideSeconds = DUR.snap / 1000; p.hold = DUR.quick / 1000;
     this.play('tone', 'world', p);
   }
 
   /**
-   * The derezz. A convoy Program is the impact at full weight and an
-   * anonymous process a fraction of it; the score's duck now follows the
-   * tombstone event through the Conductor (WP-25 section 4), not this cue.
+   * The derezz: the impact voice's sine drop and shaped burst per reason,
+   * the kick's design at the scale of a death. A convoy Program is the impact
+   * at full weight and an anonymous process a fraction of it; the score's
+   * duck follows the tombstone event through the Conductor.
    */
   processExited(e: KernelEventOf<'process.exited'>, pan: number): void {
     const convoy = this.host.isConvoy(e.pid);
@@ -126,50 +169,48 @@ export class SoundBank {
     this.play('impact', 'world', p);
   }
 
-  /** A slow detuning of that process's pitch; fatal adds a descending third. */
+  /** A slow detuning of that process's pitch; fatal adds a descending third, in the key. */
   processStarving(e: KernelEventOf<'process.starving'>, pan: number): void {
-    const hz = pitchForPid(this.host.rootMidi, e.pid, 1);
+    const hz = this.pidHz(e.pid, 2);
     const seconds = DUR.ambient / 4000;
     if (e.fatal) {
       const p = FATAL;
-      p.hz = hz; p.hz2 = hz; p.detuneCents = 0; p.gain = 0.28; p.pan = pan; p.filterHz = hz * 4; p.adsr = PAD_ADSR;
-      p.glideToHz = hz * centsToRatio(-45); p.glideSeconds = seconds; p.stepToHz = pitchHz(this.host.rootMidi, pidDegree(e.pid) - 2, 1); p.hold = seconds + DUR.base / 1000;
+      p.hz = hz; p.hz2 = hz; p.detuneCents = 0; p.gain = 0.26; p.pan = pan; p.waveform = 'triangle'; p.filterHz = hz * 4; p.q = 1; p.adsr = GLIDE_ADSR;
+      p.glideToHz = hz * centsToRatio(-45); p.glideSeconds = seconds; p.stepToHz = this.keyHz(1 + pidDegree(e.pid) - 2, 2); p.hold = seconds + DUR.base / 1000;
       this.play('tone', 'world', p);
       return;
     }
     const p = GLIDE;
-    p.hz = hz; p.hz2 = hz; p.detuneCents = 0; p.gain = 0.22; p.pan = pan; p.filterHz = hz * 4; p.adsr = PAD_ADSR;
+    p.hz = hz; p.hz2 = hz; p.detuneCents = 0; p.gain = 0.2; p.pan = pan; p.waveform = 'triangle'; p.filterHz = hz * 4; p.q = 1; p.adsr = GLIDE_ADSR;
     p.glideToHz = hz * centsToRatio(-30); p.glideSeconds = seconds; p.hold = seconds;
     this.play('tone', 'world', p);
   }
 
-  /** A click on the next sixteenth of the score's grid, pitched from the incoming pid. */
+  /** A tick on the next sixteenth of the score's grid, pitched from the incoming pid. */
   contextSwitch(e: KernelEventOf<'context.switch'>, pan: number): void {
     if (e.to === null) return; // Switching to idle has no incoming pitch: no click.
     const at = this.host.score?.nextStepTime(this.at()) ?? this.at();
-    const hz = pitchForPid(this.host.rootMidi, e.to, 2);
-    const p = TONE;
-    p.hz = hz; p.hz2 = hz * 2; p.detuneCents = 0; p.gain = 0.16; p.pan = pan; p.filterHz = hz * 6; p.adsr = CLICK_ADSR; p.hold = 0;
-    this.play('tone', 'world', p, at);
+    this.tick(this.pidHz(e.to, 3), 0.14, pan, 'world', at);
   }
 
   /* ---- memory ------------------------------------------------------- */
 
-  /** A downward noise sweep, longer and lower when dirty (visual bible 8.4). */
+  /** A downward band-pass sweep from the root's harmonics, longer and lower when dirty (visual bible 8.4). */
   pageEvicted(e: KernelEventOf<'memory.page_evicted'>, pan: number): void {
+    const root = this.rootHz();
     const p = NOISE;
-    p.filterHz = e.dirty ? 1800 : 2400; p.filterEndHz = e.dirty ? 220 : 420; p.q = 3; p.gain = 0.28; p.pan = pan;
+    p.filterHz = root * (e.dirty ? 16 : 24); p.filterEndHz = root * (e.dirty ? 2 : 4); p.q = 4; p.gain = 0.26; p.pan = pan;
     p.hold = 0.14 + (e.dirty ? DIRTY_EVICT_EXTRA_MS / 1000 : 0);
     this.play('noise', 'world', p);
   }
 
-  /** Strain as a cue: a low pair adrift from each other, wider and longer when critical. The score does not move. */
+  /** Strain as a cue: the root under itself a quarter-tone adrift, wider and longer when critical. The score does not move. */
   thrashing(e: KernelEventOf<'memory.thrashing'>, pan: number): void {
-    const hz = pitchHz(this.host.rootMidi, 0, 1);
+    const hz = this.keyHz(1, 1);
     const critical = e.severity === 'critical';
     const p = TONE;
-    p.hz = hz; p.hz2 = hz; p.detuneCents = critical ? 32 : 16; p.gain = critical ? 0.26 : 0.18; p.pan = pan;
-    p.filterHz = hz * 3; p.adsr = PAD_ADSR; p.hold = (critical ? DUR.travel : DUR.base) / 1000;
+    p.hz = hz; p.hz2 = hz; p.detuneCents = critical ? 32 : 16; p.gain = critical ? 0.26 : 0.18; p.pan = pan; p.waveform = 'sawtooth';
+    p.filterHz = hz * 3; p.q = 2; p.adsr = SWELL_ADSR; p.hold = (critical ? 0.12 : 0.06);
     this.play('tone', 'world', p);
   }
 
@@ -192,11 +233,11 @@ export class SoundBank {
     this.interval(e.pid, pan, 'opening');
   }
 
-  /** Two detuned copies of the same tone beating against each other. */
+  /** Two copies of the key's third beating against each other. */
   raceDetected(pan: number): void {
-    const hz = pitchHz(this.host.rootMidi, 2, 1);
+    const hz = this.keyHz(3, 2);
     const p = TONE;
-    p.hz = hz; p.hz2 = hz; p.detuneCents = 0; p.gain = 0.24; p.pan = pan; p.filterHz = hz * 5; p.adsr = PAD_ADSR; p.hold = DUR.base / 1000;
+    p.hz = hz; p.hz2 = hz; p.detuneCents = 0; p.gain = 0.22; p.pan = pan; p.waveform = 'triangle'; p.filterHz = hz * 4; p.q = 1.5; p.adsr = SWELL_ADSR; p.hold = 0.12;
     this.play('tone', 'world', p);
     p.detuneCents = RACE_BEAT_CENTS;
     this.play('tone', 'world', p);
@@ -221,11 +262,11 @@ export class SoundBank {
     this.interval(pid ?? (1 as Pid), pan, 'opening');
   }
 
-  /** Grant: a short rising tone on the world bus. Denial: the hard-gated burst. */
+  /** Grant: a short rising tone on the world bus. Denial: the shaped burst. */
   resourceGranted(e: KernelEventOf<'resource.granted'>, pan: number): void {
-    const hz = pitchForPid(this.host.rootMidi, e.pid, 2);
+    const hz = this.pidHz(e.pid, 3);
     const p = GLIDE;
-    p.hz = hz * centsToRatio(-70); p.hz2 = hz; p.detuneCents = 0; p.gain = 0.2; p.pan = pan; p.filterHz = hz * 5; p.adsr = CUE_ADSR;
+    p.hz = hz * centsToRatio(-100); p.hz2 = hz; p.detuneCents = 0; p.gain = 0.2; p.pan = pan; p.waveform = 'sawtooth'; p.filterHz = hz * 4; p.q = 1.5; p.adsr = CUE_ADSR;
     p.glideToHz = hz; p.glideSeconds = DUR.snap / 1000; p.hold = DUR.quick / 1000;
     this.play('tone', 'world', p);
   }
@@ -238,54 +279,56 @@ export class SoundBank {
 
   /* ---- storage and I/O ---------------------------------------------- */
 
-  /** A sweep whose duration is proportional to `distance` (package line 250). */
+  /** A band-pass sweep up the root's harmonics whose duration is proportional to `distance` (WP-16 line 250). */
   diskSeek(e: KernelEventOf<'disk.seek'>, pan: number): void {
     const ms = Math.min(SEEK_SWEEP.maxMs, SEEK_SWEEP.baseMs + SEEK_SWEEP.msPerCylinder * Math.max(0, e.distance));
+    const root = this.rootHz();
     const p = NOISE;
-    p.filterHz = 700; p.filterEndHz = 1600; p.q = 4; p.gain = 0.22; p.pan = pan; p.hold = ms / 1000;
+    p.filterHz = root * 8; p.filterEndHz = root * 18; p.q = 4; p.gain = 0.22; p.pan = pan; p.hold = ms / 1000;
     this.play('noise', 'world', p);
   }
 
-  /** The block lands: a short high tick. */
+  /** The block lands: a tick on the fifth. */
   diskServed(pan: number): void {
-    this.tick(pitchHz(this.host.rootMidi, 7, 2), 0.14, pan, 'world');
+    this.tick(this.keyHz(5, 3), 0.14, pan, 'world');
   }
 
-  /** One interrupt tick; the consumer caps how many land per frame. */
+  /** One interrupt tick on the octave; the consumer caps how many land per frame. */
   interruptTick(at: number, pan: number): void {
-    this.tick(pitchHz(this.host.rootMidi, 4, 3), 0.13, pan, 'world', at);
+    this.tick(this.keyHz(8, 3), 0.13, pan, 'world', at);
   }
 
-  /** Flow: an upward sweep whose length follows the transfer size. */
+  /** Flow: an upward sweep whose length follows the transfer size, capped inside the palette's 400 ms. */
   dmaTransfer(e: KernelEventOf<'io.dma_transfer'>, pan: number): void {
+    const root = this.rootHz();
     const p = NOISE;
-    p.filterHz = 600; p.filterEndHz = 2400; p.q = 2.5; p.gain = 0.2; p.pan = pan;
-    p.hold = Math.min(0.5, Math.max(0.08, e.bytes / 65536));
+    p.filterHz = root * 6; p.filterEndHz = root * 28; p.q = 2.5; p.gain = 0.2; p.pan = pan;
+    p.hold = Math.min(DMA_SWEEP_MAX_SECONDS, Math.max(0.08, e.bytes / 65536));
     this.play('noise', 'world', p);
   }
 
   /* ---- file system -------------------------------------------------- */
 
-  /** Jittered grains; `recoverable: false` removes the fundamental (package line 263). */
+  /** Jittered grains through a band-pass at the root's harmonics; `recoverable: false` removes the fundamental (WP-16 line 263). */
   fsCorruption(e: KernelEventOf<'fs.corruption'>, pan: number): void {
     const p = GRAIN;
-    p.intensity = 0.8; p.gain = 0.32; p.filterHz = 1400; p.pitchJitter = 0.6; p.removeFundamental = !e.recoverable; p.pan = pan;
+    p.intensity = 0.8; p.gain = 0.32; p.filterHz = this.rootHz() * 16; p.pitchJitter = 0.6; p.removeFundamental = !e.recoverable; p.pan = pan;
     p.hold = (CORRUPTION.rampInMs * 2) / 1000;
     this.play('granular', 'world', p);
   }
 
-  /** The reaches come apart: a pair a quarter-tone adrift. */
+  /** The reaches come apart: the key's second, a pair a quarter-tone adrift. */
   fsFragmented(pan: number): void {
-    const hz = pitchHz(this.host.rootMidi, 1, 1);
+    const hz = this.keyHz(2, 2);
     const p = TONE;
-    p.hz = hz; p.hz2 = hz; p.detuneCents = -30; p.gain = 0.18; p.pan = pan; p.filterHz = hz * 4; p.adsr = CUE_ADSR; p.hold = DUR.quick / 1000;
+    p.hz = hz; p.hz2 = hz; p.detuneCents = -30; p.gain = 0.18; p.pan = pan; p.waveform = 'triangle'; p.filterHz = hz * 4; p.q = 1.5; p.adsr = CUE_ADSR; p.hold = DUR.quick / 1000;
     this.play('tone', 'world', p);
   }
 
-  /** Commit and checkpoint tick; begin and write are silent (Appendix A: dim and fill). */
+  /** Commit and checkpoint tick, on the fifth and the octave; begin and write are silent (Appendix A: dim and fill). */
   fsJournal(e: KernelEventOf<'fs.journal'>, pan: number): void {
     if (e.entry.phase !== 'commit' && e.entry.phase !== 'checkpoint') return;
-    this.tick(pitchHz(this.host.rootMidi, e.entry.phase === 'commit' ? 5 : 7, 2), 0.12, pan, 'world');
+    this.tick(this.keyHz(e.entry.phase === 'commit' ? 5 : 8, 3), 0.12, pan, 'world');
   }
 
   /** Recovery mirrors corruption: an opening interval. */
@@ -314,15 +357,20 @@ export class SoundBank {
 
   /* ---- UI ----------------------------------------------------------- */
 
+  /** WP-16's terminal key tick, untouched: a terminal should sound like a terminal. */
   uiKeyTick(): void {
-    this.tick(pitchHz(this.host.rootMidi, 9, 3), 0.07, 0, 'ui');
+    const hz = pitchHz(this.host.rootMidi, 9, 3);
+    const p = TONE;
+    p.hz = hz; p.hz2 = hz * 2; p.detuneCents = 0; p.gain = 0.07; p.pan = 0; p.waveform = 'sine'; p.filterHz = hz * 8; p.q = 0.7; p.adsr = TERMINAL_TICK_ADSR; p.hold = 0.01;
+    this.play('tone', 'ui', p);
   }
 
+  /** Accept: the tonic rising to the fifth over the snap. */
   uiCommandAccept(): void {
-    const from = pitchHz(this.host.rootMidi, 0, 2);
-    const to = pitchHz(this.host.rootMidi, 3, 2);
+    const from = this.keyHz(1, 3);
+    const to = this.keyHz(5, 3);
     const p = GLIDE;
-    p.hz = from; p.hz2 = to; p.detuneCents = 0; p.gain = 0.14; p.pan = 0; p.filterHz = to * 5; p.adsr = CUE_ADSR;
+    p.hz = from; p.hz2 = to; p.detuneCents = 0; p.gain = 0.14; p.pan = 0; p.waveform = 'triangle'; p.filterHz = to * 4; p.q = 1.5; p.adsr = CUE_ADSR;
     p.glideToHz = to; p.glideSeconds = DUR.snap / 1000; p.hold = DUR.snap / 1000;
     this.play('tone', 'ui', p);
   }
@@ -333,21 +381,22 @@ export class SoundBank {
     this.play('impact', 'ui', p);
   }
 
+  /** An alert: the third under the sixth, the mode's colour, on the alert bus. */
   uiAlertAppear(): void {
-    const hz = pitchHz(this.host.rootMidi, 4, 2);
+    const hz = this.keyHz(3, 3);
     const p = TONE;
-    p.hz = hz; p.hz2 = pitchHz(this.host.rootMidi, 7, 2); p.detuneCents = 0; p.gain = 0.2; p.pan = 0; p.filterHz = hz * 5; p.adsr = PAD_ADSR; p.hold = DUR.quick / 1000;
+    p.hz = hz; p.hz2 = this.keyHz(6, 3); p.detuneCents = 0; p.gain = 0.2; p.pan = 0; p.waveform = 'triangle'; p.filterHz = hz * 4; p.q = 1.5; p.adsr = SWELL_ADSR; p.hold = 0.1;
     this.play('tone', 'voice_alerts', p);
   }
 
-  /** Aligned to the 520 ms engage: the glide lasts exactly the camera's arc. */
+  /** Aligned to the 520 ms engage: the tonic glides to the fifth over exactly the camera's arc. */
   uiFocusEngage(): void {
-    this.focusGlide(pitchHz(this.host.rootMidi, 0, 2), pitchHz(this.host.rootMidi, 3, 2), FOCUS_DURATION_MS.engage / 1000);
+    this.focusGlide(this.keyHz(1, 3), this.keyHz(5, 3), FOCUS_DURATION_MS.engage / 1000);
   }
 
-  /** Aligned to the 380 ms release. */
+  /** Aligned to the 380 ms release: the fifth back to the tonic. */
   uiFocusRelease(): void {
-    this.focusGlide(pitchHz(this.host.rootMidi, 3, 2), pitchHz(this.host.rootMidi, 0, 2), FOCUS_DURATION_MS.release / 1000);
+    this.focusGlide(this.keyHz(5, 3), this.keyHz(1, 3), FOCUS_DURATION_MS.release / 1000);
   }
 
   /* ---- helpers ------------------------------------------------------ */
@@ -356,26 +405,28 @@ export class SoundBank {
     return this.host.now + LEAD;
   }
 
+  /** A percussive tick: the kick click's attack and decay on a pitched pair. */
   private tick(hz: number, gain: number, pan: number, bus: BusId, at = this.at()): void {
     const p = TONE;
-    p.hz = hz; p.hz2 = hz * 2; p.detuneCents = 0; p.gain = gain; p.pan = pan; p.filterHz = hz * 8; p.adsr = TICK_ADSR; p.hold = 0.01;
+    p.hz = hz; p.hz2 = hz * 2; p.detuneCents = 0; p.gain = gain; p.pan = pan; p.waveform = 'triangle'; p.filterHz = hz * 8; p.q = 1; p.adsr = TICK_ADSR; p.hold = 0.01;
     this.play('tone', bus, p, at);
   }
 
+  /** A third of the key from a pid's degree, closing (upper to lower) or opening (lower to upper). */
   private interval(pid: Pid, pan: number, direction: 'closing' | 'opening'): void {
-    const degree = pidDegree(pid);
-    const lower = pitchHz(this.host.rootMidi, degree, 1);
-    const upper = pitchHz(this.host.rootMidi, degree + 2, 1);
+    const degree = 1 + pidDegree(pid);
+    const lower = this.keyHz(degree, 2);
+    const upper = this.keyHz(degree + 2, 2);
     const p = GLIDE;
-    p.hz = direction === 'closing' ? upper : lower; p.hz2 = p.hz; p.detuneCents = 0; p.gain = 0.22; p.pan = pan;
-    p.filterHz = upper * 5; p.adsr = CUE_ADSR; p.glideToHz = direction === 'closing' ? lower : upper;
+    p.hz = direction === 'closing' ? upper : lower; p.hz2 = p.hz; p.detuneCents = 0; p.gain = 0.2; p.pan = pan; p.waveform = 'triangle';
+    p.filterHz = upper * 4; p.q = 1.5; p.adsr = CUE_ADSR; p.glideToHz = direction === 'closing' ? lower : upper;
     p.glideSeconds = DUR.quick / 1000; p.hold = DUR.quick / 1000;
     this.play('tone', 'world', p);
   }
 
   private focusGlide(from: number, to: number, seconds: number): void {
     const p = GLIDE;
-    p.hz = from; p.hz2 = from; p.detuneCents = 0; p.gain = 0.12; p.pan = 0; p.filterHz = to * 4; p.adsr = PAD_ADSR;
+    p.hz = from; p.hz2 = from; p.detuneCents = 0; p.gain = 0.12; p.pan = 0; p.waveform = 'triangle'; p.filterHz = to * 4; p.q = 1; p.adsr = GLIDE_ADSR;
     p.glideToHz = to; p.glideSeconds = seconds; p.hold = seconds;
     this.play('tone', 'ui', p);
   }
