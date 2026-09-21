@@ -472,7 +472,7 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
     if (stage === null || disposed) return;
     const layoutStage = stage;
     driver = new BootSectorDriver({
-      document: doc, canvas: boot.canvas, run: () => runStore.get(), structures: () => layoutStage.structures,
+      document: doc, overlay: boot.overlay, canvas: boot.canvas, run: () => runStore.get(), structures: () => layoutStage.structures,
       sceneObject: name => scene.getObjectByName(name) ?? null, focus, hud, pacing, terminal: () => terminal,
       interactions: interactionPanel, requisition: requisitionPanel, gate: gatePanel, clock: () => performance.now(),
     });

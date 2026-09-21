@@ -73,7 +73,7 @@ describe('the zero-segment allowance as an option', () => {
 
 import { Group, PerspectiveCamera } from 'three/webgpu';
 import { BootSectorDriver, BEAT_ANCHORS, EXITS, RING_STEP_MS, TERMINAL_HINT, layoutCarriesBeats, type DriverHost, type DriverStructure } from '../../src/app/onboarding/BootSectorDriver';
-import { HINTS, hintProblems } from '../../src/app/onboarding/hints';
+import { hintFor, hintProblems } from '../../src/app/onboarding/hints';
 import { createPacing } from '../../src/app/pacing';
 import { ObservedBus } from '../../src/app/panels/RefusalLine';
 import { RequisitionPanel } from '../../src/app/panels/RequisitionPanel';
@@ -120,7 +120,8 @@ function stubHost() {
   const pips = doc.createElement('div');
   for (const name of ['KESTREL', 'LUMEN', 'ORRERY', 'SABLE', 'VESPER']) { const pip = doc.createElement('div'); pip.className = 'kt-pip'; const value = doc.createElement('span'); value.className = 'kt-value'; value.textContent = name; pip.append(value); pips.append(pip); }
   const hint = doc.createElement('div');
-  const hud = { element: hudElement, note: (text: string) => { notes.push(text); }, cell: (region: 'convoyPips' | 'focusHint') => (region === 'convoyPips' ? pips : hint) };
+  const hovers: (string | null)[] = [];
+  const hud = { element: hudElement, note: (text: string) => { notes.push(text); }, cell: (region: 'convoyPips' | 'focusHint') => (region === 'convoyPips' ? pips : hint), setHover: (id: string | null) => { hovers.push(id); } };
   const scales: number[] = [];
   const pacing = createPacing({ setTimeScale: scale => { scales.push(scale); } });
   const listeners = new Set<(name: string, argv: readonly string[], result: { ok: boolean }) => void>();
@@ -132,7 +133,7 @@ function stubHost() {
   const requisition = new RequisitionPanel({ document: doc, overlay, bus: rig.bus, run: () => rig.store.get(), tick: () => rig.runner.kernel!.tick, clock: () => now });
   const gate = new GatePanel({ document: doc, overlay, bus: rig.bus, run: () => rig.store.get(), tick: () => rig.runner.kernel!.tick });
   const host: DriverHost = {
-    document: doc, canvas, run: () => rig.store.get(), structures: () => structures, sceneObject: name => scene.get(name) ?? null,
+    document: doc, overlay, canvas, run: () => rig.store.get(), structures: () => structures, sceneObject: name => scene.get(name) ?? null,
     focus, hud, pacing, terminal: () => terminal, interactions: { restrict: ids => { restricted.push(ids); }, enableOnly: ids => { enabled.push(ids); } }, requisition, gate, clock: () => now,
   };
   const advance = (ms: number): void => { now += ms; };
@@ -144,16 +145,22 @@ function stubHost() {
   };
   const visible = (id: string): boolean => { const s = structures.find(candidate => candidate.id === id)!; return s.root.visible && s.root.scale.x > 0; };
   const runCommand = (name: string, argv: string[], ok = true): void => { for (const l of listeners) l(name, argv, { ok }); };
-  return { ...rig, host, structures, scene, state, focus, notes, hudElement, pips, hint, pacing, scales, restricted, enabled, requisition, gate, overlay, advance, flush, button, visible, runCommand, clock: () => now, listeners };
+  const card = (): { beat: string | null; text: string | null } => { const el = overlay.querySelector('.kt-card--beat'); return { beat: el?.getAttribute('data-beat') ?? null, text: el?.querySelector('.kt-beat-hint')?.textContent ?? null }; };
+  return { ...rig, host, structures, scene, state, focus, notes, hovers, hudElement, pips, hint, pacing, scales, restricted, enabled, requisition, gate, overlay, advance, flush, button, visible, runCommand, clock: () => now, listeners, card };
 }
 
 describe('the Boot Sector driver', () => {
   it('the layout guard, the hint lines and the exit table cover exactly the eight beats', () => {
+    // The ruling before the replay: every beat says what the player must do next, in one sentence, naming the input.
+    for (const beat of ONBOARDING) {
+      expect(beat.hint.trim(), beat.id).not.toBe('');
+      expect(/click|press|drag|nothing to press|verb/i.test(beat.hint), `${beat.id}: ${beat.hint} names its input`).toBe(true);
+    }
+    expect(ONBOARDING.find(beat => beat.id === 'beat.convoy')?.hintAfterMs).toBe(6000);
     expect(layoutCarriesBeats(bootLayout.anchors.map(anchor => anchor.id))).toBe(true);
     expect(layoutCarriesBeats(['vault', 'console'])).toBe(false);
     expect(BEAT_ANCHORS).toHaveLength(1 + 1 + 1 + 5 + 6);
     expect(hintProblems()).toEqual([]);
-    expect(Object.keys(HINTS).sort()).toEqual(['beat.floor', 'beat.reach']);
     expect(Object.keys(EXITS)).toEqual(ONBOARDING.map(beat => beat.id));
     for (const beat of ONBOARDING) expect(EXITS[beat.id]?.text).toBe(beat.exit);
   });
@@ -165,6 +172,8 @@ describe('the Boot Sector driver', () => {
     driver.onBeat(beat => beats.push(beat.id));
     // 1. Nothing exists: only the module ring; the HUD hidden; the clock held; orbit blocked.
     expect(driver.beatId).toBe('beat.void');
+    // The card says what to do, from the beat's own hint, while the beat is active.
+    expect(s.card()).toEqual({ beat: 'beat.void', text: hintFor(ONBOARDING[0]!) });
     expect(s.visible('anchor.plate')).toBe(true);
     expect(s.visible('anchor.convoy.lumen')).toBe(false);
     expect(s.visible('anchor.win.quota')).toBe(false);
@@ -183,6 +192,7 @@ describe('the Boot Sector driver', () => {
     // 2. The floor writes itself: the hold lifts, orbit is added, the sweep runs one ring per RING_STEP_MS to the horizon.
     s.advance(1); driver.update(s.clock());
     expect(driver.beatId).toBe('beat.floor');
+    expect(s.card()).toEqual({ beat: 'beat.floor', text: 'Drag on the floor to orbit the camera.' });
     expect(s.pacing.held()).toEqual([]);
     expect(s.hudElement.hidden).toBe(false);
     expect(s.scene.get('kt.env.ground.grid')?.visible).toBe(true);
@@ -202,6 +212,7 @@ describe('the Boot Sector driver', () => {
     expect(s.scene.get('kt.env.horizon.line')?.visible).toBe(true);
     // 3. The convoy lights in roster order at STELE_LIGHT_MS; the row lights with it; a click on a stele engages the rig.
     expect(driver.beatId).toBe('beat.convoy');
+    expect(s.card().text).toBe('Click a stele to inspect a convoy member.');
     expect(s.visible('anchor.convoy.lumen')).toBe(true);
     expect(s.visible('anchor.convoy.sable')).toBe(false);
     const pipOf = (name: string): HTMLElement => [...s.pips.children].find(pip => pip.textContent === name) as HTMLElement;
@@ -210,21 +221,25 @@ describe('the Boot Sector driver', () => {
     expect(['sable', 'orrery', 'kestrel', 'vesper'].every(member => s.visible(`anchor.convoy.${member}`))).toBe(true);
     expect([...s.pips.children].every(pip => !(pip as HTMLElement).hidden)).toBe(true);
     expect(s.visible('anchor.block_stack')).toBe(false);
+    // Beat three now hints after six seconds of unheld time, as the floor does: the line is the card's sentence. The stele took 1600 ms.
+    s.advance(6_000 - STELE_LIGHT_MS * 4 - 1); driver.update(s.clock());
+    expect(s.notes).toEqual([]);
     s.advance(20_000); driver.update(s.clock());
     expect(driver.beatId).toBe('beat.convoy');
-    expect(s.notes).toEqual([]);
+    expect(s.notes).toEqual(['Click a stele to inspect a convoy member.']);
     s.focus.engage('anchor.convoy.orrery'); driver.update(s.clock());
     // 4. The reach: on focus release the stack appears, the panel shows the one verb, and the hint follows 20 s later.
     expect(driver.beatId).toBe('beat.reach');
+    expect(s.card().beat).toBe('beat.reach');
     expect(s.visible('anchor.block_stack')).toBe(false);
     s.state.mode = 'releasing'; driver.update(s.clock());
     expect(s.visible('anchor.block_stack')).toBe(true);
     expect(s.restricted.at(-1)).toEqual(['boot.direct_reach']);
     expect(s.enabled.at(-1)).toBeNull();
     s.state.mode = 'free';
-    s.advance(19_999); driver.update(s.clock()); expect(s.notes).toEqual([]);
-    s.advance(1); driver.update(s.clock()); expect(s.notes).toEqual([HINTS['beat.reach']]);
-    s.advance(60_000); driver.update(s.clock()); expect(s.notes).toHaveLength(1);
+    s.advance(19_999); driver.update(s.clock()); expect(s.notes).toHaveLength(1);
+    s.advance(1); driver.update(s.clock()); expect(s.notes.at(-1)).toBe(hintFor(ONBOARDING[3]!));
+    s.advance(60_000); driver.update(s.clock()); expect(s.notes).toHaveLength(2);
     s.bus.dispatch({ kind: 'interaction', id: 'boot.direct_reach', anchor: 'anchor.block_stack' }, { source: 'world', legId: 'boot_sector' });
     s.tick(); driver.update(s.clock());
     expect(s.store.get().decisions.at(-1)?.outcome).toBe('costly');
@@ -259,6 +274,7 @@ describe('the Boot Sector driver', () => {
     s.button('blocks').click(); s.tick(); driver.update(s.clock());
     expect(driver.done).toBe(true);
     expect(s.runner.finished).toBe(true);
+    expect(s.card()).toEqual({ beat: null, text: null });
     expect(beats).toEqual(ONBOARDING.slice(1).map(beat => beat.id));
     expect(s.restricted.at(-1)).toBeNull();
     expect(s.enabled.at(-1)).toBeNull();
@@ -284,7 +300,7 @@ describe('the Boot Sector driver', () => {
     s.advance(19_000); driver.update(s.clock());
     expect(s.notes).toEqual([]);
     s.advance(1000); driver.update(s.clock());
-    expect(s.notes).toEqual([HINTS['beat.reach']]);
+    expect(s.notes).toEqual([hintFor(ONBOARDING[3]!)]);
     driver.dispose();
     expect(s.structures.every(structure => structure.root.visible && structure.root.scale.x === 1)).toBe(true);
     expect(s.hudElement.hidden).toBe(false);

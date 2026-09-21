@@ -1,25 +1,15 @@
 /**
- * WP-24 section 2: the timed hint lines. `OnboardingBeat` carries
- * `hintAfterMs` and no text, so each hinted beat's line is its own
- * `playerMust` rearranged into the leg's voice (pre-flight ruling 9.6):
- * short declaratives, real nouns, no tooltip. Shown through the HUD alert
- * stack as one line after the beat's `hintAfterMs` of unheld wall time.
+ * WP-24 section 2: the hint lines. Every beat carries its own `hint` in
+ * src/legs/boot_sector/onboarding.ts (the ruling before the replay: one
+ * sentence naming the input), which the driver shows on a card while the
+ * beat is active and, for a beat with `hintAfterMs`, again as one HUD line
+ * after that much unheld wall time without the expected action.
  */
-import { ONBOARDING } from '@legs/boot_sector/onboarding';
+import { ONBOARDING, type OnboardingBeat } from '@legs/boot_sector/onboarding';
 
-export const HINTS: Readonly<Record<string, string>> = {
-  /** playerMust: "nothing; camera orbit is added" */
-  'beat.floor': 'Drag to orbit.',
-  /** playerMust: "reach for them" */
-  'beat.reach': 'Reach for them.',
-};
+export const hintFor = (beat: OnboardingBeat): string => beat.hint;
 
-/** Every beat with a hint time has a line, and no line names a beat without one. */
+/** Every beat has a non-empty hint; the data file, not the package, is where a missing one is a defect. */
 export function hintProblems(): readonly string[] {
-  const problems: string[] = [];
-  for (const beat of ONBOARDING) {
-    if (beat.hintAfterMs !== null && HINTS[beat.id] === undefined) problems.push(`${beat.id} hints after ${beat.hintAfterMs} ms and has no line`);
-  }
-  for (const id of Object.keys(HINTS)) if (!ONBOARDING.some(beat => beat.id === id && beat.hintAfterMs !== null)) problems.push(`${id} has a line and no hint time`);
-  return problems;
+  return ONBOARDING.filter(beat => beat.hint.trim() === '').map(beat => `${beat.id} has no hint`);
 }

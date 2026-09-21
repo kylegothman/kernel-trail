@@ -26,8 +26,10 @@ import { MODULE_METRES, ONBOARDING, STELE_LIGHT_MS, type OnboardingBeat } from '
 import { ROSTER } from '@legs/boot_sector/populate';
 import { WINDOWS, parseInteractionChoice, reduceRequisition } from '@legs/boot_sector/windows';
 import type { Pacing } from '../pacing';
-import { HINTS } from './hints';
+import { hintFor } from './hints';
 
+/** How much a hovered stele grows in beat three, so it reads as clickable on the stand-in stage. */
+export const HOVER_SCALE = 1.12;
 /** The sweep's step, which the data file does not fix (pre-flight ruling 9.12); one ring per STELE_LIGHT_MS. */
 export const RING_STEP_MS = 400;
 /** The focus hint's line for beat 5, in the hint's own format: the key that opens the terminal. */
@@ -53,6 +55,8 @@ export interface DriverHud {
   readonly element: HTMLElement;
   note(text: string): void;
   cell(region: 'convoyPips' | 'focusHint'): HTMLElement;
+  /** The anchor under the cursor, or null; the HUD's own hover affordance. */
+  setHover(anchorId: string | null): void;
 }
 
 export interface DriverTerminal {
@@ -61,6 +65,8 @@ export interface DriverTerminal {
 
 export interface DriverHost {
   readonly document: Document;
+  /** Where the beat card is appended. */
+  readonly overlay: HTMLElement;
   readonly canvas: HTMLCanvasElement;
   readonly run: () => Readonly<RunState>;
   readonly structures: () => readonly DriverStructure[];
@@ -114,7 +120,10 @@ export class BootSectorDriver {
   private unwatchShell: (() => void) | null = null;
   private hintSpan: HTMLElement | null = null;
   private readonly picker: (event: PointerEvent) => void;
+  private readonly hoverer: (event: PointerEvent) => void;
   private pickerInstalled = false;
+  private hovered: DriverStructure | null = null;
+  private card: HTMLElement | null = null;
   private readonly blockOrbit: (event: Event) => void;
   private readonly onBeatListeners = new Set<(beat: OnboardingBeat) => void>();
 
@@ -124,8 +133,25 @@ export class BootSectorDriver {
     const others = host.structures().filter(structure => !STELE_IDS.includes(structure.id) && structure.id !== ANCHORS.blockStack);
     this.sweepTarget = Math.max(...others.map(distanceOf), 0);
     this.picker = event => this.pick(event);
+    this.hoverer = event => this.hover(event);
     this.blockOrbit = event => { if (event.target === host.canvas) event.stopPropagation(); };
+    this.showCard();
     this.enterVoid();
+  }
+
+  /** The card that says what the player must do next, from the beat's own hint, while the beat is active. Not a hold: the beats are not modal. */
+  private showCard(): void {
+    this.card?.remove();
+    const beat = this.beat;
+    const card = this.host.document.createElement('section');
+    card.className = 'kt-card kt-card--beat'; card.setAttribute('role', 'region'); card.setAttribute('aria-label', 'Tutorial');
+    card.setAttribute('data-beat', beat.id);
+    const title = this.host.document.createElement('h2'); title.className = 'kt-headline'; title.textContent = beat.title;
+    const line = this.host.document.createElement('p'); line.className = 'kt-beat-hint'; line.textContent = hintFor(beat);
+    card.append(title, line);
+    Object.assign(card.style, { pointerEvents: 'none', position: 'absolute', left: '50%', top: '12%', transform: 'translateX(-50%)', maxWidth: '40%' });
+    this.host.overlay.append(card);
+    this.card = card;
   }
 
   get beat(): OnboardingBeat {
@@ -211,8 +237,38 @@ export class BootSectorDriver {
   private enterConvoy(now: number): void {
     this.litCount = 0; this.litLast = now - STELE_LIGHT_MS;
     this.host.canvas.addEventListener('pointerdown', this.picker);
+    this.host.canvas.addEventListener('pointermove', this.hoverer);
     this.pickerInstalled = true;
     this.light(now);
+  }
+
+  /** The stele under the pointer, among those already lit, or null. */
+  private steleAt(event: PointerEvent): DriverStructure | null {
+    const rect = this.host.canvas.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return null;
+    const ndc = new Vector2(((event.clientX - rect.left) / rect.width) * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1);
+    const raycaster = new Raycaster(); raycaster.layers.enableAll();
+    raycaster.setFromCamera(ndc, this.host.focus.camera);
+    const stele = this.host.structures().filter(structure => STELE_IDS.includes(structure.id) && !this.hidden.has(structure.id));
+    const hit = raycaster.intersectObjects(stele.map(structure => structure.root), true)[0];
+    if (hit === undefined) return null;
+    return stele.find(structure => { let object: Object3D | null = hit.object; while (object !== null) { if (object === structure.root) return true; object = object.parent; } return false; }) ?? null;
+  }
+
+  /** Beat three's affordance: a hovered stele grows, the cursor is a pointer, and the HUD's focus hint names it. */
+  private hover(event: PointerEvent): void {
+    const next = this.host.focus.state.mode === 'free' ? this.steleAt(event) : null;
+    if (next === this.hovered) return;
+    this.setHovered(next);
+  }
+
+  private setHovered(next: DriverStructure | null): void {
+    const previous = this.hovered;
+    if (previous !== null) { previous.root.scale.setScalar(1); previous.root.updateMatrix(); }
+    this.hovered = next;
+    if (next !== null) { next.root.scale.setScalar(HOVER_SCALE); next.root.updateMatrix(); }
+    this.host.canvas.style.cursor = next === null ? '' : 'pointer';
+    this.host.hud.setHover(next?.id ?? null);
   }
 
   /** The five stele in roster order at STELE_LIGHT_MS each; the convoy row whose name matches lights with it. */
@@ -227,16 +283,10 @@ export class BootSectorDriver {
 
   private pick(event: PointerEvent): void {
     if (event.button !== 0 || this.host.focus.state.mode !== 'free') return;
-    const rect = this.host.canvas.getBoundingClientRect();
-    if (rect.width === 0 || rect.height === 0) return;
-    const ndc = new Vector2(((event.clientX - rect.left) / rect.width) * 2 - 1, -((event.clientY - rect.top) / rect.height) * 2 + 1);
-    const raycaster = new Raycaster(); raycaster.layers.enableAll();
-    raycaster.setFromCamera(ndc, this.host.focus.camera);
-    const stele = this.host.structures().filter(structure => STELE_IDS.includes(structure.id) && !this.hidden.has(structure.id));
-    const hits = raycaster.intersectObjects(stele.map(structure => structure.root), true);
-    const hit = hits[0]; if (hit === undefined) return;
-    const target = stele.find(structure => { let object: Object3D | null = hit.object; while (object !== null) { if (object === structure.root) return true; object = object.parent; } return false; });
-    if (target !== undefined) this.host.focus.engage(target.id);
+    const target = this.steleAt(event);
+    if (target === null) return;
+    this.setHovered(null);
+    this.host.focus.engage(target.id);
   }
 
   private enterReach(): void { this.revealedStack = false; }
@@ -296,6 +346,7 @@ export class BootSectorDriver {
 
   private enter(now: number): void {
     this.startedAt = now; this.activeMs = 0; this.hinted = false;
+    this.showCard();
     for (const listener of this.onBeatListeners) listener(this.beat);
     switch (this.beat.id) {
       case 'beat.floor': this.enterFloor(now); break;
@@ -309,9 +360,14 @@ export class BootSectorDriver {
     }
   }
 
+  /** The beat card's element, for the host and the tests. */
+  get cardElement(): HTMLElement | null { return this.card; }
+
   /** Once per frame with the wall clock. */
   update(now: number): void {
     if (this.disposed || this.done) return;
+    // The stele stop reading as clickable once one is locked.
+    if (this.hovered !== null && this.host.focus.state.mode !== 'free') this.setHovered(null);
     const dt = Math.max(0, now - this.lastNow); this.lastNow = now;
     if (this.host.pacing.held().length === 0) this.activeMs += dt;
     while (!this.done && this.exited(now)) {
@@ -319,15 +375,21 @@ export class BootSectorDriver {
       if (this.done) { this.finish(); return; }
       this.enter(now);
     }
-    const beat = this.beat; const hint = HINTS[beat.id];
+    const beat = this.beat;
     const waiting = beat.id !== 'beat.reach' || this.revealedStack;
-    if (!this.hinted && hint !== undefined && beat.hintAfterMs !== null && waiting && this.activeMs >= beat.hintAfterMs) {
-      this.hinted = true; this.host.hud.note(hint);
+    if (!this.hinted && beat.hintAfterMs !== null && waiting && this.activeMs >= beat.hintAfterMs) {
+      this.hinted = true; this.host.hud.note(hintFor(beat));
     }
   }
 
   private finish(): void {
-    if (this.pickerInstalled) { this.host.canvas.removeEventListener('pointerdown', this.picker); this.pickerInstalled = false; }
+    this.card?.remove(); this.card = null;
+    if (this.pickerInstalled) {
+      this.host.canvas.removeEventListener('pointerdown', this.picker);
+      this.host.canvas.removeEventListener('pointermove', this.hoverer);
+      this.pickerInstalled = false;
+    }
+    this.setHovered(null);
     this.host.interactions.restrict(null);
     this.host.interactions.enableOnly(null);
   }

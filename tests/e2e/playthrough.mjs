@@ -113,7 +113,7 @@ export async function prepareExpectations() {
       || step.command.kind === 'interaction' && ['boot.direct_reach', 'boot.trap_purchase', 'boot.choose_disc'].includes(step.command.id))
       .map(step => ({ kind: step.command.kind, choice: describeChoice(step.command) }));
     return { seed: SEED, legs, quantumPassBadGolden: golden.fingerprint.hash, dbName: DB_NAME, flagKey: BOOT_SECTOR_COMPLETED_KEY,
-      beats: ONBOARDING.map(beat => beat.id), scripted, harnessTerminalStep };
+      beats: ONBOARDING.map(beat => beat.id), hints: Object.fromEntries(ONBOARDING.map(beat => [beat.id, beat.hint])), scripted, harnessTerminalStep };
   } finally {
     await unregister();
   }
@@ -187,8 +187,17 @@ export async function playTutorial(context, baseUrl, backend, expectations, time
   const diagnostics = capturePageDiagnostics(page);
   const timings = [];
   let previous = performance.now();
+  /** The ruling before the replay: every beat has a non-empty hint in the data and a card in the DOM saying it while the beat is active. */
+  const cardSays = async (beat) => {
+    const hint = expectations.hints[beat];
+    assert(typeof hint === 'string' && hint.trim() !== '', `${beat} has a non-empty hint in the data file`);
+    const card = page.locator(`.kt-card--beat[data-beat="${beat}"] .kt-beat-hint`);
+    await card.waitFor({ timeout });
+    same(`the ${beat} card`, await card.textContent(), hint);
+  };
   const arrived = async (beat) => {
     await waitForBeat(page, beat, timeout);
+    await cardSays(beat);
     const now = performance.now();
     timings.push({ beat, wallMs: Math.round(now - previous) });
     previous = now;
@@ -203,6 +212,7 @@ export async function playTutorial(context, baseUrl, backend, expectations, time
     // The driver is mounted on a fresh profile (beat() is non-null and no Skip tutorial card was offered), the world is the void
     // (the HUD hidden), and the clock is held; the M3 playtest asked for each of these, since it saw the clock run free.
     same('tutorial first beat', await readBeat(page), expectations.beats[0]);
+    await cardSays(expectations.beats[0]);
     same('no skip card on a fresh profile', await page.locator('.kt-card--tutorial').count(), 0);
     same('the HUD is hidden in beat.void', await page.locator('.kt-hud').isHidden(), true);
     const verbs = page.locator('.kt-panel--interactions [data-interaction]');
@@ -235,6 +245,15 @@ export async function playTutorial(context, baseUrl, backend, expectations, time
     same('the HUD container is pointer-events none', hit.computed, 'none');
     same('the HUD container\'s own inline pointer-events (set by the Hud, not the session)', hit.inline, 'none');
     same('elementFromPoint at a canvas point inside the safe inset', hit.at, 'CANVAS#stage');
+    // The stele read as clickable: hovering one turns the cursor to a pointer and the HUD's focus hint names it.
+    await page.mouse.move(hit.point.x, hit.point.y);
+    await page.waitForFunction(() => document.querySelector('#stage')?.style.cursor === 'pointer', undefined, { timeout, polling: 50 });
+    const hover = await page.evaluate(() => ({ cursor: document.querySelector('#stage')?.style.cursor, hint: document.querySelector('.kt-hint')?.textContent ?? '' }));
+    console.log(`playthrough hover over the lumen stele: ${JSON.stringify(hover)}`);
+    same('the cursor over a stele', hover.cursor, 'pointer');
+    assert(hover.hint.includes('anchor.convoy.lumen'), `the focus hint names the hovered stele: ${JSON.stringify(hover.hint)}`);
+    await page.mouse.move(2, 2);
+    await page.waitForFunction(() => document.querySelector('#stage')?.style.cursor === '', undefined, { timeout, polling: 50 });
     for (let attempt = 0; attempt < 20 && (await readBeat(page)) === 'beat.convoy'; attempt++) {
       const point = await page.evaluate(() => globalThis.__kernelTrailDebug.anchorOnScreen('anchor.convoy.lumen'));
       assert(point !== null, 'the lumen stele projects onto the screen');
@@ -305,6 +324,7 @@ export async function playTutorial(context, baseUrl, backend, expectations, time
     await page.locator('.kt-panel--gate').getByRole('button', { name: 'blocks', exact: true }).click();
     const end = await waitForDebrief(page, 'boot_sector', timeout);
     same('tutorial beat after the gate', await readBeat(page), null);
+    same('no beat card after the gate', await page.locator('.kt-card--beat').count(), 0);
     const decisions = await decisionsOf(page);
     const relevant = decisions.filter(record => record.kind === 'leg_done' || record.kind === 'terminal' && record.choice.endsWith('man EPERM')
       || record.kind === 'interaction' && ['boot.direct_reach', 'boot.trap_purchase', 'boot.choose_disc'].some(id => record.choice.startsWith(`${id} @`)));
