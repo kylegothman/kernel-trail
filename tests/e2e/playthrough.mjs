@@ -282,7 +282,9 @@ export async function playTutorial(context, baseUrl, backend, expectations, time
     await page.waitForTimeout(2000);
     const stillHeld = await readSeam(page);
     same('ticks across two seconds with the requisition open', stillHeld.tick - held.tick, 0);
-    assert.match(await page.locator('.kt-pace').textContent() ?? '', /paused \(requisition\)/, 'the pace indicator names the requisition hold');
+    // The label lands through the HUD's batch on the flush after the hold changes, so it is awaited, bounded by the timeout.
+    await page.waitForFunction(() => /paused \(requisition\)/.test(document.querySelector('.kt-pace')?.textContent ?? ''), undefined, { timeout, polling: 50 });
+    console.log(`playthrough tutorial: pace with the requisition open ${JSON.stringify(await page.locator('.kt-pace').textContent())}`);
     const requisition = page.locator('.kt-panel--requisition');
     await requisition.getByRole('button', { name: 'Request memory quota mode', exact: true }).click();
     await requisition.locator('[aria-label="Request memory quota amount"]').fill('40');
@@ -298,7 +300,8 @@ export async function playTutorial(context, baseUrl, backend, expectations, time
     // 8. The gate opens on the next frame and holds in its turn; the pace indicator names it. The leg ends on leg_done; the debrief follows.
     await arrived('beat.gate');
     await page.locator('.kt-panel--gate').waitFor({ timeout });
-    assert.match(await page.locator('.kt-pace').textContent() ?? '', /paused \(gate\)/, 'the pace indicator names the gate hold once the requisition has closed');
+    await page.waitForFunction(() => /paused \(gate\)/.test(document.querySelector('.kt-pace')?.textContent ?? ''), undefined, { timeout, polling: 50 });
+    console.log(`playthrough tutorial: pace with the gate open ${JSON.stringify(await page.locator('.kt-pace').textContent())}`);
     await page.locator('.kt-panel--gate').getByRole('button', { name: 'blocks', exact: true }).click();
     const end = await waitForDebrief(page, 'boot_sector', timeout);
     same('tutorial beat after the gate', await readBeat(page), null);
