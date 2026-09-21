@@ -406,7 +406,8 @@ export async function createBrowserSession(boot: BootContext, start: SessionStar
   view.addEventListener('beforeunload', hide);
   view.addEventListener('pagehide', hide);
   commit(() => {
-    hud.element.style.pointerEvents = 'auto';
+    // WP-24 found in a real browser that an inline pointer-events auto on the HUD container, set here since WP-22, overrode the
+    // stylesheet's none and swallowed every canvas click inside the safe inset, orbit drags included; the cells are auto on their own.
     hud.cell('legRail').title = `Seed ${initial.seed}`;
   });
 
