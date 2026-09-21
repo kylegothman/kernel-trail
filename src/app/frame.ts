@@ -66,8 +66,9 @@ export function browserFrameHooks(options: {
       governor.onFrame(metrics, boot.backend.stats.drawCalls > PROFILES[governor.current].drawCalls);
     },
     onRunStateChanged(running) {
+      // WP-25 (S3): the score keeps playing while the loop is stopped or held; the session says when audio may not run.
       const context = options.engine.adapter.context;
-      if (context !== null) void (running && options.audioRunning() ? context.resume() : context.suspend()).catch(() => undefined);
+      if (context !== null) void (running || options.audioRunning() ? context.resume() : context.suspend()).catch(() => undefined);
     },
   };
 }
