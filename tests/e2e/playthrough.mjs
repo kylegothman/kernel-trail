@@ -223,7 +223,7 @@ export async function playTutorial(context, baseUrl, backend, expectations, time
     await arrived('beat.convoy');
     // The player clicks a stele: the first to light, at the point the seam projects it to; the rig engages on the hit.
     await page.waitForFunction(() => globalThis.__kernelTrailDebug.anchorOnScreen('anchor.convoy.lumen') !== null, undefined, { timeout, polling: 50 });
-    // Pointer events through the real DOM: the HUD container is none with no inline override, and a canvas point inside the safe
+    // Pointer events through the real DOM: the HUD container is none, inline by the Hud's own hand and not overridden, and a canvas point inside the safe
     // inset resolves to the canvas, so a click there is the world's (609585a; the M3 playtest reported nothing clickable).
     const hit = await page.evaluate(() => {
       const hud = document.querySelector('.kt-hud');
@@ -233,7 +233,7 @@ export async function playTutorial(context, baseUrl, backend, expectations, time
     });
     console.log(`playthrough pointer: ${JSON.stringify(hit)}`);
     same('the HUD container is pointer-events none', hit.computed, 'none');
-    same('the HUD container carries no inline pointer-events', hit.inline, '');
+    same('the HUD container\'s own inline pointer-events (set by the Hud, not the session)', hit.inline, 'none');
     same('elementFromPoint at a canvas point inside the safe inset', hit.at, 'CANVAS#stage');
     for (let attempt = 0; attempt < 20 && (await readBeat(page)) === 'beat.convoy'; attempt++) {
       const point = await page.evaluate(() => globalThis.__kernelTrailDebug.anchorOnScreen('anchor.convoy.lumen'));
