@@ -287,3 +287,29 @@ describe('the Boot Sector driver', () => {
     expect(s.restricted.at(-1)).toBeNull();
   });
 });
+
+/* ------------------------------------------------------------------ */
+/* The title screen (section 5): the bible's words, nothing new         */
+/* ------------------------------------------------------------------ */
+
+import { readFileSync } from 'node:fs';
+import { difficultyText, discClassText } from '../../src/app/screens/TitleScreen';
+
+describe('the title screen', () => {
+  it('describes each class and tier in sentences the narrative bible carries, with the 5.2 ledger at the chosen tier', () => {
+    const bible = readFileSync('docs/04-NARRATIVE-BIBLE.md', 'utf8').replaceAll(/\s+/g, ' ').replaceAll('`', '').toLowerCase();
+    const sentences = (text: string): string[] => text.split(/(?<=\.)\s+/).map(sentence => sentence.trim()).filter(Boolean);
+    // A sentence may begin where the bible's runs on ("Who should pick it: first run, always."), so the match is case-blind.
+    const carried = (sentence: string): boolean => bible.includes(sentence.toLowerCase());
+    for (const disc of ['shell', 'daemon', 'compiler'] as const) {
+      const [first, second] = sentences(discClassText(disc, 'operator'));
+      expect(carried(first ?? ''), first).toBe(true);
+      expect(carried(second ?? ''), second).toBe(true);
+    }
+    for (const tier of ['novice', 'operator', 'architect', 'kernel_space'] as const) {
+      for (const sentence of sentences(difficultyText(tier))) expect(carried(sentence), sentence).toBe(true);
+    }
+    expect(discClassText('shell', 'operator')).toContain('Starts with 1600 cycles, 900 quota, 120 blocks, 60 bandwidth.');
+    expect(discClassText('compiler', 'architect')).toContain('Starts with 560 cycles, 336 quota, 72 blocks, 24 bandwidth.');
+  });
+});

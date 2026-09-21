@@ -3,6 +3,7 @@
  * without changing run selection, save validation, or the start gesture.
  */
 import { LEG_ORDER, type DifficultyTier, type DiscClass, type SaveFile } from '@game/types';
+import { startingLedger } from '@game/travel/ledger';
 import type { StoredSave } from '@game/save';
 import { loadOutcome } from '@game/persist/LoadService';
 import { LEG_LOADERS } from '@legs/registry';
@@ -15,6 +16,43 @@ const DISC_OPTIONS: readonly DiscClass[] = ['shell', 'daemon', 'compiler'];
 const DIFFICULTY_OPTIONS: readonly DifficultyTier[] = ['novice', 'operator', 'architect', 'kernel_space'];
 const QUALITY_OPTIONS: readonly (QualityTier | 'auto')[] = ['auto', 'low', 'medium', 'high'];
 const LEG_LOAD_TIMEOUT_MS = 10_000;
+
+/**
+ * WP-24 section 5: the choice made legible in the bible's own words. Two
+ * sentences per disc class from docs/04-NARRATIVE-BIBLE.md sections 4.1 to
+ * 4.3 (the class's first sentence and its "who should pick it"), and two per
+ * tier from section 13.1. Nothing here is written new; the ledger each class
+ * starts with is the 5.2 table through startingLedger at the chosen tier.
+ */
+const DISC_CLASS_LINES: Readonly<Record<DiscClass, string>> = {
+  // Narrative bible 4.1, Shell.
+  shell: 'The banker. First run, always. Anyone who has never seen a page table.',
+  // Narrative bible 4.2, Daemon.
+  daemon: 'The carpenter. The second and third runs. A player who has died once to thrashing and once to deadlock and wants the same journey with less margin.',
+  // Narrative bible 4.3, Compiler.
+  compiler: 'The farmer, and it must be genuinely hard. The player who has finished a run and wants the game to stop being generous.',
+};
+const DIFFICULTY_LINES: Readonly<Record<DifficultyTier, string>> = {
+  // Narrative bible 13.1, novice.
+  novice: 'The course, with the answers in the back. The codex entry unlocks the instant the pathology is inflicted and states the remedy as an instruction.',
+  // Narrative bible 13.1, operator.
+  operator: 'The default and the one the curriculum is balanced against. The codex names the remedy once the entry has unlocked, and the entry unlocks by suffering the pathology, so the first instance of every affliction in a player\'s life is solved by reasoning or not at all.',
+  // Narrative bible 13.1, architect.
+  architect: 'Assistance becomes conditional. The codex gives the concept, the citation and the player\'s own trace, and it withholds the remedy until the player has performed it successfully once, at which point the entry rewrites itself to include it.',
+  // Narrative bible 13.1, kernel_space.
+  kernel_space: 'Nearly all assistance is off. What kernel_space keeps, always: the tombstone cause line, the affliction drain numbers, every terminal command, and full determinism with a visible seed.',
+};
+
+/** The two sentences and the ledger for a class at a tier, narrative bible 4 and 5.2. */
+export function discClassText(disc: DiscClass, tier: DifficultyTier): string {
+  const ledger = startingLedger(disc, tier);
+  return `${DISC_CLASS_LINES[disc]} Starts with ${ledger.cycles} cycles, ${ledger.quota} quota, ${ledger.blocks} blocks, ${ledger.bandwidth} bandwidth.`;
+}
+
+/** The two sentences for a tier, narrative bible 13.1. */
+export function difficultyText(tier: DifficultyTier): string {
+  return DIFFICULTY_LINES[tier];
+}
 
 export interface TitleScreen {
   readonly element: HTMLElement;
@@ -167,6 +205,19 @@ export function mountTitleScreen(boot: BootContext, onStart: StartFromTitle): Ti
     disc = select(doc, 'Disc class', DISC_OPTIONS, 'shell');
     difficulty = select(doc, 'Difficulty', DIFFICULTY_OPTIONS, 'operator');
     quality = select(doc, 'Quality', QUALITY_OPTIONS, 'auto');
+    // WP-24 section 5: under each choice, the bible's own description of what is selected.
+    const discNote = doc.createElement('p'); discNote.className = 'kt-title-disc-note';
+    const difficultyNote = doc.createElement('p'); difficultyNote.className = 'kt-title-difficulty-note';
+    for (const note of [discNote, difficultyNote]) note.style.cssText = `margin:0;font:12px/1.5 ${FONT_STACK.sans};color:${cssColor(SLATE.primary)}`;
+    const chosenDisc = disc; const chosenDifficulty = difficulty;
+    const describeChoices = (): void => {
+      discNote.textContent = discClassText(chosenDisc.value(), chosenDifficulty.value());
+      difficultyNote.textContent = difficultyText(chosenDifficulty.value());
+    };
+    describeChoices();
+    disc.control.addEventListener('change', describeChoices);
+    difficulty.control.addEventListener('change', describeChoices);
+    disc.label.append(discNote); difficulty.label.append(difficultyNote);
     const actions = doc.createElement('div');
     actions.style.cssText = 'display:flex;gap:12px;margin-top:24px;flex-wrap:wrap';
     prepareButton(newRun, 'New run'); prepareButton(continueRun, 'Continue');
