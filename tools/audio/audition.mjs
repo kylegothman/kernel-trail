@@ -123,7 +123,9 @@ async function renderInBrowser(request) {
     send(TOUR[0]);
     for (const step of TOUR.slice(1)) {
       const t = step.atBar * bar;
-      score.scheduleUntil(t, 0);
+      // Schedule up to half a millisecond before the bar line, so the bar's own step, and the Conductor's
+      // question at it, come after the event: a sum of bars can round a hair either side of the line.
+      score.scheduleUntil(t - 0.0005, 0);
       clock.now = t;
       send(step);
     }

@@ -21,7 +21,7 @@ import {
   type Arrangement, type Note, type PartId, type Section, type SectionId,
 } from '../../src/audio/score/Arrangement';
 import {
-  LATE_STEP_TOLERANCE_SECONDS, LOOKAHEAD_SECONDS, RELEASE_GAP_SECONDS, SCHEDULE_INTERVAL_MS, Sequencer,
+  LATE_STEP_TOLERANCE_SECONDS, LOOKAHEAD_SECONDS, RELEASE_GAP_SECONDS, SCHEDULE_INTERVAL_MS, SWITCH_FADE, Sequencer,
   type BarInfo, type SequencerHost, type Voicing,
 } from '../../src/audio/score/Sequencer';
 import { FakeContext, type FakeNode, type FakeParam } from './fakeContext';
@@ -427,6 +427,36 @@ describe('sequencer', () => {
     const loss = rig.patched.filter((p) => p.section === 'loss');
     expect(loss.some((p) => p.part === 'lead')).toBe(true);
     expect(loss.some((p) => p.part === 'pad')).toBe(true);
+  });
+
+  it('yield inside a note: a section change on a bar line fades out the notes that cross it and frees their voices', () => {
+    const rig = makeRig({ drones: 1 });
+    const a = fixture(120);
+    const bar = barSeconds(a);
+    rig.sequencer.onBar = (info) => (info.section === 'travel' && info.barInSection === 1 ? 'crossing' : null);
+    rig.sequencer.start(a, 'travel', 0);
+    run(rig, 0, 2 * bar + 0.5);
+    expect(rig.sequencer.current).toBe('crossing');
+    // The fixture's travel pad note is four bars long; the crossing began at bar one, inside it.
+    const pad = rig.voices().find((v) => v instanceof DroneVoice);
+    if (pad === undefined) throw new Error('no pad');
+    const level = gainOf(pad);
+    const from = bar - SWITCH_FADE.leadSeconds;
+    const end = bar - SWITCH_FADE.endSeconds;
+    const cut = level.events.filter((e) => e.time >= from - 1e-9 && e.time <= end + 1e-9).map((e) => [e.kind, Math.round(e.time * 1e6) / 1e6, Math.round(e.value * 1e6) / 1e6]);
+    expect(cut).toEqual([['set', Math.round(from * 1e6) / 1e6, 0.16], ['linear', Math.round(end * 1e6) / 1e6, MIN_EXP_TARGET]]);
+    expect(level.valueAt(from)).toBeCloseTo(0.16, 6);
+    expect(level.valueAt(end)).toBeCloseTo(MIN_EXP_TARGET, 6);
+    // Nothing of the old note survives between the fade and the line, and the crossing's pad reused the voice on it.
+    expect(level.events.filter((e) => e.time > end + 1e-9 && e.time < bar - 1e-9).length).toBe(0);
+    expect(pad.busy).toBe(true);
+    expect(pad.startedAt).toBeCloseTo(bar, 9);
+    expect(rig.sequencer.stats.unplaced).toBe(0);
+    // Notes that ended at the line by construction were not touched: the chords' releases ended a millisecond before it.
+    for (const v of rig.voices()) {
+      if (!(v instanceof ToneVoice)) continue;
+      expect(gainOf(v).events.some((e) => Math.abs(e.time - from) < 1e-9)).toBe(false);
+    }
   });
 
   it('reduced motion: the hold shrinks so the halved envelope still fits the note', () => {

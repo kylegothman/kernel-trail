@@ -44,6 +44,14 @@ export const LATE_STEP_TOLERANCE_SECONDS = 0.03;
  * it, which drops the note.
  */
 export const RELEASE_GAP_SECONDS = 0.001;
+/**
+ * A section change on a bar line inside a note that would cross it: the note
+ * fades out over 25 ms, ending 5 ms before the line, so its voice is free for
+ * the new section's first notes and no release ramp is left for the new
+ * note's attack to cancel, which would click. The bar line's hook is asked
+ * a lookahead ahead of it, so the fade is always still in the future.
+ */
+export const SWITCH_FADE = { leadSeconds: 0.03, endSeconds: 0.005 } as const;
 
 export type MutableVoiceParams = { -readonly [K in keyof VoiceParams]?: VoiceParams[K] };
 
@@ -123,7 +131,8 @@ export class Sequencer {
   private stepInBar = 0;
   private stopAt = Number.POSITIVE_INFINITY;
   private readonly muted = new Set<PartId>();
-  private readonly padLevels = new Map<Voice, number>();
+  /** The level each sounding score voice holds at, for the pad kept through a panic and for a cut at a section change. */
+  private readonly sustainLevels = new Map<Voice, number>();
   /** Panic keeps the pad it cut into; the section's own pad notes are then not scheduled. */
   private skipPad = false;
   /** `start` chose its section; the hook is asked from the next bar line on, as after any switch. */
@@ -215,7 +224,7 @@ export class Sequencer {
     this.section = null;
     this.byStep.clear();
     this.muted.clear();
-    this.padLevels.clear();
+    this.sustainLevels.clear();
     this.skipPad = false;
     this.skipFirstHook = false;
     this.stopAt = Number.POSITIVE_INFINITY;
@@ -321,6 +330,7 @@ export class Sequencer {
         if (ended) this.loop(time);
       } else {
         this.stats.changes += 1;
+        if (!ended) this.cutCrossing(time);
         this.enter(next, time, false);
       }
     } else if (ended) {
@@ -328,6 +338,27 @@ export class Sequencer {
     }
     this.stats.bars += 1;
     return true;
+  }
+
+  /**
+   * A looping section yielded inside a long note: every score voice still
+   * sounding past the bar line fades out just before it and is freed. Notes
+   * that end at the line by construction are untouched.
+   */
+  private cutCrossing(time: number): void {
+    const from = time - SWITCH_FADE.leadSeconds;
+    const end = time - SWITCH_FADE.endSeconds;
+    for (const voice of this.host.allocator.all()) {
+      if (!voice.busy || voice.bus !== 'score' || voice.finishAt <= time) continue;
+      const level = voice.level;
+      level.cancelScheduledValues(from);
+      level.setValueAtTime(this.sustainLevels.get(voice) ?? MIN_EXP_TARGET, from);
+      level.linearRampToValueAtTime(MIN_EXP_TARGET, end);
+      voice.busy = false;
+      voice.exempt = false;
+      voice.finishAt = end;
+      this.sustainLevels.delete(voice);
+    }
   }
 
   private loop(time: number): void {
@@ -378,7 +409,7 @@ export class Sequencer {
     let kept = 0;
     for (const voice of this.host.allocator.all()) {
       if (!(voice instanceof DroneVoice) || !voice.busy || voice.bus !== 'score' || voice.startedAt > time) continue;
-      const level = this.padLevels.get(voice) ?? 0.3;
+      const level = this.sustainLevels.get(voice) ?? 0.3;
       voice.level.cancelScheduledValues(time);
       voice.level.setValueAtTime(level, time);
       voice.finishAt = time + seconds;
@@ -417,12 +448,13 @@ export class Sequencer {
       level.setValueAtTime(gain, end - release);
       level.linearRampToValueAtTime(MIN_EXP_TARGET, end);
       voice.finishAt = end;
-      this.padLevels.set(voice, gain);
+      this.sustainLevels.set(voice, gain);
       if (section.padDetuneCents !== 0) voice.setDetune(section.padDetuneCents, onset, Math.max(0.01, sectionSeconds(a, section.id) - (onset - this.anchor)));
     } else {
       // A one-shot whose release ends inside the note, so the next note on this voice starts from silence.
       params.hold = Math.max(0, seconds - RELEASE_GAP_SECONDS - (adsr.attack + adsr.decay + adsr.release) * scale);
       voice.start(onset, params);
+      this.sustainLevels.set(voice, Math.max(MIN_EXP_TARGET, (params.gain ?? 0.3) * adsr.sustain));
     }
     this.stats.notes += 1;
     if (this.onNote !== null) this.onNote(part, note, onset, seconds, section.id);
@@ -442,7 +474,7 @@ export class Sequencer {
       } else {
         voice.stop(at);
       }
-      this.padLevels.delete(voice);
+      this.sustainLevels.delete(voice);
     }
   }
 }
